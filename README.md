@@ -1,4 +1,4 @@
-# Homework
+# Homework (Horizon Server)
 
 Weekly task tracker for FFXI Horizon Server.
 
