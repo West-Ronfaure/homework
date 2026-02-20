@@ -1486,11 +1486,11 @@ local function render_ui()
                     end
                     status_text = 'Unknown';
                 else
-                    -- Real timer counting down
+                    -- Real timer counting down - CHANGED TO GREEN
                     if timer_data.has_ki then
-                        icon = '[KI]'; icon_color = { 1.0, 0.3, 0.3, 1.0 };
+                        icon = '[KI]'; icon_color = { 0.0, 1.0, 0.0, 1.0 };
                     else
-                        icon = '[  ]'; icon_color = { 1.0, 0.3, 0.3, 1.0 };
+                        icon = '[  ]'; icon_color = { 0.0, 1.0, 0.0, 1.0 };
                     end
                     status_text = format_time_short(remaining);
                 end
