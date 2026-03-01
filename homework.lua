@@ -1366,7 +1366,7 @@ local function render_ui()
                         elseif n == 'bastok' then table.insert(available, 'Bastok'); end
                     end
                 end
-                local available_text = #available > 0 and table.concat(available, '/') or 'All done';
+                local available_text = #available == 3 and 'All nations' or (#available > 0 and table.concat(available, '/') or 'All done');
 
                 if step == 'done' then
                     icon = '[X]'; color = { 1.0, 0.3, 0.3, 1.0 };
