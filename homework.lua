@@ -1095,7 +1095,7 @@ local function show_timers()
                 local time_left = timer_data.next_ki_time - current_time;
                 local days = math.floor(time_left / 86400);
                 local hours = math.floor((time_left % 86400) / 3600);
-                if timer_data.has_ki then status_icon = '\30\076[KI]\30\106'; else status_icon = '\30\076[   ]\30\106'; end
+                if timer_data.has_ki then status_icon = '\30\110[KI]\30\106'; else status_icon = '\30\110[   ]\30\106'; end
                 if days > 0 then status_text = string.format('\30\071(%dd %dh)\30\106', days, hours);
                 else status_text = string.format('\30\071(%dh)\30\106', hours); end
             end
@@ -1795,7 +1795,7 @@ local function show_char_details(char_name)
                 local time_left = timer_data.next_ki_time - current_time;
                 local days = math.floor(time_left / 86400);
                 local hours = math.floor((time_left % 86400) / 3600);
-                if timer_data.has_ki then status_icon = '\30\076[KI]\30\106'; else status_icon = '\30\076[   ]\30\106'; end
+                if timer_data.has_ki then status_icon = '\30\110[KI]\30\106'; else status_icon = '\30\110[   ]\30\106'; end
                 if days > 0 then status_text = string.format('\30\071(%dd %dh)\30\106', days, hours);
                 else status_text = string.format('\30\071(%dh)\30\106', hours); end
             end
