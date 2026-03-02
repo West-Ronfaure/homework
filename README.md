@@ -28,6 +28,6 @@ This addon tracks your weekly objectives and ENM timers. It was created specific
 - Speak to Eeko-Weeko in Ru'Lude Gardens once to initialize the EcoWarrior nation rotation.
 
 <p>
-<img src="https://github.com/user-attachments/assets/065dbbbf-9b29-493f-ac73-645a3ac4538c" width="350">
-<img src="https://github.com/user-attachments/assets/40634801-ee10-4198-af81-a96e116f0e42" width="500">
+<img width="369" height="603" alt="image1" src="https://github.com/user-attachments/assets/d8189b6b-6fb4-470f-954c-7bddf7160e01" />
+<img width="665" height="476" alt="image2" src="https://github.com/user-attachments/assets/ec7c24cc-ab05-4b9a-9b3b-09d9895df47d" />
 </p>
