@@ -5,7 +5,7 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-addon.version   = '3.1';
+addon.version   = '3.2';
 addon.desc      = 'Weekly homework tracker for FFXI';
 addon.link      = '';
 
@@ -592,6 +592,8 @@ local function on_ki_gained(ki_id)
     end
     -- Check X'sKnife KIs
     if ki_id == XSKNIFE_KI_ID_FIRST or ki_id == XSKNIFE_KI_ID_REPEAT then
+        -- Skip if saved data already shows we have this KI (prevents reload/zone false triggers)
+        if char_data.xsknife_data.has_ki then return; end
         char_data.xsknife_data.has_ki = true;
         local current_step = char_data.xsknife_data.step;
         if current_step == 'unknown' or current_step == 'scanned_no_ki' or current_step == 'scanned_has_ki_used' then
@@ -605,6 +607,9 @@ local function on_ki_gained(ki_id)
     end
     -- Check CookBook KI
     if ki_id == COOKBOOK_KI_ID then
+        -- Skip if already at or past KI stage (prevents reload/zone false triggers)
+        local cb_step = char_data.quest_steps.cookbook;
+        if cb_step == 'jonette_return' or cb_step == 'done' then return; end
         char_data.quest_steps.cookbook = 'jonette_return';
         save_settings();
         print_success('Obtained Tavnazian Cookbook - Return to Jonette!');
@@ -612,6 +617,9 @@ local function on_ki_gained(ki_id)
     end
     -- Check SpiceGals KI
     if ki_id == SPICEGALS_KI_ID then
+        -- Skip if already at or past KI stage (prevents reload/zone false triggers)
+        local sg_step = char_data.quest_steps.spicegals;
+        if sg_step == 'rouva_return' or sg_step == 'done' then return; end
         char_data.quest_steps.spicegals = 'rouva_return';
         save_settings();
         print_success('Obtained Rivernewort - Return to Rouva!');
@@ -619,6 +627,9 @@ local function on_ki_gained(ki_id)
     end
     -- Check UnInvited KI
     if ki_id == UNINVITED_KI_ID then
+        -- Skip if already at or past KI stage (prevents reload/zone false triggers)
+        local ui_step = char_data.quest_steps.uninvited;
+        if ui_step == 'bcnm' or ui_step == 'justinius_return' or ui_step == 'done' then return; end
         char_data.quest_steps.uninvited = 'bcnm';
         save_settings();
         print_success('Obtained Monarch Linn Patrol Permit - Head to BCNM!');
@@ -629,6 +640,10 @@ local function on_ki_gained(ki_id)
         if ki_id == id then
             local eco_data = char_data.ecowarrior_data;
             if eco_data ~= nil then
+                -- Skip if already past KI stage (prevents reload/zone false triggers)
+                local current_step = eco_data.step;
+                if current_step == 'field_agent_return' or current_step == 'reward' or current_step == 'done' then return; end
+                if current_step == 'scanned_has_ki' and eco_data.current_nation == nation then return; end
                 local zone_info = ECOWARRIOR_ZONES[nation];
                 if eco_data.step == 'unknown' or eco_data.step == 'scanned_has_ki' then
                     -- Don't know locked nations yet
@@ -666,6 +681,8 @@ local function on_ki_lost(ki_id)
     end
     -- Check X'sKnife KIs
     if ki_id == XSKNIFE_KI_ID_FIRST or ki_id == XSKNIFE_KI_ID_REPEAT then
+        -- Skip if saved data already shows we don't have this KI (prevents reload/zone false triggers)
+        if not char_data.xsknife_data.has_ki then return; end
         char_data.xsknife_data.has_ki = false;
         local current_step = char_data.xsknife_data.step;
         if current_step == 'unknown' or current_step == 'scanned_has_ki' then
@@ -712,6 +729,8 @@ local function on_ki_lost(ki_id)
         if ki_id == id then
             local eco_data = char_data.ecowarrior_data;
             if eco_data ~= nil then
+                -- Skip if already done (prevents reload/zone false triggers)
+                if eco_data.step == 'done' or eco_data.step == 'ready' or eco_data.step == 'scanned' or eco_data.step == 'unknown' then return; end
                 if eco_data.knows_status then
                     -- We know locked nations, track completion
                     eco_data.step = 'done';
@@ -1095,7 +1114,7 @@ local function show_timers()
                 local time_left = timer_data.next_ki_time - current_time;
                 local days = math.floor(time_left / 86400);
                 local hours = math.floor((time_left % 86400) / 3600);
-                if timer_data.has_ki then status_icon = '\30\110[KI]\30\106'; else status_icon = '\30\110[   ]\30\106'; end
+                if timer_data.has_ki then status_icon = '\30\076[KI]\30\106'; else status_icon = '\30\076[   ]\30\106'; end
                 if days > 0 then status_text = string.format('\30\071(%dd %dh)\30\106', days, hours);
                 else status_text = string.format('\30\071(%dh)\30\106', hours); end
             end
@@ -1242,8 +1261,15 @@ local function render_ui()
         imgui.PopStyleColor(5);
         imgui.PopStyleVar(2);
         
-        -- Apply font scale
-        imgui.SetWindowFontScale(ui.font_scale);
+        -- Apply font scale (compatible with both old and new Ashita)
+        local _useNewFont = (imgui.SetWindowFontScale == nil);
+        if _useNewFont then
+            local defaultFont = imgui.GetFont();
+            local defaultSize = imgui.GetFontSize();
+            imgui.PushFont(defaultFont, defaultSize * ui.font_scale);
+        else
+            imgui.SetWindowFontScale(ui.font_scale);
+        end
 
         -- Tab bar
         if imgui.BeginTabBar('##homework_tabs', ImGuiTabBarFlags_None) then
@@ -1652,6 +1678,11 @@ local function render_ui()
             imgui.EndTabBar();
         end
 
+        -- Pop font scale
+        if _useNewFont then
+            imgui.PopFont();
+        end
+
     else
         imgui.PopStyleColor(5);
         imgui.PopStyleVar(2);
@@ -1795,7 +1826,7 @@ local function show_char_details(char_name)
                 local time_left = timer_data.next_ki_time - current_time;
                 local days = math.floor(time_left / 86400);
                 local hours = math.floor((time_left % 86400) / 3600);
-                if timer_data.has_ki then status_icon = '\30\110[KI]\30\106'; else status_icon = '\30\110[   ]\30\106'; end
+                if timer_data.has_ki then status_icon = '\30\076[KI]\30\106'; else status_icon = '\30\076[   ]\30\106'; end
                 if days > 0 then status_text = string.format('\30\071(%dd %dh)\30\106', days, hours);
                 else status_text = string.format('\30\071(%dh)\30\106', hours); end
             end
