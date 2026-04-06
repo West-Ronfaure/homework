@@ -5,6 +5,7 @@ Weekly task tracker for FFXI Horizon Server.
 This addon tracks your weekly objectives and ENM timers. It was created specifically for Horizon Server due to differences in EcoWarrior mechanics and includes tracking for the custom Highwind NM.
 
 ## Tracked Tasks
+- Dynamis entry
 - EcoWarrior (with nation rotation)
 - Highwind
 - UnInvited
