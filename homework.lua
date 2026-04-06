@@ -5,7 +5,7 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-addon.version   = '3.2';
+addon.version   = '3.3';
 addon.desc      = 'Weekly homework tracker for FFXI';
 addon.link      = '';
 
@@ -15,11 +15,9 @@ local imgui = require('imgui');
 -- UI State
 local ui = {
     is_open = { false },
-    show_settings = false,
     selected_char = { 0 },  -- Shared character selection for both tabs
     char_list = {},
-    font_scale = 1.0,
-    selected_tab = 0,  -- 0 = Tasks, 1 = Settings
+    font_scale = 1.2,
     window_flags = bit.bor(
         ImGuiWindowFlags_NoCollapse
     ),
@@ -183,8 +181,9 @@ local tracker = {
     -- Login detection state
     login_state = {
         waiting_for_login = false,  -- Set true after logout, cleared on next zone-in
-        waiting_for_ki = false,     -- Set true after login, cleared after KI packets received
-        ki_packets_received = 0     -- Count of 0x0055 packets received (need 7 total)
+        waiting_for_ki = false,     -- Set true after login/zone, cleared after KI packets received
+        ki_packets_received = 0,    -- Count of 0x0055 packets received (need 7 total)
+        suppress_ki_events = false  -- Set true during zone-in to prevent false "obtained" messages
     },
     -- KI state tracking (for detecting gain/loss via 0x055)
     -- 3 states: nil = unknown, true = has KI, false = doesn't have KI
@@ -234,9 +233,28 @@ local LIMBUS_CARDS = {
     { ki_id = 350, name = 'Red Card', location = 'Apollyon (NW, SW)' }
 };
 
+-- Dynamis zone IDs
+local DYNAMIS_ZONES = {
+    [185] = 'San d\'Oria',
+    [186] = 'Bastok',
+    [187] = 'Windurst',
+    [188] = 'Jeuno',
+    [134] = 'Beaucedine',
+    [135] = 'Xarcabard',
+    [39] = 'Valkurm',
+    [40] = 'Buburimu',
+    [41] = 'Qufim',
+    [42] = 'Tavnazia'
+};
+
+-- Dynamis runtime state (not saved)
+local dynamis_state = {
+    pending_entry = false,  -- Glass was traded, waiting to zone in
+};
+
 -- Display settings structure
 local display_settings = {
-    font_scale = 1.0,
+    font_scale = 1.2,
     tracked = {}  -- Per-character tracking: [char_name] = {tasks = {task1=true, ...}, timers = {timer1=true, ...}}
 };
 
@@ -400,7 +418,8 @@ local function get_char_data()
             enm_timers = {},
             xsknife_data = { step = 'unknown', has_ki = false },
             quest_steps = { highwind = 'scanned', uninvited = 'unknown', spicegals = 'unknown', cookbook = 'unknown' },
-            ecowarrior_data = { step = 'unknown', current_nation = nil, locked_nations = {}, knows_status = false }
+            ecowarrior_data = { step = 'unknown', current_nation = nil, locked_nations = {}, knows_status = false },
+            dynamis_data = { entries_remaining = 2, glass_used = false }
         };
         save_settings();
         print_success('Created new tracker for character: ' .. tracker.current_char);
@@ -435,6 +454,10 @@ local function get_char_data()
         local eco = tracker.settings.characters[tracker.current_char].ecowarrior_data;
         -- If step is 'scanned', 'ready', or 'done', we know status
         eco.knows_status = (eco.step == 'scanned' or eco.step == 'ready' or eco.step == 'done');
+    end
+    -- Ensure dynamis_data exists
+    if tracker.settings.characters[tracker.current_char].dynamis_data == nil then
+        tracker.settings.characters[tracker.current_char].dynamis_data = { entries_remaining = 2, glass_used = false };
     end
     return tracker.settings.characters[tracker.current_char];
 end
@@ -518,8 +541,8 @@ local function scan_key_items(silent)
     if char_data.quest_steps.highwind == 'unknown' then char_data.quest_steps.highwind = 'scanned'; end
     -- Scan SpiceGals KI
     if has_key_item(SPICEGALS_KI_ID) then
-        if char_data.quest_steps.spicegals == 'unknown' or char_data.quest_steps.spicegals == 'scanned' or char_data.quest_steps.spicegals == 'rouva' or char_data.quest_steps.spicegals == 'riverne' then
-            char_data.quest_steps.spicegals = 'rouva_return';
+        if char_data.quest_steps.spicegals == 'unknown' or char_data.quest_steps.spicegals == 'scanned' or char_data.quest_steps.spicegals == 'riverne' then
+            char_data.quest_steps.spicegals = 'rouva';
             if not silent then print_msg('Found Rivernewort - Go to Rouva!'); end
         end
     elseif char_data.quest_steps.spicegals == 'unknown' then
@@ -578,9 +601,6 @@ local function on_ki_gained(ki_id)
     -- Check ENM/Limbus KIs
     for _, enm in ipairs(ENM_KEY_ITEMS) do
         if ki_id == enm.ki_id then
-            -- Skip if timer is still active (prevents reload/zone/BCNM entry from resetting timers)
-            local timer_data = char_data.enm_timers[enm.name];
-            if timer_data ~= nil and timer_data.next_ki_time ~= nil and timer_data.next_ki_time > os.time() then return; end
             local current_time = os.time();
             char_data.enm_timers[enm.name] = { has_ki = true, next_ki_time = current_time + enm.cooldown, timer_source = 'obtained' };
             save_settings();
@@ -592,8 +612,6 @@ local function on_ki_gained(ki_id)
     end
     -- Check X'sKnife KIs
     if ki_id == XSKNIFE_KI_ID_FIRST or ki_id == XSKNIFE_KI_ID_REPEAT then
-        -- Skip if saved data already shows we have this KI (prevents reload/zone false triggers)
-        if char_data.xsknife_data.has_ki then return; end
         char_data.xsknife_data.has_ki = true;
         local current_step = char_data.xsknife_data.step;
         if current_step == 'unknown' or current_step == 'scanned_no_ki' or current_step == 'scanned_has_ki_used' then
@@ -607,9 +625,6 @@ local function on_ki_gained(ki_id)
     end
     -- Check CookBook KI
     if ki_id == COOKBOOK_KI_ID then
-        -- Skip if already at or past KI stage (prevents reload/zone false triggers)
-        local cb_step = char_data.quest_steps.cookbook;
-        if cb_step == 'jonette_return' or cb_step == 'done' then return; end
         char_data.quest_steps.cookbook = 'jonette_return';
         save_settings();
         print_success('Obtained Tavnazian Cookbook - Return to Jonette!');
@@ -617,19 +632,13 @@ local function on_ki_gained(ki_id)
     end
     -- Check SpiceGals KI
     if ki_id == SPICEGALS_KI_ID then
-        -- Skip if already at or past KI stage (prevents reload/zone false triggers)
-        local sg_step = char_data.quest_steps.spicegals;
-        if sg_step == 'rouva_return' or sg_step == 'done' then return; end
-        char_data.quest_steps.spicegals = 'rouva_return';
+        char_data.quest_steps.spicegals = 'rouva';
         save_settings();
-        print_success('Obtained Rivernewort - Return to Rouva!');
+        print_success('Obtained Rivernewort - Go to Rouva!');
         return;
     end
     -- Check UnInvited KI
     if ki_id == UNINVITED_KI_ID then
-        -- Skip if already at or past KI stage (prevents reload/zone false triggers)
-        local ui_step = char_data.quest_steps.uninvited;
-        if ui_step == 'bcnm' or ui_step == 'justinius_return' or ui_step == 'done' then return; end
         char_data.quest_steps.uninvited = 'bcnm';
         save_settings();
         print_success('Obtained Monarch Linn Patrol Permit - Head to BCNM!');
@@ -640,10 +649,6 @@ local function on_ki_gained(ki_id)
         if ki_id == id then
             local eco_data = char_data.ecowarrior_data;
             if eco_data ~= nil then
-                -- Skip if already past KI stage (prevents reload/zone false triggers)
-                local current_step = eco_data.step;
-                if current_step == 'field_agent_return' or current_step == 'reward' or current_step == 'done' then return; end
-                if current_step == 'scanned_has_ki' and eco_data.current_nation == nation then return; end
                 local zone_info = ECOWARRIOR_ZONES[nation];
                 if eco_data.step == 'unknown' or eco_data.step == 'scanned_has_ki' then
                     -- Don't know locked nations yet
@@ -681,8 +686,6 @@ local function on_ki_lost(ki_id)
     end
     -- Check X'sKnife KIs
     if ki_id == XSKNIFE_KI_ID_FIRST or ki_id == XSKNIFE_KI_ID_REPEAT then
-        -- Skip if saved data already shows we don't have this KI (prevents reload/zone false triggers)
-        if not char_data.xsknife_data.has_ki then return; end
         char_data.xsknife_data.has_ki = false;
         local current_step = char_data.xsknife_data.step;
         if current_step == 'unknown' or current_step == 'scanned_has_ki' then
@@ -708,7 +711,7 @@ local function on_ki_lost(ki_id)
     end
     -- Check SpiceGals KI
     if ki_id == SPICEGALS_KI_ID then
-        if char_data.quest_steps.spicegals == 'rouva_return' then
+        if char_data.quest_steps.spicegals == 'rouva' then
             char_data.quest_steps.spicegals = 'done';
             save_settings();
             print_success('SpiceGals complete!');
@@ -729,8 +732,6 @@ local function on_ki_lost(ki_id)
         if ki_id == id then
             local eco_data = char_data.ecowarrior_data;
             if eco_data ~= nil then
-                -- Skip if already done (prevents reload/zone false triggers)
-                if eco_data.step == 'done' or eco_data.step == 'ready' or eco_data.step == 'scanned' or eco_data.step == 'unknown' then return; end
                 if eco_data.knows_status then
                     -- We know locked nations, track completion
                     eco_data.step = 'done';
@@ -794,7 +795,7 @@ local function reset_character_data(char_data)
     -- SpiceGals: only reset if done, otherwise keep current step
     local spicegals_step = char_data.quest_steps and char_data.quest_steps.spicegals or 'unknown';
     if spicegals_step == 'done' or spicegals_step == 'unknown' or spicegals_step == 'scanned' then
-        spicegals_step = 'rouva';
+        spicegals_step = 'riverne';
     end
     -- CookBook: only reset if done, otherwise keep current step
     local cookbook_step = char_data.quest_steps and char_data.quest_steps.cookbook or 'unknown';
@@ -841,6 +842,13 @@ local function reset_character_data(char_data)
         elseif current_step == 'done' then
             char_data.xsknife_data.step = 'despachiaire';
         end
+    end
+    -- Reset Dynamis entries
+    if char_data.dynamis_data then
+        char_data.dynamis_data.entries_remaining = 2;
+        char_data.dynamis_data.glass_used = false;
+    else
+        char_data.dynamis_data = { entries_remaining = 2, glass_used = false };
     end
 end
 
@@ -964,9 +972,8 @@ local function show_list()
             local step = char_data.quest_steps.spicegals or 'unknown';
             if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
             elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
+            elseif step == 'riverne' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[??? Riverne B]\30\106 ' .. task);
             elseif step == 'rouva' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva]\30\106 ' .. task);
-            elseif step == 'riverne' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Riverne B]\30\106 ' .. task);
-            elseif step == 'rouva_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva]\30\106 ' .. task);
             elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
         elseif normalized == 'cookbook' then
             local step = char_data.quest_steps.cookbook or 'unknown';
@@ -1170,7 +1177,7 @@ local function factory_reset()
     tracker.kis = {};
     tracker.kis_initialized = false;
     display_settings.tracked = {};
-    ui.font_scale = 1.0;
+    ui.font_scale = 1.2;
     ui.char_list = {};
     ui.selected_char = { 0 };
     -- Re-initialize current character
@@ -1300,6 +1307,29 @@ local function render_ui()
         -- Get tracking settings for current character
         local tracking = get_char_tracking(char_name);
 
+        -- Dynamis entry counter (displayed above EcoWarrior)
+        if char_data.dynamis_data then
+            local entries = char_data.dynamis_data.entries_remaining or 2;
+            local dyn_icon, dyn_color;
+            if entries == 0 then
+                dyn_icon = '[X]';
+                dyn_color = { 1.0, 0.3, 0.3, 1.0 };  -- Red
+            elseif entries == 1 then
+                dyn_icon = '[1]';
+                dyn_color = { 1.0, 1.0, 0.0, 1.0 };  -- Yellow
+            else
+                dyn_icon = '[2]';
+                dyn_color = { 0.0, 1.0, 0.0, 1.0 };  -- Green
+            end
+            imgui.TextColored(dyn_color, dyn_icon);
+            imgui.SameLine();
+            imgui.SetCursorPosX(col_task);
+            imgui.Text('Dynamis');
+            imgui.SameLine();
+            imgui.SetCursorPosX(col_location);
+            imgui.TextColored({ 0.6, 0.8, 1.0, 1.0 }, entries .. ' entries left');
+        end
+
         for _, task in ipairs(tracker.settings.tasks) do
             -- Skip if not tracked for this character
             if not tracking.tasks[task] then
@@ -1352,9 +1382,8 @@ local function render_ui()
             elseif normalized == 'spicegals' then
                 local step = char_data.quest_steps and char_data.quest_steps.spicegals or 'unknown';
                 if step == 'done' then icon = '[X]'; color = { 1.0, 0.3, 0.3, 1.0 };
-                elseif step == 'rouva' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Rouva';
                 elseif step == 'riverne' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Riverne B';
-                elseif step == 'rouva_return' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Rouva';
+                elseif step == 'rouva' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Rouva';
                 elseif step == 'scanned' then
                     icon = '[  ]'; color = { 1.0, 1.0, 0.0, 1.0 };
                     help_text = "Unknown progress. Resolves at next tally.\n/hw spice to toggle.";
@@ -1392,7 +1421,7 @@ local function render_ui()
                         elseif n == 'bastok' then table.insert(available, 'Bastok'); end
                     end
                 end
-                local available_text = #available == 3 and 'All nations' or (#available > 0 and table.concat(available, '/') or 'All done');
+                local available_text = #available > 0 and table.concat(available, '/') or 'All done';
 
                 if step == 'done' then
                     icon = '[X]'; color = { 1.0, 0.3, 0.3, 1.0 };
@@ -1620,39 +1649,36 @@ local function render_ui()
                         imgui.Unindent(2);
                     end
 
-                    -- X'sKnife count override (show when character has active or uncertain boneyard step)
+                    imgui.Spacing();
+                    imgui.Spacing();
+                    
+                    -- Dynamis Run Count manual override
                     local settings_char_data = tracker.settings.characters[settings_char];
-                    if settings_char_data and settings_char_data.xsknife_data then
-                        local xs_step = settings_char_data.xsknife_data.step;
-                        if xs_step == 'boneyard' or xs_step == 'boneyard_2x' or xs_step == 'scanned_has_ki' or xs_step == 'scanned_no_ki' or xs_step == 'scanned_has_ki_used' then
-                            imgui.Spacing();
-                            imgui.Spacing();
-                            imgui.TextColored({ 0.7, 0.7, 0.7, 1.0 }, "X'sKnife Run Count:");
-                            imgui.Spacing();
-                            imgui.Indent(2);
-                            local has_ki = xs_step == 'boneyard' or xs_step == 'boneyard_2x' or xs_step == 'scanned_has_ki';
-                            if has_ki then
-                                local is_1x = xs_step == 'boneyard' or xs_step == 'scanned_has_ki';
-                                if imgui.RadioButton('1 Run##xsknife', is_1x) and not is_1x then
-                                    settings_char_data.xsknife_data.step = 'boneyard';
-                                    save_settings();
-                                end
-                                imgui.SameLine();
-                                if imgui.RadioButton('2 Runs##xsknife', not is_1x) and is_1x then
-                                    settings_char_data.xsknife_data.step = 'boneyard_2x';
-                                    save_settings();
-                                end
-                            else
-                                -- No KI - show greyed out
-                                imgui.PushStyleColor(ImGuiCol_Text, { 0.4, 0.4, 0.4, 1.0 });
-                                imgui.PushStyleColor(ImGuiCol_CheckMark, { 0.4, 0.4, 0.4, 1.0 });
-                                imgui.RadioButton('1 Run##xsknife', false);
-                                imgui.SameLine();
-                                imgui.RadioButton('2 Runs##xsknife', false);
-                                imgui.PopStyleColor(2);
-                            end
-                            imgui.Unindent(2);
+                    if settings_char_data and settings_char_data.dynamis_data then
+                        imgui.TextColored({ 0.7, 0.7, 0.7, 1.0 }, 'Dynamis Run Count:');
+                        local entries = settings_char_data.dynamis_data.entries_remaining or 2;
+                        
+                        -- Radio buttons for 0, 1, 2 runs
+                        imgui.Indent(2);
+                        local sel_0 = { entries == 0 };
+                        local sel_1 = { entries == 1 };
+                        local sel_2 = { entries == 2 };
+                        
+                        if imgui.RadioButton('0 Runs', sel_0[1]) then
+                            settings_char_data.dynamis_data.entries_remaining = 0;
+                            save_settings();
                         end
+                        imgui.SameLine();
+                        if imgui.RadioButton('1 Run', sel_1[1]) then
+                            settings_char_data.dynamis_data.entries_remaining = 1;
+                            save_settings();
+                        end
+                        imgui.SameLine();
+                        if imgui.RadioButton('2 Runs', sel_2[1]) then
+                            settings_char_data.dynamis_data.entries_remaining = 2;
+                            save_settings();
+                        end
+                        imgui.Unindent(2);
                     end
 
                     imgui.Spacing();
@@ -1678,7 +1704,7 @@ local function render_ui()
             imgui.EndTabBar();
         end
 
-        -- Pop font scale
+        -- Pop font if we used PushFont
         if _useNewFont then
             imgui.PopFont();
         end
@@ -1750,9 +1776,8 @@ local function show_char_details(char_name)
             local step = char_data.quest_steps.spicegals or 'unknown';
             if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
             elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
+            elseif step == 'riverne' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[??? Riverne B]\30\106 ' .. task);
             elseif step == 'rouva' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva]\30\106 ' .. task);
-            elseif step == 'riverne' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Riverne B]\30\106 ' .. task);
-            elseif step == 'rouva_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva]\30\106 ' .. task);
             elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
         elseif normalized == 'cookbook' then
             local step = char_data.quest_steps.cookbook or 'unknown';
@@ -1849,7 +1874,7 @@ local function toggle_task(task)
         else char_data.quest_steps.uninvited = 'done'; print_success('Marked ' .. proper_name .. ' as completed for ' .. tracker.current_char .. '!'); end
         save_settings(); return;
     elseif normalized == 'spicegals' then
-        if char_data.quest_steps.spicegals == 'done' then char_data.quest_steps.spicegals = 'rouva'; print_success('Unmarked ' .. proper_name .. ' for ' .. tracker.current_char);
+        if char_data.quest_steps.spicegals == 'done' then char_data.quest_steps.spicegals = 'riverne'; print_success('Unmarked ' .. proper_name .. ' for ' .. tracker.current_char);
         else char_data.quest_steps.spicegals = 'done'; print_success('Marked ' .. proper_name .. ' as completed for ' .. tracker.current_char .. '!'); end
         save_settings(); return;
     elseif normalized == 'cookbook' then
@@ -1990,14 +2015,6 @@ ashita.events.register('text_in', 'text_in_cb', function(e)
             print_success('CookBook started - Head to ??? in Sacrarium!');
         end
     end
-    -- SpiceGals quest acceptance (Rouva in Southern San d'Oria)
-    if zone_id == 230 and message:find('Forget the words I have spoken') then
-        if char_data.quest_steps.spicegals == 'rouva' or char_data.quest_steps.spicegals == 'unknown' or char_data.quest_steps.spicegals == 'scanned' then
-            char_data.quest_steps.spicegals = 'riverne';
-            save_settings();
-            print_success('SpiceGals accepted - Head to Riverne B for Rivernewort!');
-        end
-    end
     -- EcoWarrior quest acceptance San d'Oria (Norejaie in Southern San d'Oria)
     if zone_id == 230 and (message:find("Rojaireaut, our V.E.R.M.I.N. agent") or message:find("I knew you'd come through for us")) then
         local eco_data = char_data.ecowarrior_data;
@@ -2124,13 +2141,37 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
             tracker.login_state.waiting_for_login = true;
             tracker.kis = {};
             tracker.kis_initialized = false;
+            dynamis_state.pending_entry = false;  -- Reset pending entry on logout
             print_msg('Logout detected.');
         end
         return;
     end
-    -- Login packet
+    -- Login packet (also received on zone-in)
     if id == 0x000A then
+        -- Get zone ID from packet
+        local zone_id = struct.unpack('H', data, 0x30 + 1) or 0;
+        
+        -- Check if this is a Dynamis zone
+        if DYNAMIS_ZONES[zone_id] then
+            local char_data = get_char_data();
+            if char_data and char_data.dynamis_data then
+                -- Only count if: pending_entry is true AND glass_used is false
+                if dynamis_state.pending_entry and not char_data.dynamis_data.glass_used then
+                    if char_data.dynamis_data.entries_remaining > 0 then
+                        char_data.dynamis_data.entries_remaining = char_data.dynamis_data.entries_remaining - 1;
+                        char_data.dynamis_data.glass_used = true;
+                        save_settings();
+                        print_success('Dynamis entry counted! ' .. char_data.dynamis_data.entries_remaining .. ' entries remaining this week.');
+                    else
+                        print_msg('Dynamis entry detected but counter already at 0.');
+                    end
+                end
+                dynamis_state.pending_entry = false;
+            end
+        end
+        
         if tracker.login_state.waiting_for_login then
+            -- Full login - character change
             tracker.login_state.waiting_for_login = false;
             tracker.kis = {};
             tracker.kis_initialized = false;
@@ -2142,7 +2183,12 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
                 print_success('Character loaded: ' .. current_char);
                 tracker.login_state.waiting_for_ki = true;
                 tracker.login_state.ki_packets_received = 0;
+                tracker.login_state.suppress_ki_events = true;
             end
+        else
+            -- Zone-in (not a fresh login) - suppress KI events until packets stabilize
+            tracker.login_state.suppress_ki_events = true;
+            tracker.login_state.ki_packets_received = 0;
         end
         return;
     end
@@ -2155,29 +2201,57 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
             local bit_index = i % 8;
             local ki_byte = struct.unpack('B', data, 0x04 + byte_index + 1);
             local has_ki = bit.band(bit.rshift(ki_byte, bit_index), 1) == 1;
-            if (tracker.kis[ki_position] ~= nil) and (has_ki ~= tracker.kis[ki_position]) then
-                if has_ki then on_ki_gained(ki_position); else on_ki_lost(ki_position); end
+            -- Only trigger events if not suppressed (zone-in/login in progress)
+            if not tracker.login_state.suppress_ki_events then
+                if (tracker.kis[ki_position] ~= nil) and (has_ki ~= tracker.kis[ki_position]) then
+                    if has_ki then on_ki_gained(ki_position); else on_ki_lost(ki_position); end
+                end
             end
             tracker.kis[ki_position] = has_ki;
         end
-        if tracker.login_state.waiting_for_ki then
-            tracker.login_state.ki_packets_received = tracker.login_state.ki_packets_received + 1;
-            if tracker.login_state.ki_packets_received >= 7 then
+        -- Track packets received during login/zone
+        tracker.login_state.ki_packets_received = tracker.login_state.ki_packets_received + 1;
+        if tracker.login_state.ki_packets_received >= 7 then
+            -- All KI packets received - clear suppression and update state
+            tracker.login_state.suppress_ki_events = false;
+            tracker.login_state.ki_packets_received = 0;
+            tracker.kis_initialized = true;
+            if tracker.login_state.waiting_for_ki then
                 tracker.login_state.waiting_for_ki = false;
-                tracker.login_state.ki_packets_received = 0;
-                tracker.kis_initialized = true;
                 local char_data = get_char_data();
                 if char_data ~= nil then
                     scan_key_items(true);
                     print_success('Auto-scanned key items.');
                 end
             end
-        else
-            tracker.kis_initialized = true;
         end
         return;
     end
     return;
+end);
+
+-- Outgoing packet handler for Dynamis tracking
+ashita.events.register('packet_out', 'packet_out_cb', function(e)
+    local id = e.id;
+    local data = e.data;
+    
+    -- Trade packet (0x036) - any trade could be Perpetual Hourglass
+    -- We set pending_entry and let zone detection confirm it's Dynamis
+    if id == 0x036 then
+        dynamis_state.pending_entry = true;
+        return;
+    end
+    
+    -- Drop packet (0x028) - reset glass_used flag
+    -- When player drops something and glass_used is true, assume they dropped the glass
+    if id == 0x028 then
+        local char_data = get_char_data();
+        if char_data and char_data.dynamis_data and char_data.dynamis_data.glass_used then
+            char_data.dynamis_data.glass_used = false;
+            save_settings();
+        end
+        return;
+    end
 end);
 
 ashita.events.register('d3d_present', 'd3d_present_cb', function()
