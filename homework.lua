@@ -247,10 +247,8 @@ local DYNAMIS_ZONES = {
     [42] = 'Tavnazia'
 };
 
--- Dynamis runtime state (not saved)
-local dynamis_state = {
-    pending_entry = false,  -- Glass was traded, waiting to zone in
-};
+-- Perpetual Hourglass item ID
+local PERPETUAL_HOURGLASS_ID = 4237;
 
 -- Display settings structure
 local display_settings = {
@@ -843,10 +841,9 @@ local function reset_character_data(char_data)
             char_data.xsknife_data.step = 'despachiaire';
         end
     end
-    -- Reset Dynamis entries
+    -- Reset Dynamis entries (glass_used stays - only reset when glass is actually dropped)
     if char_data.dynamis_data then
         char_data.dynamis_data.entries_remaining = 2;
-        char_data.dynamis_data.glass_used = false;
     else
         char_data.dynamis_data = { entries_remaining = 2, glass_used = false };
     end
@@ -1421,7 +1418,10 @@ local function render_ui()
                         elseif n == 'bastok' then table.insert(available, 'Bastok'); end
                     end
                 end
-                local available_text = #available > 0 and table.concat(available, '/') or 'All done';
+                local available_text;
+                if #available == 3 or #available == 0 then available_text = 'All Nations';
+                elseif #available == 2 then available_text = available[1] .. ' & ' .. available[2];
+                else available_text = available[1]; end
 
                 if step == 'done' then
                     icon = '[X]'; color = { 1.0, 0.3, 0.3, 1.0 };
@@ -2141,7 +2141,6 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
             tracker.login_state.waiting_for_login = true;
             tracker.kis = {};
             tracker.kis_initialized = false;
-            dynamis_state.pending_entry = false;  -- Reset pending entry on logout
             print_msg('Logout detected.');
         end
         return;
@@ -2155,18 +2154,20 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
         if DYNAMIS_ZONES[zone_id] then
             local char_data = get_char_data();
             if char_data and char_data.dynamis_data then
-                -- Only count if: pending_entry is true AND glass_used is false
-                if dynamis_state.pending_entry and not char_data.dynamis_data.glass_used then
+                -- Count if: new glass (glass_used false) OR different Dynamis zone
+                local is_new_entry = not char_data.dynamis_data.glass_used;
+                local is_different_zone = char_data.dynamis_data.glass_used and char_data.dynamis_data.dynamis_zone ~= zone_id;
+                if is_new_entry or is_different_zone then
                     if char_data.dynamis_data.entries_remaining > 0 then
                         char_data.dynamis_data.entries_remaining = char_data.dynamis_data.entries_remaining - 1;
                         char_data.dynamis_data.glass_used = true;
+                        char_data.dynamis_data.dynamis_zone = zone_id;
                         save_settings();
                         print_success('Dynamis entry counted! ' .. char_data.dynamis_data.entries_remaining .. ' entries remaining this week.');
                     else
                         print_msg('Dynamis entry detected but counter already at 0.');
                     end
                 end
-                dynamis_state.pending_entry = false;
             end
         end
         
@@ -2232,23 +2233,23 @@ end);
 
 -- Outgoing packet handler for Dynamis tracking
 ashita.events.register('packet_out', 'packet_out_cb', function(e)
-    local id = e.id;
-    local data = e.data;
-    
-    -- Trade packet (0x036) - any trade could be Perpetual Hourglass
-    -- We set pending_entry and let zone detection confirm it's Dynamis
-    if id == 0x036 then
-        dynamis_state.pending_entry = true;
-        return;
-    end
-    
-    -- Drop packet (0x028) - reset glass_used flag
-    -- When player drops something and glass_used is true, assume they dropped the glass
-    if id == 0x028 then
+    -- Drop packet (0x028) - check if dropped item is Perpetual Hourglass
+    if e.id == 0x028 then
         local char_data = get_char_data();
         if char_data and char_data.dynamis_data and char_data.dynamis_data.glass_used then
-            char_data.dynamis_data.glass_used = false;
-            save_settings();
+            -- Read slot info from packet (container at 0x08, slot at 0x09)
+            local container = struct.unpack('B', e.data, 0x08 + 1) or 0;
+            local slot = struct.unpack('B', e.data, 0x09 + 1) or 0;
+            -- Check if this slot contains the Perpetual Hourglass
+            local ok, item_id = pcall(function()
+                local item = AshitaCore:GetMemoryManager():GetInventory():GetContainerItem(container, slot);
+                return item and item.Id or 0;
+            end);
+            if ok and item_id == PERPETUAL_HOURGLASS_ID then
+                char_data.dynamis_data.glass_used = false;
+                char_data.dynamis_data.dynamis_zone = nil;
+                save_settings();
+            end
         end
         return;
     end
