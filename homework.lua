@@ -5,7 +5,7 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-addon.version   = '3.3';
+addon.version   = '3.3.1';
 addon.desc      = 'Weekly homework tracker for FFXI';
 addon.link      = '';
 
@@ -539,9 +539,9 @@ local function scan_key_items(silent)
     if char_data.quest_steps.highwind == 'unknown' then char_data.quest_steps.highwind = 'scanned'; end
     -- Scan SpiceGals KI
     if has_key_item(SPICEGALS_KI_ID) then
-        if char_data.quest_steps.spicegals == 'unknown' or char_data.quest_steps.spicegals == 'scanned' or char_data.quest_steps.spicegals == 'riverne' then
-            char_data.quest_steps.spicegals = 'rouva';
-            if not silent then print_msg('Found Rivernewort - Go to Rouva!'); end
+        if char_data.quest_steps.spicegals == 'unknown' or char_data.quest_steps.spicegals == 'scanned' or char_data.quest_steps.spicegals == 'rouva' or char_data.quest_steps.spicegals == 'riverne' then
+            char_data.quest_steps.spicegals = 'rouva_return';
+            if not silent then print_msg('Found Rivernewort - Return to Rouva!'); end
         end
     elseif char_data.quest_steps.spicegals == 'unknown' then
         char_data.quest_steps.spicegals = 'scanned';
@@ -630,9 +630,9 @@ local function on_ki_gained(ki_id)
     end
     -- Check SpiceGals KI
     if ki_id == SPICEGALS_KI_ID then
-        char_data.quest_steps.spicegals = 'rouva';
+        char_data.quest_steps.spicegals = 'rouva_return';
         save_settings();
-        print_success('Obtained Rivernewort - Go to Rouva!');
+        print_success('Obtained Rivernewort - Return to Rouva!');
         return;
     end
     -- Check UnInvited KI
@@ -709,7 +709,7 @@ local function on_ki_lost(ki_id)
     end
     -- Check SpiceGals KI
     if ki_id == SPICEGALS_KI_ID then
-        if char_data.quest_steps.spicegals == 'rouva' then
+        if char_data.quest_steps.spicegals == 'rouva_return' then
             char_data.quest_steps.spicegals = 'done';
             save_settings();
             print_success('SpiceGals complete!');
@@ -793,7 +793,7 @@ local function reset_character_data(char_data)
     -- SpiceGals: only reset if done, otherwise keep current step
     local spicegals_step = char_data.quest_steps and char_data.quest_steps.spicegals or 'unknown';
     if spicegals_step == 'done' or spicegals_step == 'unknown' or spicegals_step == 'scanned' then
-        spicegals_step = 'riverne';
+        spicegals_step = 'rouva';
     end
     -- CookBook: only reset if done, otherwise keep current step
     local cookbook_step = char_data.quest_steps and char_data.quest_steps.cookbook or 'unknown';
@@ -969,8 +969,9 @@ local function show_list()
             local step = char_data.quest_steps.spicegals or 'unknown';
             if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
             elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'riverne' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[??? Riverne B]\30\106 ' .. task);
             elseif step == 'rouva' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva]\30\106 ' .. task);
+            elseif step == 'riverne' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Riverne B]\30\106 ' .. task);
+            elseif step == 'rouva_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva]\30\106 ' .. task);
             elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
         elseif normalized == 'cookbook' then
             local step = char_data.quest_steps.cookbook or 'unknown';
@@ -1379,8 +1380,9 @@ local function render_ui()
             elseif normalized == 'spicegals' then
                 local step = char_data.quest_steps and char_data.quest_steps.spicegals or 'unknown';
                 if step == 'done' then icon = '[X]'; color = { 1.0, 0.3, 0.3, 1.0 };
-                elseif step == 'riverne' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Riverne B';
                 elseif step == 'rouva' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Rouva';
+                elseif step == 'riverne' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Riverne B';
+                elseif step == 'rouva_return' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Rouva';
                 elseif step == 'scanned' then
                     icon = '[  ]'; color = { 1.0, 1.0, 0.0, 1.0 };
                     help_text = "Unknown progress. Resolves at next tally.\n/hw spice to toggle.";
@@ -1776,8 +1778,9 @@ local function show_char_details(char_name)
             local step = char_data.quest_steps.spicegals or 'unknown';
             if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
             elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'riverne' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[??? Riverne B]\30\106 ' .. task);
             elseif step == 'rouva' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva]\30\106 ' .. task);
+            elseif step == 'riverne' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Riverne B]\30\106 ' .. task);
+            elseif step == 'rouva_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva]\30\106 ' .. task);
             elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
         elseif normalized == 'cookbook' then
             local step = char_data.quest_steps.cookbook or 'unknown';
@@ -1874,7 +1877,7 @@ local function toggle_task(task)
         else char_data.quest_steps.uninvited = 'done'; print_success('Marked ' .. proper_name .. ' as completed for ' .. tracker.current_char .. '!'); end
         save_settings(); return;
     elseif normalized == 'spicegals' then
-        if char_data.quest_steps.spicegals == 'done' then char_data.quest_steps.spicegals = 'riverne'; print_success('Unmarked ' .. proper_name .. ' for ' .. tracker.current_char);
+        if char_data.quest_steps.spicegals == 'done' then char_data.quest_steps.spicegals = 'rouva'; print_success('Unmarked ' .. proper_name .. ' for ' .. tracker.current_char);
         else char_data.quest_steps.spicegals = 'done'; print_success('Marked ' .. proper_name .. ' as completed for ' .. tracker.current_char .. '!'); end
         save_settings(); return;
     elseif normalized == 'cookbook' then
@@ -2013,6 +2016,14 @@ ashita.events.register('text_in', 'text_in_cb', function(e)
             char_data.quest_steps.cookbook = 'sacrarium';
             save_settings();
             print_success('CookBook started - Head to ??? in Sacrarium!');
+        end
+    end
+    -- SpiceGals quest acceptance (Rouva in Southern San d'Oria)
+    if zone_id == 230 and message:find("Forget the words I have spoken") then
+        if char_data.quest_steps.spicegals == 'rouva' or char_data.quest_steps.spicegals == 'unknown' or char_data.quest_steps.spicegals == 'scanned' then
+            char_data.quest_steps.spicegals = 'riverne';
+            save_settings();
+            print_success('SpiceGals started - Head to Riverne B for Rivernewort!');
         end
     end
     -- EcoWarrior quest acceptance San d'Oria (Norejaie in Southern San d'Oria)
