@@ -5,7 +5,7 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-addon.version   = '3.3.1';
+addon.version   = '3.4.0';
 addon.desc      = 'Weekly homework tracker for FFXI';
 addon.link      = '';
 
@@ -24,21 +24,57 @@ local ui = {
 };
 
 -- Custom settings file handling for Ashita v4
+-- As of 3.4.0, settings live in Ashita's config tree (Ashita4/config/addons/Homework/)
+-- instead of inside the addon folder. This keeps player data out of the addon folder
+-- so users can share the addon without accidentally leaking their character data.
 local settings_file = nil;
 local display_settings_file = nil;
 
+local function get_config_dir()
+    return AshitaCore:GetInstallPath() .. 'config/addons/' .. addon.name .. '/';
+end
+
+local function get_legacy_dir()
+    -- Old location used by versions <= 3.3.x
+    return addon.path .. '/settings/';
+end
+
 local function get_settings_path()
     if settings_file == nil then
-        settings_file = addon.path .. '/settings/homework.json';
+        settings_file = get_config_dir() .. 'homework.json';
     end
     return settings_file;
 end
 
 local function get_display_settings_path()
     if display_settings_file == nil then
-        display_settings_file = addon.path .. '/settings/display.json';
+        display_settings_file = get_config_dir() .. 'display.json';
     end
     return display_settings_file;
+end
+
+-- One-shot migration: if the legacy file exists and the new one doesn't, copy it
+-- to the new location and delete the original.
+local function migrate_settings_file(legacy_path, new_path)
+    if not ashita.fs.exists(legacy_path) then return; end
+    if ashita.fs.exists(new_path) then return; end
+    local src = io.open(legacy_path, 'rb');
+    if not src then return; end
+    local content = src:read('*all');
+    src:close();
+    local new_dir = get_config_dir();
+    if not ashita.fs.exists(new_dir) then ashita.fs.create_dir(new_dir); end
+    local dst = io.open(new_path, 'wb');
+    if not dst then return; end
+    dst:write(content);
+    dst:close();
+    os.remove(legacy_path);
+end
+
+local function migrate_legacy_settings()
+    local legacy_dir = get_legacy_dir();
+    migrate_settings_file(legacy_dir .. 'homework.json', get_settings_path());
+    migrate_settings_file(legacy_dir .. 'display.json', get_display_settings_path());
 end
 
 -- Known array field names (these should always serialize as [] not {})
@@ -201,7 +237,7 @@ local tracker = {
 -- Save settings function (must be after tracker is defined)
 local function save_settings()
     local path = get_settings_path();
-    local dir = addon.path .. '/settings/';
+    local dir = get_config_dir();
     if not ashita.fs.exists(dir) then
         ashita.fs.create_dir(dir);
     end
@@ -258,7 +294,7 @@ local display_settings = {
 
 local function save_display_settings()
     local path = get_display_settings_path();
-    local dir = addon.path .. '/settings/';
+    local dir = get_config_dir();
     if not ashita.fs.exists(dir) then
         ashita.fs.create_dir(dir);
     end
@@ -741,6 +777,12 @@ local function on_ki_lost(ki_id)
                     end
                     if not already_locked then
                         table.insert(eco_data.locked_nations, nation);
+                    elseif #eco_data.locked_nations >= 3 then
+                        -- Cycle-restart detection: re-completing a nation that's
+                        -- already locked while all 3 are locked means the in-game
+                        -- cycle silently reset. Start a fresh cycle with just this
+                        -- nation locked.
+                        eco_data.locked_nations = { nation };
                     end
                     eco_data.current_nation = nil;
                     save_settings();
@@ -1906,7 +1948,14 @@ local function toggle_task(task)
 end
 
 ashita.events.register('load', 'load_cb', function()
-    local dir = addon.path .. '/settings/';
+    -- One-shot migration from legacy path (addon/settings) to config/addons/Homework
+    migrate_legacy_settings();
+    -- Try to remove the now-empty legacy dir (best-effort; only succeeds if empty)
+    local legacy_dir = get_legacy_dir();
+    if ashita.fs.exists(legacy_dir) then
+        os.remove(legacy_dir);
+    end
+    local dir = get_config_dir();
     if not ashita.fs.exists(dir) then
         ashita.fs.create_dir(dir);
     end
