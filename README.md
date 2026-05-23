@@ -1,4 +1,4 @@
-# Homework (Horizon Server)
+# Homework (Horizon Server Approved by Aerec)
 
 Weekly task tracker for FFXI Horizon Server.
 
