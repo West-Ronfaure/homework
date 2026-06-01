@@ -5,7 +5,7 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-addon.version   = '3.4.0';
+addon.version   = '3.4.1';
 addon.desc      = 'Weekly homework tracker for FFXI';
 addon.link      = '';
 
@@ -1161,7 +1161,7 @@ local function show_timers()
                 local time_left = timer_data.next_ki_time - current_time;
                 local days = math.floor(time_left / 86400);
                 local hours = math.floor((time_left % 86400) / 3600);
-                if timer_data.has_ki then status_icon = '\30\076[KI]\30\106'; else status_icon = '\30\076[   ]\30\106'; end
+                if timer_data.has_ki then status_icon = '\30\076[KI]\30\106'; else status_icon = '\30\068[   ]\30\106'; end
                 if days > 0 then status_text = string.format('\30\071(%dd %dh)\30\106', days, hours);
                 else status_text = string.format('\30\071(%dh)\30\106', hours); end
             end
@@ -1304,7 +1304,7 @@ local function render_ui()
     imgui.PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
     imgui.PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
     
-    if imgui.Begin('Homework', ui.is_open, ui.window_flags) then
+    if imgui.Begin('Homework v' .. addon.version, ui.is_open, ui.window_flags) then
         imgui.PopStyleColor(5);
         imgui.PopStyleVar(2);
         
@@ -1590,11 +1590,11 @@ local function render_ui()
                     end
                     status_text = 'Unknown';
                 else
-                    -- Real timer counting down - CHANGED TO GREEN
+                    -- Real timer counting down
                     if timer_data.has_ki then
                         icon = '[KI]'; icon_color = { 0.0, 1.0, 0.0, 1.0 };
                     else
-                        icon = '[  ]'; icon_color = { 0.0, 1.0, 0.0, 1.0 };
+                        icon = '[  ]'; icon_color = { 1.0, 0.0, 0.0, 1.0 };
                     end
                     status_text = format_time_short(remaining);
                 end
@@ -1896,7 +1896,7 @@ local function show_char_details(char_name)
                 local time_left = timer_data.next_ki_time - current_time;
                 local days = math.floor(time_left / 86400);
                 local hours = math.floor((time_left % 86400) / 3600);
-                if timer_data.has_ki then status_icon = '\30\076[KI]\30\106'; else status_icon = '\30\076[   ]\30\106'; end
+                if timer_data.has_ki then status_icon = '\30\076[KI]\30\106'; else status_icon = '\30\068[   ]\30\106'; end
                 if days > 0 then status_text = string.format('\30\071(%dd %dh)\30\106', days, hours);
                 else status_text = string.format('\30\071(%dh)\30\106', hours); end
             end
