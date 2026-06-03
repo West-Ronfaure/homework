@@ -1541,7 +1541,7 @@ local function render_ui()
 
         -- Timer column positions scaled with font
         local timer_col_name = 40 * ui.font_scale;
-        local timer_col_status = 160 * ui.font_scale;
+        local timer_col_status = 170 * ui.font_scale;
 
         for _, enm in ipairs(ENM_KEY_ITEMS) do
             -- Skip if not tracked for this character
