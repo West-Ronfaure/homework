@@ -5,7 +5,7 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-addon.version   = '3.4.1';
+addon.version   = '3.4.2';
 addon.desc      = 'Weekly homework tracker for FFXI';
 addon.link      = '';
 
@@ -1003,25 +1003,25 @@ local function show_list()
             local step = char_data.quest_steps.uninvited or 'unknown';
             if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
             elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'justinius' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Justinius]\30\106 ' .. task);
+            elseif step == 'justinius' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Justinius - Start]\30\106 ' .. task);
             elseif step == 'bcnm' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[BCNM Monarch]\30\106 ' .. task);
-            elseif step == 'justinius_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Justinius]\30\106 ' .. task);
+            elseif step == 'justinius_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Justinius - Reward]\30\106 ' .. task);
             elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
         elseif normalized == 'spicegals' then
             local step = char_data.quest_steps.spicegals or 'unknown';
             if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
             elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'rouva' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva]\30\106 ' .. task);
+            elseif step == 'rouva' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva - Start]\30\106 ' .. task);
             elseif step == 'riverne' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Riverne B]\30\106 ' .. task);
-            elseif step == 'rouva_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva]\30\106 ' .. task);
+            elseif step == 'rouva_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva - Reward]\30\106 ' .. task);
             elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
         elseif normalized == 'cookbook' then
             local step = char_data.quest_steps.cookbook or 'unknown';
             if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
             elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'jonette' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Jonette]\30\106 ' .. task);
+            elseif step == 'jonette' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Jonette - Start]\30\106 ' .. task);
             elseif step == 'sacrarium' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[??? Sacrarium]\30\106 ' .. task);
-            elseif step == 'jonette_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Jonette]\30\106 ' .. task);
+            elseif step == 'jonette_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Jonette - Reward]\30\106 ' .. task);
             elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
         elseif normalized == 'ecowarrior' then
             local eco_data = char_data.ecowarrior_data or {step = 'unknown', current_nation = nil, locked_nations = {}, knows_status = false};
@@ -1409,9 +1409,9 @@ local function render_ui()
             elseif normalized == 'uninvited' then
                 local step = char_data.quest_steps and char_data.quest_steps.uninvited or 'unknown';
                 if step == 'done' then icon = '[X]'; color = { 1.0, 0.3, 0.3, 1.0 };
-                elseif step == 'justinius' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Justinius';
+                elseif step == 'justinius' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Justinius - Start';
                 elseif step == 'bcnm' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'BCNM Monarch';
-                elseif step == 'justinius_return' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Justinius';
+                elseif step == 'justinius_return' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Justinius - Reward';
                 elseif step == 'scanned' then
                     icon = '[  ]'; color = { 1.0, 1.0, 0.0, 1.0 };
                     help_text = "Unknown progress. Resolves at next tally.\n/hw uninvited to toggle.";
@@ -1422,9 +1422,9 @@ local function render_ui()
             elseif normalized == 'spicegals' then
                 local step = char_data.quest_steps and char_data.quest_steps.spicegals or 'unknown';
                 if step == 'done' then icon = '[X]'; color = { 1.0, 0.3, 0.3, 1.0 };
-                elseif step == 'rouva' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Rouva';
+                elseif step == 'rouva' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Rouva - Start';
                 elseif step == 'riverne' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Riverne B';
-                elseif step == 'rouva_return' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Rouva';
+                elseif step == 'rouva_return' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Rouva - Reward';
                 elseif step == 'scanned' then
                     icon = '[  ]'; color = { 1.0, 1.0, 0.0, 1.0 };
                     help_text = "Unknown progress. Resolves at next tally.\n/hw spice to toggle.";
@@ -1435,9 +1435,9 @@ local function render_ui()
             elseif normalized == 'cookbook' then
                 local step = char_data.quest_steps and char_data.quest_steps.cookbook or 'unknown';
                 if step == 'done' then icon = '[X]'; color = { 1.0, 0.3, 0.3, 1.0 };
-                elseif step == 'jonette' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Jonette';
+                elseif step == 'jonette' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Jonette - Start';
                 elseif step == 'sacrarium' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Sacrarium';
-                elseif step == 'jonette_return' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Jonette';
+                elseif step == 'jonette_return' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Jonette - Reward';
                 elseif step == 'scanned' then
                     icon = '[  ]'; color = { 1.0, 1.0, 0.0, 1.0 };
                     help_text = "Unknown progress. Resolves at next tally or use /hw cookbook.";
@@ -1812,25 +1812,25 @@ local function show_char_details(char_name)
             local step = char_data.quest_steps.uninvited or 'unknown';
             if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
             elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'justinius' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Justinius]\30\106 ' .. task);
+            elseif step == 'justinius' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Justinius - Start]\30\106 ' .. task);
             elseif step == 'bcnm' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[BCNM Monarch]\30\106 ' .. task);
-            elseif step == 'justinius_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Justinius]\30\106 ' .. task);
+            elseif step == 'justinius_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Justinius - Reward]\30\106 ' .. task);
             elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
         elseif normalized == 'spicegals' then
             local step = char_data.quest_steps.spicegals or 'unknown';
             if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
             elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'rouva' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva]\30\106 ' .. task);
+            elseif step == 'rouva' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva - Start]\30\106 ' .. task);
             elseif step == 'riverne' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Riverne B]\30\106 ' .. task);
-            elseif step == 'rouva_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva]\30\106 ' .. task);
+            elseif step == 'rouva_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva - Reward]\30\106 ' .. task);
             elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
         elseif normalized == 'cookbook' then
             local step = char_data.quest_steps.cookbook or 'unknown';
             if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
             elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'jonette' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Jonette]\30\106 ' .. task);
+            elseif step == 'jonette' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Jonette - Start]\30\106 ' .. task);
             elseif step == 'sacrarium' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[??? Sacrarium]\30\106 ' .. task);
-            elseif step == 'jonette_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Jonette]\30\106 ' .. task);
+            elseif step == 'jonette_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Jonette - Reward]\30\106 ' .. task);
             elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
         elseif normalized == 'ecowarrior' then
             local eco_data = char_data.ecowarrior_data or {step = 'unknown', current_nation = nil, locked_nations = {}, knows_status = false};
