@@ -5,7 +5,7 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-addon.version   = '3.4.2';
+addon.version   = '3.4.3';
 addon.desc      = 'Weekly homework tracker for FFXI';
 addon.link      = '';
 
@@ -2306,9 +2306,37 @@ ashita.events.register('packet_out', 'packet_out_cb', function(e)
                 return item and item.Id or 0;
             end);
             if ok and item_id == PERPETUAL_HOURGLASS_ID then
-                char_data.dynamis_data.glass_used = false;
-                char_data.dynamis_data.dynamis_zone = nil;
-                save_settings();
+                -- Before resetting glass_used, scan all bags for any remaining hourglass.
+                -- If the player still has one (e.g. they crafted multiple and dropped extras),
+                -- keep glass_used = true so re-zoning into Dynamis won't false-count.
+                local still_has_glass = false;
+                local sok, _ = pcall(function()
+                    local inv = AshitaCore:GetMemoryManager():GetInventory();
+                    local bags = { 0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+                    for _, bag in ipairs(bags) do
+                        local bag_max = inv:GetContainerCountMax(bag);
+                        if bag_max and bag_max > 0 then
+                            for s = 1, bag_max do
+                                local it = inv:GetContainerItem(bag, s);
+                                if it ~= nil then
+                                    local iok, iid = pcall(function() return it.Id; end);
+                                    if iok and iid == PERPETUAL_HOURGLASS_ID then
+                                        -- Skip the slot being dropped right now (its Id may still read here)
+                                        if not (bag == container and s == slot) then
+                                            still_has_glass = true;
+                                            return;
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end);
+                if not still_has_glass then
+                    char_data.dynamis_data.glass_used = false;
+                    char_data.dynamis_data.dynamis_zone = nil;
+                    save_settings();
+                end
             end
         end
         return;
