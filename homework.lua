@@ -5,7 +5,7 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-addon.version   = '3.4.3';
+addon.version   = '3.4.4';
 addon.desc      = 'Weekly homework tracker for FFXI';
 addon.link      = '';
 
@@ -885,7 +885,14 @@ local function reset_character_data(char_data)
     end
     -- Reset Dynamis entries (glass_used stays - only reset when glass is actually dropped)
     if char_data.dynamis_data then
-        char_data.dynamis_data.entries_remaining = 2;
+        -- If the player claimed a Dynamis zone before the weekly reset, carry that
+        -- usage forward so the entry they already spent doesn't get refunded.
+        if char_data.dynamis_data.claimed_before_reset then
+            char_data.dynamis_data.entries_remaining = 1;
+            char_data.dynamis_data.claimed_before_reset = false;
+        else
+            char_data.dynamis_data.entries_remaining = 2;
+        end
     else
         char_data.dynamis_data = { entries_remaining = 2, glass_used = false };
     end
@@ -2014,12 +2021,30 @@ ashita.events.register('text_in', 'text_in_cb', function(e)
     local zone_id = get_zone_id();
     local char_data = get_char_data();
     
-    -- Base mode 142: Highwind completion
+    -- Base mode 142: Highwind completion & Dynamis claim
     if base_mode == 142 then
         if is_in_highwind_zone() and message:contains('Obtained 3000 gil') then
             char_data.quest_steps.highwind = 'done';
             save_settings();
             print_success('Highwind complete!');
+        end
+        -- Dynamis zone-claim detection (two-step: claim message then obtain confirmation)
+        if message:find('The time and destination for your foray into Dynamis has been recorded') then
+            tracker.pending_dynamis_claim = os.time();
+        elseif message:find('Obtained: Perpetual hourglass') then
+            if tracker.pending_dynamis_claim ~= nil
+                and (os.time() - tracker.pending_dynamis_claim) <= 5
+                and char_data.dynamis_data ~= nil then
+                local dd = char_data.dynamis_data;
+                if not dd.glass_used and (dd.entries_remaining or 0) > 0 then
+                    dd.entries_remaining = dd.entries_remaining - 1;
+                    dd.glass_used = true;
+                    dd.claimed_before_reset = true;
+                    save_settings();
+                    print_success('Dynamis claim counted! Entries left: ' .. dd.entries_remaining);
+                end
+            end
+            tracker.pending_dynamis_claim = nil;
         end
         return;
     end
