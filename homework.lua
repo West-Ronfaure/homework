@@ -5,7 +5,7 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-addon.version   = '3.4.4';
+addon.version   = '3.5';
 addon.desc      = 'Weekly homework tracker for FFXI';
 addon.link      = '';
 
@@ -18,10 +18,13 @@ local ui = {
     selected_char = { 0 },  -- Shared character selection for both tabs
     char_list = {},
     font_scale = 1.2,
-    window_flags = bit.bor(
-        ImGuiWindowFlags_NoCollapse
-    ),
+    window_flags = ImGuiWindowFlags_NoCollapse,
+    -- Set when a tick lands on a full account: { char = name, from = index }
+    pending_account_add = nil,
 };
+
+-- Defined once the key item constants exist; used by save_settings below.
+local build_ki_cache;
 
 -- Custom settings file handling for Ashita v4
 -- As of 3.4.0, settings live in Ashita's config tree (Ashita4/config/addons/Homework/)
@@ -79,7 +82,11 @@ end
 
 -- Known array field names (these should always serialize as [] not {})
 -- Note: 'tasks' removed from here since display_settings.tracked uses it as an object {task_name: boolean}
-local ARRAY_FIELDS = { locked_nations = true };
+local ARRAY_FIELDS = { locked_nations = true, ki_cache = true, counted_glasses = true, chars = true, dynamis_accounts = true };
+
+local function escape_json_string(str)
+    return str:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t');
+end
 
 local function serialize_value(val, indent, key)
     indent = indent or '';
@@ -99,18 +106,16 @@ local function serialize_value(val, indent, key)
             for k, v in pairs(val) do
                 if not first then result = result .. ',\n'; end
                 first = false;
-                local key_str = '"' .. tostring(k) .. '"';
+                local key_str = '"' .. escape_json_string(tostring(k)) .. '"';
                 result = result .. indent .. '  ' .. key_str .. ': ' .. serialize_value(v, indent .. '  ', k);
             end
             if not first then result = result .. '\n' .. indent; end
             return result .. '}';
         end
     elseif t == 'string' then
-        return '"' .. val:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n') .. '"';
+        return '"' .. escape_json_string(val) .. '"';
     elseif t == 'boolean' then
         return val and 'true' or 'false';
-    elseif t == 'nil' then
-        return 'null';
     else
         return tostring(val);
     end
@@ -133,7 +138,14 @@ local function parse_json_value(str, pos)
             elseif ec == '"' then break;
             else endpos = endpos + 1; end
         end
-        local s = str:sub(pos + 1, endpos - 1):gsub('\\n', '\n'):gsub('\\"', '"'):gsub('\\\\', '\\');
+        -- Single-pass unescape. Chained gsubs used to mis-handle a literal
+        -- backslash followed by 'n', because '\\n' was expanded before '\\\\'.
+        local s = str:sub(pos + 1, endpos - 1):gsub('\\(.)', function(c)
+            if c == 'n' then return '\n';
+            elseif c == 't' then return '\t';
+            elseif c == 'r' then return '\r';
+            else return c; end
+        end);
         return s, endpos + 1;
     end
     
@@ -199,17 +211,38 @@ local function load_settings()
     return result;
 end
 
+-- Canonical task list. Saved files carry their own copy, so this is merged into
+-- the loaded settings on startup - otherwise a task added in a new version would
+-- never appear for anyone with an existing homework.json.
+local DEFAULT_TASKS = {
+    'EcoWarrior',
+    'Highwind',
+    'UnInvited',
+    'CookBook',
+    'SpiceGals',
+    'X\'sKnife'
+};
+
+local function print_msg(message)
+    print('\30\081[\30\082Homework\30\081]\30\106 ' .. message);
+end
+
+local function print_error(message)
+    print('\30\081[\30\082Homework\30\081]\30\068 ' .. message);
+end
+
+local function print_success(message)
+    print('\30\081[\30\082Homework\30\081]\30\110 ' .. message);
+end
+
 -- Tracker data
 local tracker = {
     settings = {
-        tasks = {
-            'EcoWarrior',
-            'Highwind',
-            'UnInvited',
-            'CookBook',
-            'SpiceGals',
-            'X\'sKnife'
-        },
+        tasks = { 'EcoWarrior', 'Highwind', 'UnInvited', 'CookBook', 'SpiceGals', 'X\'sKnife' },
+        -- Dynamis entry pooling. Off means every character counts its own.
+        dynamis_account_wide = false,
+        dynamis_accounts = {},
+        chars_per_account = 3,
         characters = {} -- Per-character data: [charname] = { last_reset = 0, enm_timers = {}, xsknife_data = {}, etc }
     },
     current_char = nil,
@@ -230,12 +263,21 @@ local tracker = {
     render_interval = 2,          -- Only check every 2 seconds
     -- UnInvited inventory check
     uninvited_done_time = 0,       -- Timestamp when UnInvited marked done
-    -- Factory reset confirmation
-    pending_reset = false
+    -- Timestamp of a pending /hw reset, nil when none outstanding
+    pending_reset = nil,
+    -- Set by the Dynamis claim message, consumed by the hourglass-obtained message
+    pending_dynamis_claim = nil
 };
 
 -- Save settings function (must be after tracker is defined)
 local function save_settings()
+    -- Mirror the live key item state into the character record so a reload can
+    -- recover it without the game's memory API. See restore_ki_cache().
+    if build_ki_cache ~= nil and tracker.kis_initialized
+       and tracker.current_char ~= nil and tracker.current_char ~= 'Unknown' then
+        local cd = tracker.settings.characters[tracker.current_char];
+        if cd ~= nil then cd.ki_cache = build_ki_cache(); end
+    end
     local path = get_settings_path();
     local dir = get_config_dir();
     if not ashita.fs.exists(dir) then
@@ -286,9 +328,71 @@ local DYNAMIS_ZONES = {
 -- Perpetual Hourglass item ID
 local PERPETUAL_HOURGLASS_ID = 4237;
 
+-- A charged Perpetual Hourglass carries its booking in the item's Extra bytes.
+-- Verified against two live captures (Bastok 186 and Windurst 187):
+--   Extra[13..16] (1-based) = unix time the timeless glass was traded
+--   Extra[17..20] (1-based) = destination Dynamis zone id
+-- An uncharged Timeless Hourglass has Extra all zero, so no serial.
+-- Copies of one glass share the same bytes, which is what we want: one break,
+-- one entry, however many duplicates get handed round.
+local GLASS_EXTRA_TIME_OFFSET = 13;
+local GLASS_EXTRA_ZONE_OFFSET = 17;
+
+-- Bags worth scanning for an hourglass.
+local GLASS_BAGS = { 0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+
+-- Reads the serial from one inventory item. Returns serial, zone_id or nil.
+local function glass_serial_from_item(item)
+    if item == nil then return nil; end
+    local ok, serial, zone = pcall(function()
+        if item.Id ~= PERPETUAL_HOURGLASS_ID then return nil, nil; end
+        local extra = item.Extra;
+        if extra == nil or #extra < GLASS_EXTRA_ZONE_OFFSET + 3 then return nil, nil; end
+        local t = struct.unpack('L', extra, GLASS_EXTRA_TIME_OFFSET);
+        local z = struct.unpack('L', extra, GLASS_EXTRA_ZONE_OFFSET);
+        if t == nil or z == nil or t == 0 then return nil, nil; end
+        return string.format('%d-%d', z, t), z;
+    end);
+    if not ok then return nil; end
+    return serial, zone;
+end
+
+-- Finds a charged glass. Prefers one booked for prefer_zone when given, so
+-- holding a Bastok and a Windurst glass at once still resolves correctly.
+local function find_glass_serial(prefer_zone)
+    local best_serial, best_zone, any_serial, any_zone = nil, nil, nil, nil;
+    pcall(function()
+        local inv = AshitaCore:GetMemoryManager():GetInventory();
+        if inv == nil then return; end
+        for _, bag in ipairs(GLASS_BAGS) do
+            local max_slots = inv:GetContainerCountMax(bag);
+            if max_slots and max_slots > 0 then
+                for slot = 1, max_slots do
+                    local serial, zone = glass_serial_from_item(inv:GetContainerItem(bag, slot));
+                    if serial ~= nil then
+                        if any_serial == nil then any_serial, any_zone = serial, zone; end
+                        if prefer_zone ~= nil and zone == prefer_zone and best_serial == nil then
+                            best_serial, best_zone = serial, zone;
+                        end
+                    end
+                end
+            end
+        end
+    end);
+    if best_serial ~= nil then return best_serial, best_zone; end
+    return any_serial, any_zone;
+end
+
+-- How long a /hw reset confirmation stays valid.
+local RESET_CONFIRM_WINDOW = 30;
+
+-- How long before the weekly reset a Dynamis claim still counts against the
+-- upcoming week's allowance.
+local DYNAMIS_CLAIM_CARRY_WINDOW = 24 * 3600;
+
 -- Display settings structure
+-- font_scale is not stored here; it lives on `ui` and is written out at save time.
 local display_settings = {
-    font_scale = 1.2,
     tracked = {}  -- Per-character tracking: [char_name] = {tasks = {task1=true, ...}, timers = {timer1=true, ...}}
 };
 
@@ -298,10 +402,9 @@ local function save_display_settings()
     if not ashita.fs.exists(dir) then
         ashita.fs.create_dir(dir);
     end
-    display_settings.font_scale = ui.font_scale;
     local f = io.open(path, 'w');
     if f then
-        f:write(serialize_value(display_settings));
+        f:write(serialize_value({ font_scale = ui.font_scale, tracked = display_settings.tracked }));
         f:close();
     end
 end
@@ -378,41 +481,224 @@ local ECOWARRIOR_KI_IDS = {
     bastok = 473
 };
 
+-- How many characters one account may hold. A setting rather than a constant in
+-- case the server changes the limit.
+local DEFAULT_CHARS_PER_ACCOUNT = 3;
+
+-- Fresh Dynamis bookkeeping.
+local function new_dynamis_data()
+    return { entries_remaining = 2, counted_glasses = {} };
+end
+
+-- Which account (if any) a character belongs to. Returns the account table.
+local function find_dynamis_account(char_name)
+    if char_name == nil then return nil; end
+    for _, acct in ipairs(tracker.settings.dynamis_accounts or {}) do
+        for _, c in ipairs(acct.chars or {}) do
+            if c == char_name then return acct; end
+        end
+    end
+    return nil;
+end
+
+-- Returns the table holding entries_remaining/counted_glasses for a character,
+-- plus true when that table is shared across an account. Every Dynamis read and
+-- write goes through here so per-character and account-wide behave identically.
+local function get_dynamis_store(char_name)
+    if tracker.settings.dynamis_account_wide then
+        local acct = find_dynamis_account(char_name);
+        if acct ~= nil then
+            if acct.entries_remaining == nil then acct.entries_remaining = 2; end
+            if type(acct.counted_glasses) ~= 'table' then acct.counted_glasses = {}; end
+            return acct, true;
+        end
+    end
+    local cd = char_name and tracker.settings.characters[char_name] or nil;
+    if cd == nil then return nil, false; end
+    if cd.dynamis_data == nil then cd.dynamis_data = new_dynamis_data(); end
+    if type(cd.dynamis_data.counted_glasses) ~= 'table' then cd.dynamis_data.counted_glasses = {}; end
+    return cd.dynamis_data, false;
+end
+
+local function chars_per_account()
+    local n = tonumber(tracker.settings.chars_per_account or DEFAULT_CHARS_PER_ACCOUNT);
+    if n == nil or n < 1 then n = DEFAULT_CHARS_PER_ACCOUNT; end
+    return n;
+end
+
+local function dynamis_accounts()
+    if type(tracker.settings.dynamis_accounts) ~= 'table' then
+        tracker.settings.dynamis_accounts = {};
+    end
+    return tracker.settings.dynamis_accounts;
+end
+
+local function add_dynamis_account()
+    local accts = dynamis_accounts();
+    table.insert(accts, {
+        name = 'Account ' .. tostring(#accts + 1),
+        chars = {},
+        entries_remaining = 2,
+        counted_glasses = {}
+    });
+    return #accts;
+end
+
+-- Drops a character from every account. A character belongs to at most one, so
+-- ticking a name somewhere else silently moves it rather than warning.
+local recalc_account_from_members;
+
+local function unassign_char(char_name)
+    for _, acct in ipairs(dynamis_accounts()) do
+        if type(acct.chars) == 'table' then
+            local removed = false;
+            for i = #acct.chars, 1, -1 do
+                if acct.chars[i] == char_name then table.remove(acct.chars, i); removed = true; end
+            end
+            if removed then recalc_account_from_members(acct); end
+        end
+    end
+end
+
+-- An account inherits the LOWEST remaining count among its members, so grouping
+-- characters never hands back an entry somebody already spent. Clamped against
+-- the account's own value as well, so adding a fresh character to an account that
+-- has already been used cannot top it back up. Membership changes can therefore
+-- only lower the count - delete the account to start it over.
+-- Member glass serials are merged in too, otherwise a glass one character already
+-- counted would count a second time once the pool took over.
+function recalc_account_from_members(acct)
+    if acct == nil or type(acct.chars) ~= 'table' or #acct.chars == 0 then return; end
+    local lowest = acct.entries_remaining or 2;
+    local merged, seen = {}, {};
+    for _, sn in ipairs(acct.counted_glasses or {}) do
+        if not seen[sn] then seen[sn] = true; table.insert(merged, sn); end
+    end
+    for _, cname in ipairs(acct.chars) do
+        local cd = tracker.settings.characters[cname];
+        local dd = cd and cd.dynamis_data or nil;
+        if dd ~= nil then
+            local e = tonumber(dd.entries_remaining);
+            if e ~= nil and e < lowest then lowest = e; end
+            for _, sn in ipairs(dd.counted_glasses or {}) do
+                if not seen[sn] then seen[sn] = true; table.insert(merged, sn); end
+            end
+        end
+    end
+    acct.entries_remaining = lowest;
+    acct.counted_glasses = merged;
+end
+
+-- Returns false when the target account is already full.
+local function assign_char_to_account(char_name, acct_index)
+    local accts = dynamis_accounts();
+    local acct = accts[acct_index];
+    if acct == nil then return false; end
+    if type(acct.chars) ~= 'table' then acct.chars = {}; end
+    local already = false;
+    for _, c in ipairs(acct.chars) do if c == char_name then already = true; break; end end
+    if not already and #acct.chars >= chars_per_account() then return false; end
+    unassign_char(char_name);
+    if not already then table.insert(acct.chars, char_name); end
+    recalc_account_from_members(acct);
+    return true;
+end
+
+local function remove_dynamis_account(acct_index)
+    local accts = dynamis_accounts();
+    if accts[acct_index] == nil then return; end
+    table.remove(accts, acct_index);
+    -- Renumber the default names so they stay 1..n
+    for i, acct in ipairs(accts) do
+        if acct.name == nil or acct.name:match('^Account %d+$') then
+            acct.name = 'Account ' .. tostring(i);
+        end
+    end
+end
+
+local function glass_already_counted(store, serial)
+    if store == nil or serial == nil then return false; end
+    for _, sn in ipairs(store.counted_glasses or {}) do
+        if sn == serial then return true; end
+    end
+    return false;
+end
+
+-- Counts one entry against a store. Returns true if it actually counted.
+local function count_dynamis_entry(store, serial, label)
+    if store == nil then return false; end
+    if serial ~= nil then
+        if glass_already_counted(store, serial) then return false; end
+        table.insert(store.counted_glasses, serial);
+    end
+    if (store.entries_remaining or 0) > 0 then
+        store.entries_remaining = store.entries_remaining - 1;
+        save_settings();
+        print_success(string.format('Dynamis %s! %d entr%s remaining this week.',
+            label or 'entry counted', store.entries_remaining,
+            store.entries_remaining == 1 and 'y' or 'ies'));
+    else
+        save_settings();
+        print_msg('Dynamis entry detected but the counter is already at 0.');
+    end
+    return true;
+end
+
+-- Every key item id this addon tracks, in one place.
+local TRACKED_KI_IDS = {};
+do
+    local seen = {};
+    local function add(id)
+        if id ~= nil and not seen[id] then seen[id] = true; table.insert(TRACKED_KI_IDS, id); end
+    end
+    for _, enm in ipairs(ENM_KEY_ITEMS) do add(enm.ki_id); end
+    for _, card in ipairs(LIMBUS_CARDS) do add(card.ki_id); end
+    add(XSKNIFE_KI_ID_FIRST); add(XSKNIFE_KI_ID_REPEAT);
+    add(COOKBOOK_KI_ID); add(SPICEGALS_KI_ID); add(UNINVITED_KI_ID);
+    for _, id in pairs(ECOWARRIOR_KI_IDS) do add(id); end
+end
+
+-- Ids currently held, as a plain list, for persisting to homework.json.
+function build_ki_cache()
+    local held = {};
+    for _, id in ipairs(TRACKED_KI_IDS) do
+        if tracker.kis[id] == true then table.insert(held, id); end
+    end
+    return held;
+end
+
 local ECOWARRIOR_ZONES = {
     sandoria = {
         quest_npc = 'Norejaie',
         field_agent = 'Rojaireaut',
         ki_name = 'Indigested stalagmite',
         zone_name = "Ordelle's Caves",
-        city_name = "Southern San d'Oria"
+        city_name = "Southern San d'Oria",
+        short_zone = "Ordelle's",
+        short_city = "San d'Oria",
+        short_agent = 'Rojaireaut',
     },
     windurst = {
         quest_npc = 'Lumomo',
         field_agent = 'Ahko Mhalijikhari',
         ki_name = 'Indigested meat',
         zone_name = 'Maze of Shakhrami',
-        city_name = 'Windurst Waters'
+        city_name = 'Windurst Waters',
+        short_zone = 'Shakhrami',
+        short_city = 'Windurst',
+        short_agent = 'Ahko',
     },
     bastok = {
         quest_npc = 'Raifa',
         field_agent = 'Degga',
         ki_name = 'Indigested ore',
         zone_name = 'Gusgen Mines',
-        city_name = 'Port Bastok'
+        city_name = 'Port Bastok',
+        short_zone = 'Gusgen',
+        short_city = 'Bastok',
+        short_agent = 'Degga',
     }
 };
-
-local function print_msg(message)
-    print('\30\081[\30\082Homework\30\081]\30\106 ' .. message);
-end
-
-local function print_error(message)
-    print('\30\081[\30\082Homework\30\081]\30\068 ' .. message);
-end
-
-local function print_success(message)
-    print('\30\081[\30\082Homework\30\081]\30\110 ' .. message);
-end
 
 local function get_char_name()
     local success, result = pcall(function()
@@ -430,6 +716,7 @@ local function get_zone_id()
     local party = AshitaCore:GetMemoryManager():GetParty();
     return party:GetMemberZone(0);
 end
+
 
 local function is_in_highwind_zone()
     local zone_id = get_zone_id();
@@ -453,7 +740,7 @@ local function get_char_data()
             xsknife_data = { step = 'unknown', has_ki = false },
             quest_steps = { highwind = 'scanned', uninvited = 'unknown', spicegals = 'unknown', cookbook = 'unknown' },
             ecowarrior_data = { step = 'unknown', current_nation = nil, locked_nations = {}, knows_status = false },
-            dynamis_data = { entries_remaining = 2, glass_used = false }
+            dynamis_data = new_dynamis_data()
         };
         save_settings();
         print_success('Created new tracker for character: ' .. tracker.current_char);
@@ -471,10 +758,6 @@ local function get_char_data()
         local old_data = tracker.settings.characters[tracker.current_char].xsknife_data;
         tracker.settings.characters[tracker.current_char].xsknife_data = { step = 'unknown', has_ki = old_data.has_ki or false };
     end
-    -- Remove deprecated tally_tracked field
-    if tracker.settings.characters[tracker.current_char].xsknife_data.tally_tracked ~= nil then
-        tracker.settings.characters[tracker.current_char].xsknife_data.tally_tracked = nil;
-    end
     -- Ensure quest_steps exists
     if tracker.settings.characters[tracker.current_char].quest_steps == nil then
         tracker.settings.characters[tracker.current_char].quest_steps = { highwind = 'scanned', uninvited = 'unknown', spicegals = 'unknown', cookbook = 'unknown' };
@@ -491,7 +774,7 @@ local function get_char_data()
     end
     -- Ensure dynamis_data exists
     if tracker.settings.characters[tracker.current_char].dynamis_data == nil then
-        tracker.settings.characters[tracker.current_char].dynamis_data = { entries_remaining = 2, glass_used = false };
+        tracker.settings.characters[tracker.current_char].dynamis_data = new_dynamis_data();
     end
     return tracker.settings.characters[tracker.current_char];
 end
@@ -505,26 +788,69 @@ end
 local function populate_kis_from_memory()
     local player = AshitaCore:GetMemoryManager():GetPlayer();
     if player == nil then return false; end
+    local found_any = false;
     for _, enm in ipairs(ENM_KEY_ITEMS) do
-        tracker.kis[enm.ki_id] = player:HasKeyItem(enm.ki_id);
+        local has = player:HasKeyItem(enm.ki_id);
+        tracker.kis[enm.ki_id] = has;
+        if has then found_any = true; end
     end
     -- Limbus cards (for floating window display)
     for _, card in ipairs(LIMBUS_CARDS) do
-        tracker.kis[card.ki_id] = player:HasKeyItem(card.ki_id);
+        local has = player:HasKeyItem(card.ki_id);
+        tracker.kis[card.ki_id] = has;
+        if has then found_any = true; end
     end
-    tracker.kis[XSKNIFE_KI_ID_FIRST] = player:HasKeyItem(XSKNIFE_KI_ID_FIRST);
-    tracker.kis[XSKNIFE_KI_ID_REPEAT] = player:HasKeyItem(XSKNIFE_KI_ID_REPEAT);
-    tracker.kis[COOKBOOK_KI_ID] = player:HasKeyItem(COOKBOOK_KI_ID);
-    tracker.kis[SPICEGALS_KI_ID] = player:HasKeyItem(SPICEGALS_KI_ID);
-    tracker.kis[UNINVITED_KI_ID] = player:HasKeyItem(UNINVITED_KI_ID);
+    local extras = { XSKNIFE_KI_ID_FIRST, XSKNIFE_KI_ID_REPEAT, COOKBOOK_KI_ID, SPICEGALS_KI_ID, UNINVITED_KI_ID };
+    for _, ki_id in ipairs(extras) do
+        local has = player:HasKeyItem(ki_id);
+        tracker.kis[ki_id] = has;
+        if has then found_any = true; end
+    end
     for _, ki_id in pairs(ECOWARRIOR_KI_IDS) do
-        tracker.kis[ki_id] = player:HasKeyItem(ki_id);
+        local has = player:HasKeyItem(ki_id);
+        tracker.kis[ki_id] = has;
+        if has then found_any = true; end
+    end
+    -- If we didn't find ANY KI, the game hasn't sent the KI list yet.
+    -- Don't mark as initialized so we wait for the 0x055 packet path.
+    if not found_any then
+        -- Reset what we just wrote so a stale scan won't corrupt data
+        tracker.kis = {};
+        return false;
+    end
+    tracker.kis_initialized = true;
+    return true;
+end
+
+-- Rebuilds tracker.kis from the list persisted by the previous session.
+-- On clients where HasKeyItem is unavailable this is the only way a reload can
+-- come back with a correct picture without waiting for a zone change.
+local function restore_ki_cache()
+    if tracker.current_char == nil or tracker.current_char == 'Unknown' then return false; end
+    local cd = tracker.settings.characters[tracker.current_char];
+    if cd == nil or type(cd.ki_cache) ~= 'table' then return false; end
+    local held = {};
+    for _, id in ipairs(cd.ki_cache) do held[id] = true; end
+    tracker.kis = {};
+    for _, id in ipairs(TRACKED_KI_IDS) do
+        tracker.kis[id] = (held[id] == true);
     end
     tracker.kis_initialized = true;
     return true;
 end
 
 local function scan_key_items(silent)
+    -- HARD GUARD. Without a real key item read, has_key_item() answers false for
+    -- everything and this function will happily write "you own nothing" across
+    -- every ENM, quest and timer, then save it. That is exactly how data was
+    -- lost before 3.4.5. Never scan on an empty table.
+    if not tracker.kis_initialized then
+        if not silent then
+            print_error('Key items are not loaded yet - nothing was scanned and nothing was changed.');
+            print_msg('Zone once (or warp) so the game re-sends the key item list, then try again.');
+        end
+        return false;
+    end
     local char_data = get_char_data();
     local current_time = os.time();
     local found_count = 0;
@@ -627,6 +953,7 @@ local function scan_key_items(silent)
     if not silent and new_entries > 0 then print_msg(string.format('Scanned %d new ENM/Limbus activities', new_entries)); end
     if not silent and updated_count > 0 then print_msg(string.format('Updated %d key item statuses', updated_count)); end
     if not silent then print_success(string.format('Scan complete! You have %d/%d key items', found_count, #ENM_KEY_ITEMS)); end
+    return true;
 end
 
 local function on_ki_gained(ki_id)
@@ -710,11 +1037,15 @@ local function on_ki_lost(ki_id)
     for _, enm in ipairs(ENM_KEY_ITEMS) do
         if ki_id == enm.ki_id then
             local timer_data = char_data.enm_timers[enm.name];
-            if timer_data ~= nil then
+            if timer_data == nil then
+                -- Never scanned, so we have no idea when the KI was obtained.
+                -- Record the loss with an unknown timer rather than dropping it.
+                char_data.enm_timers[enm.name] = { has_ki = false, next_ki_time = 0, timer_source = 'scan' };
+            else
                 timer_data.has_ki = false;
-                save_settings();
-                print_msg(string.format('Used %s - Timer continues', enm.ki_name));
             end
+            save_settings();
+            print_msg(string.format('Used %s - Timer continues', enm.ki_name));
             return;
         end
     end
@@ -800,17 +1131,55 @@ local function on_ki_lost(ki_id)
     end
 end
 
+-- Defined further down (UI section) but needed by on_character_change above it.
+local update_char_list;
+
 local function normalize_task(task)
     return task:lower():gsub('%s+', ''):gsub("'", '');
 end
 
+-- Short forms advertised in the UI tooltips. Previously these were suggested to
+-- the user but rejected by the exact-match lookup below.
+local TASK_ALIASES = {
+    knife     = "X'sKnife",
+    xknife    = "X'sKnife",
+    high      = 'Highwind',
+    hw        = 'Highwind',
+    spice     = 'SpiceGals',
+    gals      = 'SpiceGals',
+    cook      = 'CookBook',
+    book      = 'CookBook',
+    uninv     = 'UnInvited',
+    invited   = 'UnInvited',
+    eco       = 'EcoWarrior',
+    warrior   = 'EcoWarrior'
+};
+
 local function find_task_name(task)
     local normalized = normalize_task(task);
+    -- Exact match on the configured task list wins.
     for _, v in ipairs(tracker.settings.tasks) do
         if normalize_task(v) == normalized then return v; end
     end
-    return nil;
+    -- Then a known alias, but only if that task is actually configured.
+    local aliased = TASK_ALIASES[normalized];
+    if aliased ~= nil then
+        for _, v in ipairs(tracker.settings.tasks) do
+            if v == aliased then return v; end
+        end
+    end
+    -- Finally an unambiguous prefix (e.g. 'ecow' -> 'EcoWarrior').
+    local match = nil;
+    for _, v in ipairs(tracker.settings.tasks) do
+        if normalize_task(v):sub(1, #normalized) == normalized then
+            if match ~= nil then return nil; end
+            match = v;
+        end
+    end
+    return match;
 end
+
+local reset_dynamis_store;
 
 local function calculate_next_reset(from_time)
     local SECONDS_PER_DAY = 86400;
@@ -822,6 +1191,25 @@ local function calculate_next_reset(from_time)
     local daysRemaining = (weekday == 0) and 7 or (7 - weekday);
     local jstReset = (jpDay + daysRemaining) * SECONDS_PER_DAY;
     return jstReset - JST_OFFSET;
+end
+
+-- Shared by per-character stores and account stores.
+function reset_dynamis_store(store, current_time)
+    if store == nil then return; end
+    -- Legacy fields from before serial tracking.
+    store.glass_used = nil;
+    store.dynamis_zone = nil;
+    store.claimed_before_reset = nil;
+    -- A glass broken in the final day before reset belongs to the new week, so the
+    -- entry stays spent and its serial stays on the list.
+    if store.claimed_at ~= nil and (current_time - store.claimed_at) <= DYNAMIS_CLAIM_CARRY_WINDOW then
+        store.entries_remaining = 1;
+        store.counted_glasses = { 'carried-' .. tostring(store.claimed_at) };
+    else
+        store.entries_remaining = 2;
+        store.counted_glasses = {};
+    end
+    store.claimed_at = nil;
 end
 
 local function reset_character_data(char_data)
@@ -883,18 +1271,11 @@ local function reset_character_data(char_data)
             char_data.xsknife_data.step = 'despachiaire';
         end
     end
-    -- Reset Dynamis entries (glass_used stays - only reset when glass is actually dropped)
+    -- Dynamis: fresh allowance and a fresh list of counted glass serials.
     if char_data.dynamis_data then
-        -- If the player claimed a Dynamis zone before the weekly reset, carry that
-        -- usage forward so the entry they already spent doesn't get refunded.
-        if char_data.dynamis_data.claimed_before_reset then
-            char_data.dynamis_data.entries_remaining = 1;
-            char_data.dynamis_data.claimed_before_reset = false;
-        else
-            char_data.dynamis_data.entries_remaining = 2;
-        end
+        reset_dynamis_store(char_data.dynamis_data, current_time);
     else
-        char_data.dynamis_data = { entries_remaining = 2, glass_used = false };
+        char_data.dynamis_data = new_dynamis_data();
     end
 end
 
@@ -907,6 +1288,11 @@ local function reset_tracker()
             reset_count = reset_count + 1;
         end
     end
+    -- Account stores are shared, so they reset once rather than once per character.
+    local now = os.time();
+    for _, acct in ipairs(tracker.settings.dynamis_accounts or {}) do
+        reset_dynamis_store(acct, now);
+    end
     save_settings();
     print_success('Weekly tracker has been reset for all ' .. reset_count .. ' characters!');
     local next_reset = calculate_next_reset(os.time());
@@ -916,13 +1302,13 @@ end
 local function initialize_timer()
     local char_data = get_char_data();
     local current_time = os.time();
-    local next_reset = calculate_next_reset(current_time);
-    if current_time >= next_reset then reset_tracker(); return; end
-    local last_reset_point = calculate_next_reset(char_data.last_reset);
-    if current_time >= last_reset_point and char_data.last_reset < last_reset_point then
+    -- calculate_next_reset always returns a strictly future timestamp, so the old
+    -- `current_time >= calculate_next_reset(current_time)` guard could never fire
+    -- and `last_reset < last_reset_point` was likewise always true. Both dropped.
+    if current_time >= calculate_next_reset(char_data.last_reset) then
         reset_tracker(); return;
     end
-    tracker.next_check_time = next_reset;
+    tracker.next_check_time = calculate_next_reset(current_time);
 end
 
 local function on_character_change(new_char_name)
@@ -935,159 +1321,214 @@ local function on_character_change(new_char_name)
         tracker.kis = {};
         tracker.kis_initialized = false;
         local char_data = get_char_data();
+        if not tracker.kis_initialized then restore_ki_cache(); end
         local needs_scan = char_data.quest_steps.uninvited == 'unknown' or
                           char_data.quest_steps.spicegals == 'unknown' or
                           char_data.quest_steps.cookbook == 'unknown';
         if needs_scan then print_msg('Use /hw scan to check key items for this character'); end
         initialize_timer();
+        update_char_list();  -- keep the window dropdown in sync if it is already open
+    end
+end
+
+local HDR = '\30\081[\30\082Homework\30\081]\30\106 ';
+
+-- EcoWarrior nations still open this cycle, as display text.
+local function eco_available_text(locked)
+    local available = {};
+    for _, n in ipairs({'sandoria', 'windurst', 'bastok'}) do
+        local is_locked = false;
+        for _, l in ipairs(locked or {}) do if l == n then is_locked = true; break; end end
+        if not is_locked then
+            if n == 'sandoria' then table.insert(available, "San d'Oria");
+            elseif n == 'windurst' then table.insert(available, 'Windurst');
+            elseif n == 'bastok' then table.insert(available, 'Bastok'); end
+        end
+    end
+    if #available == 0 then return 'All Nations', 0; end      -- cycle complete, all reopen
+    if #available == 3 then return 'All Nations', 3; end
+    if #available == 2 then return available[1] .. ' & ' .. available[2], 2; end
+    return available[1], 1;
+end
+
+-- One chat line for one task. Shared by /hw weeklys and /hw chars <name>,
+-- which previously carried two drifting copies of this logic.
+local function format_task_line(task, char_data)
+    local normalized = normalize_task(task);
+    if normalized == 'xsknife' then
+        local step = (char_data.xsknife_data or {}).step or 'unknown';
+        if step == 'unknown' then return HDR .. '\30\104[ ? ]\30\106 ' .. task;
+        elseif step == 'scanned_no_ki' then return HDR .. '\30\104[   ]\30\106 ' .. task;
+        elseif step == 'scanned_has_ki' then return HDR .. '\30\104[Boneyard Gully - Requiem of Sin]\30\106 ' .. task;
+        elseif step == 'scanned_has_ki_used' then return HDR .. '\30\104[Despachiaire]\30\106 ' .. task;
+        elseif step == 'despachiaire' then return HDR .. '\30\110[Despachiaire]\30\106 ' .. task;
+        elseif step == 'boneyard' then return HDR .. '\30\110[Boneyard Gully - Requiem of Sin]\30\106 ' .. task;
+        elseif step == 'boneyard_2x' then return HDR .. '\30\110[2x Boneyard Gully - Requiem of Sin]\30\106 ' .. task;
+        elseif step == 'done' then return HDR .. '\30\076[X]\30\106 ' .. task;
+        else return HDR .. '\30\104[   ]\30\106 ' .. task; end
+    elseif normalized == 'highwind' then
+        local step = char_data.quest_steps.highwind or 'scanned';
+        if step == 'start' then return HDR .. '\30\110[NM]\30\106 ' .. task;
+        elseif step == 'done' then return HDR .. '\30\076[X]\30\106 ' .. task;
+        else return HDR .. '\30\104[   ]\30\106 ' .. task; end
+    elseif normalized == 'uninvited' then
+        local step = char_data.quest_steps.uninvited or 'unknown';
+        if step == 'scanned' then return HDR .. '\30\104[   ]\30\106 ' .. task;
+        elseif step == 'justinius' then return HDR .. '\30\110[Justinius - Start]\30\106 ' .. task;
+        elseif step == 'bcnm' then return HDR .. '\30\110[BCNM Monarch]\30\106 ' .. task;
+        elseif step == 'justinius_return' then return HDR .. '\30\110[Justinius - Reward]\30\106 ' .. task;
+        elseif step == 'done' then return HDR .. '\30\076[X]\30\106 ' .. task;
+        else return HDR .. '\30\104[ ? ]\30\106 ' .. task; end
+    elseif normalized == 'spicegals' then
+        local step = char_data.quest_steps.spicegals or 'unknown';
+        if step == 'scanned' then return HDR .. '\30\104[   ]\30\106 ' .. task;
+        elseif step == 'rouva' then return HDR .. '\30\110[Rouva - Start]\30\106 ' .. task;
+        elseif step == 'riverne' then return HDR .. '\30\110[Riverne B]\30\106 ' .. task;
+        elseif step == 'rouva_return' then return HDR .. '\30\110[Rouva - Reward]\30\106 ' .. task;
+        elseif step == 'done' then return HDR .. '\30\076[X]\30\106 ' .. task;
+        else return HDR .. '\30\104[ ? ]\30\106 ' .. task; end
+    elseif normalized == 'cookbook' then
+        local step = char_data.quest_steps.cookbook or 'unknown';
+        if step == 'scanned' then return HDR .. '\30\104[   ]\30\106 ' .. task;
+        elseif step == 'jonette' then return HDR .. '\30\110[Jonette - Start]\30\106 ' .. task;
+        elseif step == 'sacrarium' then return HDR .. '\30\110[??? Sacrarium]\30\106 ' .. task;
+        elseif step == 'jonette_return' then return HDR .. '\30\110[Jonette - Reward]\30\106 ' .. task;
+        elseif step == 'done' then return HDR .. '\30\076[X]\30\106 ' .. task;
+        else return HDR .. '\30\104[ ? ]\30\106 ' .. task; end
+    elseif normalized == 'ecowarrior' then
+        local eco_data = char_data.ecowarrior_data or {};
+        local step = eco_data.step or 'unknown';
+        local nation = eco_data.current_nation;
+        local available_text = eco_available_text(eco_data.locked_nations);
+        local zone_info = nation and ECOWARRIOR_ZONES[nation] or nil;
+        -- \30\110 = green (status known), \30\104 = yellow (status uncertain)
+        local color = eco_data.knows_status and '\30\110' or '\30\104';
+        if step == 'scanned' then return HDR .. '\30\104[' .. available_text .. ']\30\106 ' .. task;
+        elseif step == 'ready' then return HDR .. '\30\110[' .. available_text .. ']\30\106 ' .. task;
+        elseif step == 'done' then return HDR .. '\30\076[' .. available_text .. ']\30\106 ' .. task;
+        elseif step == 'scanned_has_ki' and zone_info then
+            return HDR .. '\30\104[' .. zone_info.zone_name .. ' - ' .. zone_info.field_agent .. ']\30\106 ' .. task;
+        elseif step == 'field_agent' and zone_info then
+            return HDR .. color .. '[' .. zone_info.zone_name .. ' - ' .. zone_info.field_agent .. ']\30\106 ' .. task;
+        elseif step == 'nm' and nation then
+            return HDR .. color .. '[Kill the NM]\30\106 ' .. task;
+        elseif step == 'field_agent_return' and zone_info then
+            return HDR .. color .. '[' .. zone_info.zone_name .. ' - ' .. zone_info.field_agent .. ']\30\106 ' .. task;
+        elseif step == 'reward' and zone_info then
+            return HDR .. color .. '[' .. zone_info.city_name .. ' - ' .. zone_info.quest_npc .. ']\30\106 ' .. task;
+        elseif step == 'unknown' then return HDR .. '\30\104[ ? ]\30\106 ' .. task;
+        else return HDR .. '\30\104[   ]\30\106 ' .. task; end
+    end
+    return nil;
+end
+
+-- One chat line for the Dynamis entry counter. Mirrors the row the floating
+-- window draws above the tasks.
+local function format_dynamis_line(char_name, char_data)
+    local store, shared = get_dynamis_store(char_name);
+    if store == nil then store = char_data.dynamis_data; end
+    if store == nil then return HDR .. '\30\104[ ? ]\30\106 Dynamis'; end
+    local entries = store.entries_remaining or 2;
+    local suffix = shared and ' \30\067[account]\30\106' or '';
+    if entries <= 0 then return HDR .. '\30\076[X]\30\106 Dynamis \30\071(no runs left)\30\106' .. suffix;
+    elseif entries == 1 then return HDR .. '\30\104[1 Run]\30\106 Dynamis \30\071(1 run left)\30\106' .. suffix;
+    else return HDR .. '\30\110[' .. entries .. ' Runs]\30\106 Dynamis \30\071(' .. entries .. ' runs left)\30\106' .. suffix; end
+end
+
+-- One chat line for one ENM/Limbus timer.
+local function format_timer_line(enm, timer_data, current_time)
+    local status_icon = '\30\104[ ? ]\30\106';
+    local status_text = '\30\071(Unknown)\30\106';
+    if timer_data ~= nil then
+        if timer_data.next_ki_time == nil or timer_data.next_ki_time == 0 then
+            if timer_data.has_ki then status_icon = '\30\104[KI]\30\106'; else status_icon = '\30\104[   ]\30\106'; end
+        elseif current_time >= timer_data.next_ki_time then
+            if timer_data.has_ki then status_icon = '\30\110[KI]\30\106'; else status_icon = '\30\110[   ]\30\106'; end
+            status_text = '\30\071(Ready)\30\106';
+        elseif timer_data.timer_source == 'scan' then
+            if timer_data.has_ki then status_icon = '\30\104[KI]\30\106'; else status_icon = '\30\104[   ]\30\106'; end
+        else
+            local time_left = timer_data.next_ki_time - current_time;
+            local days = math.floor(time_left / 86400);
+            local hours = math.floor((time_left % 86400) / 3600);
+            if timer_data.has_ki then status_icon = '\30\076[KI]\30\106'; else status_icon = '\30\068[   ]\30\106'; end
+            if days > 0 then status_text = string.format('\30\071(%dd %dh)\30\106', days, hours);
+            else status_text = string.format('\30\071(%dh)\30\106', hours); end
+        end
+    end
+    return string.format('%s%s %s - %s', HDR, status_icon, enm.name, status_text);
+end
+
+-- "2 day(s)" / "5 hour(s), 3 minute(s)" / "12 minute(s)"
+local function format_countdown(seconds)
+    local days = math.floor(seconds / 86400);
+    local hours = math.floor((seconds % 86400) / 3600);
+    local minutes = math.floor((seconds % 3600) / 60);
+    if days > 0 then return string.format('%d day(s)', days); end
+    if hours >= 3 then return string.format('%d hour(s)', hours); end
+    if hours > 0 then return string.format('%d hour(s), %d minute(s)', hours, minutes); end
+    return string.format('%d minute(s)', minutes);
+end
+
+local function print_task_legend(char_data)
+    local flags = {};
+    for _, task in ipairs(tracker.settings.tasks) do
+        local normalized = normalize_task(task);
+        if normalized == 'xsknife' then
+            local step = (char_data.xsknife_data or {}).step or 'unknown';
+            if step == 'unknown' then flags.knife_unknown = true;
+            elseif step == 'scanned_no_ki' then flags.knife_empty = true;
+            elseif step == 'scanned_has_ki' then flags.knife_boneyard = true;
+            elseif step == 'scanned_has_ki_used' then flags.knife_des = true; end
+        elseif normalized == 'highwind' then
+            if (char_data.quest_steps.highwind or 'scanned') == 'scanned' then flags.yellow_empty = true; end
+        elseif normalized == 'uninvited' or normalized == 'spicegals' or normalized == 'cookbook' then
+            local step = char_data.quest_steps[normalized] or 'unknown';
+            if step == 'unknown' then flags.question = true;
+            elseif step == 'scanned' then flags.yellow_empty = true; end
+        elseif normalized == 'ecowarrior' then
+            local step = (char_data.ecowarrior_data or {}).step or 'unknown';
+            if step == 'unknown' then flags.eco_unknown = true;
+            elseif step == 'scanned' then flags.eco_nation = true;
+            elseif step == 'scanned_has_ki' then flags.eco_scanned_ki = true; end
+        end
+    end
+    if flags.question then print('\30\104[ ? ]\30\067 = Use /hw scan to detect progress.'); end
+    if flags.yellow_empty then print('\30\104[   ]\30\067 = Unknown progress. Resolves at next tally or use /hw <task>.'); end
+    if flags.eco_unknown then print('\30\104[ ? ]\30\067 (EcoWarrior) = Use /hw eco <nation> or talk to Eeko-Weeko.'); end
+    if flags.eco_nation then print('\30\104[Nation]\30\067 (EcoWarrior) = Unknown if completed. Resolves at next tally or quest interaction.'); end
+    if flags.eco_scanned_ki then print('\30\104[Zone - Agent]\30\067 (EcoWarrior) = Has KI but locked nations unknown. Use /hw eco or talk to Eeko-Weeko.'); end
+    if flags.knife_unknown then print('\30\104[ ? ]\30\067 (X\'sKnife) = Use /hw scan or talk to Despachiaire.'); end
+    if flags.knife_empty then print('\30\104[   ]\30\067 (X\'sKnife) = Unknown if Despachiaire has KI. Resolves at next tally or when KI obtained.'); end
+    if flags.knife_des then print('\30\104[Despachiaire]\30\067 (X\'sKnife) = Unknown if Despachiaire has KI. Resolves at next tally or when KI obtained.'); end
+    if flags.knife_boneyard then print('\30\104[Boneyard Gully]\30\067 (X\'sKnife) = Unknown if Despachiaire has another KI. Resolves at next tally or when KI obtained.'); end
+end
+
+local function print_weekly_block(char_name, char_data, current_time)
+    print_msg('Weekly Homework for \30\110' .. char_name .. '\30\106:');
+    print_task_legend(char_data);
+    print_msg('=================');
+    print(format_dynamis_line(char_name, char_data));
+    for _, task in ipairs(tracker.settings.tasks) do
+        local line = format_task_line(task, char_data);
+        if line then print(line); end
+    end
+    print('');
+    print_msg(string.format('Next reset in %s', format_countdown(calculate_next_reset(current_time) - current_time)));
+end
+
+local function print_timer_block(char_name, char_data, current_time)
+    print_msg('ENM & Limbus Timers for \30\110' .. char_name .. '\30\106:');
+    print_msg('====================');
+    for _, enm in ipairs(ENM_KEY_ITEMS) do
+        print(format_timer_line(enm, char_data.enm_timers[enm.name], current_time));
     end
 end
 
 local function show_list()
     local char_data = get_char_data();
-    local current_time = os.time();
-    local has_question_mark = false;
-    local has_yellow_empty = false;
-    local has_eco_unknown = false;
-    local has_eco_nation = false;
-    local has_eco_scanned_ki = false;
-    local has_xsknife_unknown = false;
-    local has_xsknife_yellow_empty = false;
-    local has_xsknife_yellow_boneyard = false;
-    local has_xsknife_yellow_des = false;
-    for _, task in ipairs(tracker.settings.tasks) do
-        local normalized = normalize_task(task);
-        if normalized == 'xsknife' then
-            local step = char_data.xsknife_data.step or 'unknown';
-            if step == 'unknown' then has_xsknife_unknown = true;
-            elseif step == 'scanned_no_ki' then has_xsknife_yellow_empty = true;
-            elseif step == 'scanned_has_ki' then has_xsknife_yellow_boneyard = true;
-            elseif step == 'scanned_has_ki_used' then has_xsknife_yellow_des = true; end
-        elseif normalized == 'highwind' then
-            local step = char_data.quest_steps.highwind or 'scanned';
-            if step == 'scanned' then has_yellow_empty = true; end
-        elseif normalized == 'uninvited' or normalized == 'spicegals' or normalized == 'cookbook' then
-            local step = char_data.quest_steps[normalized] or 'unknown';
-            if step == 'unknown' then has_question_mark = true;
-            elseif step == 'scanned' then has_yellow_empty = true; end
-        elseif normalized == 'ecowarrior' then
-            local eco_data = char_data.ecowarrior_data or {step = 'unknown'};
-            if eco_data.step == 'unknown' then has_eco_unknown = true;
-            elseif eco_data.step == 'scanned' then has_eco_nation = true;
-            elseif eco_data.step == 'scanned_has_ki' then has_eco_scanned_ki = true; end
-        end
-    end
-    print_msg('Weekly Homework for \30\110' .. tracker.current_char .. '\30\106:');
-    if has_question_mark then print('\30\104[ ? ]\30\067 = Use /hw scan to detect progress.'); end
-    if has_yellow_empty then print('\30\104[   ]\30\067 = Unknown progress. Resolves at next tally or use /hw <task>.'); end
-    if has_eco_unknown then print('\30\104[ ? ]\30\067 (EcoWarrior) = Use /hw eco <nation> or talk to Eeko-Weeko.'); end
-    if has_eco_nation then print('\30\104[Nation]\30\067 (EcoWarrior) = Unknown if completed. Resolves at next tally or quest interaction.'); end
-    if has_eco_scanned_ki then print('\30\104[Zone - Agent]\30\067 (EcoWarrior) = Has KI but locked nations unknown. Use /hw eco or talk to Eeko-Weeko.'); end
-    if has_xsknife_unknown then print('\30\104[ ? ]\30\067 (X\'sKnife) = Use /hw scan or talk to Despachiaire.'); end
-    if has_xsknife_yellow_empty then print('\30\104[   ]\30\067 (X\'sKnife) = Unknown if Despachiaire has KI. Resolves at next tally or when KI obtained.'); end
-    if has_xsknife_yellow_des then print('\30\104[Despachiaire]\30\067 (X\'sKnife) = Unknown if Despachiaire has KI. Resolves at next tally or when KI obtained.'); end
-    if has_xsknife_yellow_boneyard then print('\30\104[Boneyard Gully]\30\067 (X\'sKnife) = Unknown if Despachiaire has another KI. Resolves at next tally or when KI obtained.'); end
-    print_msg('=================');
-    for _, task in ipairs(tracker.settings.tasks) do
-        local normalized = normalize_task(task);
-        if normalized == 'xsknife' then
-            local step = char_data.xsknife_data.step or 'unknown';
-            if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
-            elseif step == 'scanned_no_ki' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'scanned_has_ki' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[Boneyard Gully - Requiem of Sin]\30\106 ' .. task);
-            elseif step == 'scanned_has_ki_used' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[Despachiaire]\30\106 ' .. task);
-            elseif step == 'despachiaire' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Despachiaire]\30\106 ' .. task);
-            elseif step == 'boneyard' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Boneyard Gully - Requiem of Sin]\30\106 ' .. task);
-            elseif step == 'boneyard_2x' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[2x Boneyard Gully - Requiem of Sin]\30\106 ' .. task);
-            elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task);
-            else print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task); end
-        elseif normalized == 'highwind' then
-            local step = char_data.quest_steps.highwind or 'scanned';
-            if step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'start' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[NM]\30\106 ' .. task);
-            elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
-        elseif normalized == 'uninvited' then
-            local step = char_data.quest_steps.uninvited or 'unknown';
-            if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
-            elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'justinius' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Justinius - Start]\30\106 ' .. task);
-            elseif step == 'bcnm' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[BCNM Monarch]\30\106 ' .. task);
-            elseif step == 'justinius_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Justinius - Reward]\30\106 ' .. task);
-            elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
-        elseif normalized == 'spicegals' then
-            local step = char_data.quest_steps.spicegals or 'unknown';
-            if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
-            elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'rouva' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva - Start]\30\106 ' .. task);
-            elseif step == 'riverne' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Riverne B]\30\106 ' .. task);
-            elseif step == 'rouva_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva - Reward]\30\106 ' .. task);
-            elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
-        elseif normalized == 'cookbook' then
-            local step = char_data.quest_steps.cookbook or 'unknown';
-            if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
-            elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'jonette' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Jonette - Start]\30\106 ' .. task);
-            elseif step == 'sacrarium' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[??? Sacrarium]\30\106 ' .. task);
-            elseif step == 'jonette_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Jonette - Reward]\30\106 ' .. task);
-            elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
-        elseif normalized == 'ecowarrior' then
-            local eco_data = char_data.ecowarrior_data or {step = 'unknown', current_nation = nil, locked_nations = {}, knows_status = false};
-            local step = eco_data.step or 'unknown';
-            local nation = eco_data.current_nation;
-            local locked = eco_data.locked_nations or {};
-            local knows = eco_data.knows_status;
-            local available = {};
-            for _, n in ipairs({'sandoria', 'windurst', 'bastok'}) do
-                local is_locked = false;
-                for _, l in ipairs(locked) do if l == n then is_locked = true; break; end end
-                if not is_locked then
-                    if n == 'sandoria' then table.insert(available, "San d'Oria");
-                    elseif n == 'windurst' then table.insert(available, 'Windurst');
-                    elseif n == 'bastok' then table.insert(available, 'Bastok'); end
-                end
-            end
-            local available_text;
-            if #available == 3 or #available == 0 then available_text = 'All Nations';
-            elseif #available == 2 then available_text = available[1] .. ' & ' .. available[2];
-            elseif #available == 1 then available_text = available[1]; end
-            -- Color: \30\110 = green (knows_status), \30\104 = yellow (unknown status)
-            local color = knows and '\30\110' or '\30\104';
-            if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
-            elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[' .. available_text .. ']\30\106 ' .. task);
-            elseif step == 'scanned_has_ki' and nation then
-                local zone_info = ECOWARRIOR_ZONES[nation];
-                if zone_info then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[' .. zone_info.zone_name .. ' - ' .. zone_info.field_agent .. ']\30\106 ' .. task); end
-            elseif step == 'ready' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[' .. available_text .. ']\30\106 ' .. task);
-            elseif step == 'field_agent' and nation then
-                local zone_info = ECOWARRIOR_ZONES[nation];
-                if zone_info then print('\30\081[\30\082Homework\30\081]\30\106 ' .. color .. '[' .. zone_info.zone_name .. ' - ' .. zone_info.field_agent .. ']\30\106 ' .. task); end
-            elseif step == 'nm' and nation then
-                local zone_info = ECOWARRIOR_ZONES[nation];
-                if zone_info then print('\30\081[\30\082Homework\30\081]\30\106 ' .. color .. '[Kill the NM]\30\106 ' .. task); end
-            elseif step == 'field_agent_return' and nation then
-                local zone_info = ECOWARRIOR_ZONES[nation];
-                if zone_info then print('\30\081[\30\082Homework\30\081]\30\106 ' .. color .. '[' .. zone_info.zone_name .. ' - ' .. zone_info.field_agent .. ']\30\106 ' .. task); end
-            elseif step == 'reward' and nation then
-                local zone_info = ECOWARRIOR_ZONES[nation];
-                if zone_info then print('\30\081[\30\082Homework\30\081]\30\106 ' .. color .. '[' .. zone_info.city_name .. ' - ' .. zone_info.quest_npc .. ']\30\106 ' .. task); end
-            elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[' .. available_text .. ']\30\106 ' .. task);
-            else print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task); end
-        end
-    end
-    local next_reset = calculate_next_reset(current_time);
-    local time_left = next_reset - current_time;
-    local days = math.floor(time_left / 86400);
-    local hours = math.floor((time_left % 86400) / 3600);
-    local minutes = math.floor((time_left % 3600) / 60);
-    local time_str = '';
-    if days > 0 then time_str = string.format('%d day(s)', days);
-    elseif hours >= 3 then time_str = string.format('%d hour(s)', hours);
-    elseif hours > 0 then time_str = string.format('%d hour(s), %d minute(s)', hours, minutes);
-    else time_str = string.format('%d minute(s)', minutes); end
-    print('');
-    print_msg(string.format('Next reset in %s', time_str));
+    print_weekly_block(tracker.current_char, char_data, os.time());
 end
-
 local function show_timers()
     local char_data = get_char_data();
     local current_time = os.time();
@@ -1149,31 +1590,7 @@ local function show_timers()
     end
     print_msg('====================');
     for _, enm in ipairs(ENM_KEY_ITEMS) do
-        local timer_data = char_data.enm_timers[enm.name];
-        local status_icon = '';
-        local status_text = '';
-        if timer_data == nil or timer_data.next_ki_time == 0 then
-            if timer_data ~= nil and timer_data.has_ki then status_icon = '\30\104[KI]\30\106';
-            elseif timer_data ~= nil and not timer_data.has_ki then status_icon = '\30\104[   ]\30\106';
-            else status_icon = '\30\104[ ? ]\30\106'; end
-            status_text = '\30\071(Unknown)\30\106';
-        elseif current_time >= timer_data.next_ki_time then
-            if timer_data.has_ki then status_icon = '\30\110[KI]\30\106'; else status_icon = '\30\110[   ]\30\106'; end
-            status_text = '\30\071(Ready)\30\106';
-        else
-            if timer_data.timer_source == 'scan' then
-                if timer_data.has_ki then status_icon = '\30\104[KI]\30\106'; else status_icon = '\30\104[   ]\30\106'; end
-                status_text = '\30\071(Unknown)\30\106';
-            else
-                local time_left = timer_data.next_ki_time - current_time;
-                local days = math.floor(time_left / 86400);
-                local hours = math.floor((time_left % 86400) / 3600);
-                if timer_data.has_ki then status_icon = '\30\076[KI]\30\106'; else status_icon = '\30\068[   ]\30\106'; end
-                if days > 0 then status_text = string.format('\30\071(%dd %dh)\30\106', days, hours);
-                else status_text = string.format('\30\071(%dh)\30\106', hours); end
-            end
-        end
-        print(string.format('\30\081[\30\082Homework\30\081]\30\106 %s %s - %s', status_icon, enm.name, status_text));
+        print(format_timer_line(enm, char_data.enm_timers[enm.name], current_time));
     end
 end
 
@@ -1191,7 +1608,7 @@ local function format_time_short(seconds)
     else return string.format('%dm', minutes); end
 end
 
-local function update_char_list()
+function update_char_list()
     ui.char_list = {};
     for char_name, _ in pairs(tracker.settings.characters) do
         if char_name ~= nil and char_name ~= '' and char_name ~= 'Unknown' then
@@ -1223,6 +1640,11 @@ local function factory_reset()
     tracker.settings.characters = {};
     tracker.kis = {};
     tracker.kis_initialized = false;
+    tracker.login_state.waiting_for_login = false;
+    tracker.login_state.waiting_for_ki = false;
+    tracker.login_state.ki_packets_received = 0;
+    tracker.login_state.suppress_ki_events = false;
+    tracker.pending_dynamis_claim = nil;
     display_settings.tracked = {};
     ui.font_scale = 1.2;
     ui.char_list = {};
@@ -1355,8 +1777,9 @@ local function render_ui()
         local tracking = get_char_tracking(char_name);
 
         -- Dynamis entry counter (displayed above EcoWarrior)
-        if char_data.dynamis_data then
-            local entries = char_data.dynamis_data.entries_remaining or 2;
+        local dyn_store, dyn_shared = get_dynamis_store(char_name);
+        if dyn_store then
+            local entries = dyn_store.entries_remaining or 2;
             local dyn_icon, dyn_color;
             if entries == 0 then
                 dyn_icon = '[X]';
@@ -1374,7 +1797,7 @@ local function render_ui()
             imgui.Text('Dynamis');
             imgui.SameLine();
             imgui.SetCursorPosX(col_location);
-            imgui.TextColored({ 0.6, 0.8, 1.0, 1.0 }, entries .. ' entries left');
+            imgui.TextColored({ 0.6, 0.8, 1.0, 1.0 }, entries .. ' entries left' .. (dyn_shared and ' (account)' or ''));
         end
 
         for _, task in ipairs(tracker.settings.tasks) do
@@ -1455,24 +1878,8 @@ local function render_ui()
             elseif normalized == 'ecowarrior' then
                 local eco_data = char_data.ecowarrior_data or {step = 'unknown', locked_nations = {}};
                 local step = eco_data.step or 'unknown';
-                local locked = eco_data.locked_nations or {};
                 local knows = eco_data.knows_status;
-
-                -- Build available nations list
-                local available = {};
-                for _, n in ipairs({'sandoria', 'windurst', 'bastok'}) do
-                    local is_locked = false;
-                    for _, l in ipairs(locked) do if l == n then is_locked = true; break; end end
-                    if not is_locked then
-                        if n == 'sandoria' then table.insert(available, "San d'Oria");
-                        elseif n == 'windurst' then table.insert(available, 'Windurst');
-                        elseif n == 'bastok' then table.insert(available, 'Bastok'); end
-                    end
-                end
-                local available_text;
-                if #available == 3 or #available == 0 then available_text = 'All Nations';
-                elseif #available == 2 then available_text = available[1] .. ' & ' .. available[2];
-                else available_text = available[1]; end
+                local available_text = eco_available_text(eco_data.locked_nations);
 
                 if step == 'done' then
                     icon = '[X]'; color = { 1.0, 0.3, 0.3, 1.0 };
@@ -1492,7 +1899,7 @@ local function render_ui()
                     local nation = eco_data.current_nation;
                     if nation then
                         local zone_info = ECOWARRIOR_ZONES[nation];
-                        if zone_info then location = zone_info.zone_name .. ' - ' .. zone_info.field_agent; end
+                        if zone_info then location = zone_info.short_zone .. ' - ' .. zone_info.short_agent; end
                     end
                     help_text = "Has KI but locked nations unknown. Use /hw eco or talk to Eeko-Weeko.";
                 elseif step == 'field_agent' or step == 'nm' or step == 'field_agent_return' or step == 'reward' then
@@ -1507,10 +1914,10 @@ local function render_ui()
                     if nation then
                         local zone_info = ECOWARRIOR_ZONES[nation];
                         if zone_info then
-                            if step == 'field_agent' then location = zone_info.zone_name .. ' - ' .. zone_info.field_agent;
+                            if step == 'field_agent' then location = zone_info.short_zone .. ' - ' .. zone_info.short_agent;
                             elseif step == 'nm' then location = 'Kill NM';
-                            elseif step == 'field_agent_return' then location = zone_info.zone_name .. ' - ' .. zone_info.field_agent;
-                            elseif step == 'reward' then location = zone_info.city_name .. ' - ' .. zone_info.quest_npc; end
+                            elseif step == 'field_agent_return' then location = zone_info.short_zone .. ' - ' .. zone_info.short_agent;
+                            elseif step == 'reward' then location = zone_info.short_city .. ' - ' .. zone_info.quest_npc; end
                         end
                     end
                 else
@@ -1672,6 +2079,90 @@ local function render_ui()
                 imgui.Spacing();
                 imgui.Spacing();
 
+                draw_gradient_header('Dynamis Sharing', imgui.GetContentRegionAvail(),
+                    'Turn on when the server counts Dynamis entries per account instead of per character.\nGroup the characters that share one account. Characters left out of every account keep their own count.');
+
+                local aw = { tracker.settings.dynamis_account_wide == true };
+                if imgui.Checkbox('Dynamis entries are account-wide', aw) then
+                    tracker.settings.dynamis_account_wide = aw[1];
+                    ui.pending_account_add = nil;
+                    save_settings();
+                end
+
+                if tracker.settings.dynamis_account_wide then
+                    local accts = dynamis_accounts();
+                    local limit = chars_per_account();
+
+                    for ai, acct in ipairs(accts) do
+                        imgui.Spacing();
+                        local label = (acct.name or ('Account ' .. ai));
+                        imgui.TextColored({ 0.6, 0.8, 1.0, 1.0 },
+                            string.format('%s  (%d/%d)', label, #(acct.chars or {}), limit));
+                        imgui.SameLine();
+                        if imgui.SmallButton('Delete##acct' .. ai) then
+                            remove_dynamis_account(ai);
+                            ui.pending_account_add = nil;
+                            save_settings();
+                            break;
+                        end
+
+                        imgui.Indent(8);
+                        for _, cname in ipairs(ui.char_list) do
+                            local in_this = false;
+                            for _, c in ipairs(acct.chars or {}) do
+                                if c == cname then in_this = true; break; end
+                            end
+                            local box = { in_this };
+                            if imgui.Checkbox(cname .. '##acct' .. ai, box) then
+                                if box[1] then
+                                    if assign_char_to_account(cname, ai) then
+                                        ui.pending_account_add = nil;
+                                        save_settings();
+                                    else
+                                        -- Account full: offer to spill into a new one.
+                                        ui.pending_account_add = { char = cname, from = ai };
+                                    end
+                                else
+                                    unassign_char(cname);
+                                    ui.pending_account_add = nil;
+                                    save_settings();
+                                end
+                            end
+                        end
+                        imgui.Unindent(8);
+                    end
+
+                    imgui.Spacing();
+                    if imgui.SmallButton('+ Add account') then
+                        add_dynamis_account();
+                        save_settings();
+                    end
+
+                    if ui.pending_account_add ~= nil then
+                        imgui.Spacing();
+                        imgui.TextColored({ 1.0, 1.0, 0.0, 1.0 }, string.format(
+                            'That account is full (%d). Create a new account for %s?',
+                            limit, tostring(ui.pending_account_add.char)));
+                        if imgui.SmallButton('Yes##spill') then
+                            local idx = add_dynamis_account();
+                            assign_char_to_account(ui.pending_account_add.char, idx);
+                            ui.pending_account_add = nil;
+                            save_settings();
+                        end
+                        imgui.SameLine();
+                        if imgui.SmallButton('No##spill') then
+                            ui.pending_account_add = nil;
+                        end
+                    end
+
+                    if #accts == 0 then
+                        imgui.TextColored({ 0.7, 0.7, 0.7, 1.0 }, 'No accounts yet.');
+                    end
+                end
+
+                imgui.Spacing();
+                imgui.Spacing();
+
                 draw_gradient_header('Display Task', imgui.GetContentRegionAvail(), 'Check to affect which tasks are displayed. All are actively tracked.');
 
                 -- Character selector for tracking settings (synchronized with Tasks tab)
@@ -1704,10 +2195,10 @@ local function render_ui()
                     imgui.Spacing();
                     
                     -- Dynamis Run Count manual override
-                    local settings_char_data = tracker.settings.characters[settings_char];
-                    if settings_char_data and settings_char_data.dynamis_data then
-                        imgui.TextColored({ 0.7, 0.7, 0.7, 1.0 }, 'Dynamis Run Count:');
-                        local entries = settings_char_data.dynamis_data.entries_remaining or 2;
+                    local set_store, set_shared = get_dynamis_store(settings_char);
+                    if set_store then
+                        imgui.TextColored({ 0.7, 0.7, 0.7, 1.0 }, 'Dynamis Run Count:' .. (set_shared and '  (shared by account)' or ''));
+                        local entries = set_store.entries_remaining or 2;
                         
                         -- Radio buttons for 0, 1, 2 runs
                         imgui.Indent(2);
@@ -1716,17 +2207,17 @@ local function render_ui()
                         local sel_2 = { entries == 2 };
                         
                         if imgui.RadioButton('0 Runs', sel_0[1]) then
-                            settings_char_data.dynamis_data.entries_remaining = 0;
+                            set_store.entries_remaining = 0;
                             save_settings();
                         end
                         imgui.SameLine();
                         if imgui.RadioButton('1 Run', sel_1[1]) then
-                            settings_char_data.dynamis_data.entries_remaining = 1;
+                            set_store.entries_remaining = 1;
                             save_settings();
                         end
                         imgui.SameLine();
                         if imgui.RadioButton('2 Runs', sel_2[1]) then
-                            settings_char_data.dynamis_data.entries_remaining = 2;
+                            set_store.entries_remaining = 2;
                             save_settings();
                         end
                         imgui.Unindent(2);
@@ -1795,123 +2286,11 @@ local function show_char_details(char_name)
     if char_data.quest_steps == nil then char_data.quest_steps = {}; end
     if char_data.xsknife_data == nil then char_data.xsknife_data = {step = 'unknown'}; end
     if char_data.ecowarrior_data == nil then char_data.ecowarrior_data = {step = 'unknown', knows_status = false}; end
-    print_msg('Weekly Homework for \30\110' .. char_name .. '\30\106:');
-    print_msg('=================');
-    for _, task in ipairs(tracker.settings.tasks) do
-        local normalized = normalize_task(task);
-        if normalized == 'xsknife' then
-            local step = char_data.xsknife_data.step or 'unknown';
-            if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
-            elseif step == 'scanned_no_ki' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'scanned_has_ki' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[Boneyard Gully - Requiem of Sin]\30\106 ' .. task);
-            elseif step == 'scanned_has_ki_used' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[Despachiaire]\30\106 ' .. task);
-            elseif step == 'despachiaire' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Despachiaire]\30\106 ' .. task);
-            elseif step == 'boneyard' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Boneyard Gully - Requiem of Sin]\30\106 ' .. task);
-            elseif step == 'boneyard_2x' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[2x Boneyard Gully - Requiem of Sin]\30\106 ' .. task);
-            elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task);
-            else print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task); end
-        elseif normalized == 'highwind' then
-            local step = char_data.quest_steps.highwind or 'scanned';
-            if step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'start' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[NM]\30\106 ' .. task);
-            elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
-        elseif normalized == 'uninvited' then
-            local step = char_data.quest_steps.uninvited or 'unknown';
-            if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
-            elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'justinius' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Justinius - Start]\30\106 ' .. task);
-            elseif step == 'bcnm' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[BCNM Monarch]\30\106 ' .. task);
-            elseif step == 'justinius_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Justinius - Reward]\30\106 ' .. task);
-            elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
-        elseif normalized == 'spicegals' then
-            local step = char_data.quest_steps.spicegals or 'unknown';
-            if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
-            elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'rouva' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva - Start]\30\106 ' .. task);
-            elseif step == 'riverne' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Riverne B]\30\106 ' .. task);
-            elseif step == 'rouva_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Rouva - Reward]\30\106 ' .. task);
-            elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
-        elseif normalized == 'cookbook' then
-            local step = char_data.quest_steps.cookbook or 'unknown';
-            if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
-            elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task);
-            elseif step == 'jonette' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Jonette - Start]\30\106 ' .. task);
-            elseif step == 'sacrarium' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[??? Sacrarium]\30\106 ' .. task);
-            elseif step == 'jonette_return' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[Jonette - Reward]\30\106 ' .. task);
-            elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[X]\30\106 ' .. task); end
-        elseif normalized == 'ecowarrior' then
-            local eco_data = char_data.ecowarrior_data or {step = 'unknown', current_nation = nil, locked_nations = {}, knows_status = false};
-            local step = eco_data.step or 'unknown';
-            local nation = eco_data.current_nation;
-            local locked = eco_data.locked_nations or {};
-            local knows = eco_data.knows_status;
-            local available = {};
-            for _, n in ipairs({'sandoria', 'windurst', 'bastok'}) do
-                local is_locked = false;
-                for _, l in ipairs(locked) do if l == n then is_locked = true; break; end end
-                if not is_locked then
-                    if n == 'sandoria' then table.insert(available, "San d'Oria");
-                    elseif n == 'windurst' then table.insert(available, 'Windurst');
-                    elseif n == 'bastok' then table.insert(available, 'Bastok'); end
-                end
-            end
-            local available_text;
-            if #available == 3 or #available == 0 then available_text = 'All Nations';
-            elseif #available == 2 then available_text = available[1] .. ' & ' .. available[2];
-            elseif #available == 1 then available_text = available[1]; end
-            local color = knows and '\30\110' or '\30\104';
-            if step == 'unknown' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[ ? ]\30\106 ' .. task);
-            elseif step == 'scanned' then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[' .. available_text .. ']\30\106 ' .. task);
-            elseif step == 'scanned_has_ki' and nation then
-                local zone_info = ECOWARRIOR_ZONES[nation];
-                if zone_info then print('\30\081[\30\082Homework\30\081]\30\106 \30\104[' .. zone_info.zone_name .. ' - ' .. zone_info.field_agent .. ']\30\106 ' .. task); end
-            elseif step == 'ready' then print('\30\081[\30\082Homework\30\081]\30\106 \30\110[' .. available_text .. ']\30\106 ' .. task);
-            elseif step == 'field_agent' and nation then
-                local zone_info = ECOWARRIOR_ZONES[nation];
-                if zone_info then print('\30\081[\30\082Homework\30\081]\30\106 ' .. color .. '[' .. zone_info.zone_name .. ' - ' .. zone_info.field_agent .. ']\30\106 ' .. task); end
-            elseif step == 'nm' and nation then
-                print('\30\081[\30\082Homework\30\081]\30\106 ' .. color .. '[Kill the NM]\30\106 ' .. task);
-            elseif step == 'field_agent_return' and nation then
-                local zone_info = ECOWARRIOR_ZONES[nation];
-                if zone_info then print('\30\081[\30\082Homework\30\081]\30\106 ' .. color .. '[' .. zone_info.zone_name .. ' - ' .. zone_info.field_agent .. ']\30\106 ' .. task); end
-            elseif step == 'reward' and nation then
-                local zone_info = ECOWARRIOR_ZONES[nation];
-                if zone_info then print('\30\081[\30\082Homework\30\081]\30\106 ' .. color .. '[' .. zone_info.city_name .. ' - ' .. zone_info.quest_npc .. ']\30\106 ' .. task); end
-            elseif step == 'done' then print('\30\081[\30\082Homework\30\081]\30\106 \30\076[' .. available_text .. ']\30\106 ' .. task);
-            else print('\30\081[\30\082Homework\30\081]\30\106 \30\104[   ]\30\106 ' .. task); end
-        end
-    end
-    local next_reset = calculate_next_reset(current_time);
-    local days_until = math.floor((next_reset - current_time) / 86400);
-    print_msg(string.format('Next reset in %d day(s)', days_until));
+    if char_data.dynamis_data == nil then char_data.dynamis_data = new_dynamis_data(); end
+    print_weekly_block(char_name, char_data, current_time);
     print('');
-    print_msg('ENM & Limbus Timers for \30\110' .. char_name .. '\30\106:');
-    print_msg('====================');
-    for _, enm in ipairs(ENM_KEY_ITEMS) do
-        local timer_data = char_data.enm_timers[enm.name];
-        local status_icon = '\30\104[ ? ]\30\106';
-        local status_text = '\30\071(Unknown)\30\106';
-        if timer_data ~= nil then
-            if timer_data.next_ki_time == 0 then
-                if timer_data.has_ki then status_icon = '\30\104[KI]\30\106'; else status_icon = '\30\104[   ]\30\106'; end
-            elseif current_time >= timer_data.next_ki_time then
-                if timer_data.has_ki then status_icon = '\30\110[KI]\30\106'; else status_icon = '\30\110[   ]\30\106'; end
-                status_text = '\30\071(Ready)\30\106';
-            elseif timer_data.timer_source == 'scan' then
-                if timer_data.has_ki then status_icon = '\30\104[KI]\30\106'; else status_icon = '\30\104[   ]\30\106'; end
-            else
-                local time_left = timer_data.next_ki_time - current_time;
-                local days = math.floor(time_left / 86400);
-                local hours = math.floor((time_left % 86400) / 3600);
-                if timer_data.has_ki then status_icon = '\30\076[KI]\30\106'; else status_icon = '\30\068[   ]\30\106'; end
-                if days > 0 then status_text = string.format('\30\071(%dd %dh)\30\106', days, hours);
-                else status_text = string.format('\30\071(%dh)\30\106', hours); end
-            end
-        end
-        print(string.format('\30\081[\30\082Homework\30\081]\30\106 %s %s - %s', status_icon, enm.name, status_text));
-    end
+    print_timer_block(char_name, char_data, current_time);
 end
-
 local function toggle_task(task)
     local proper_name = find_task_name(task);
     if not proper_name then print_error('Invalid task: ' .. task); return; end
@@ -1970,7 +2349,29 @@ ashita.events.register('load', 'load_cb', function()
     if loaded_settings ~= nil then
         tracker.settings = loaded_settings;
         if tracker.settings.characters == nil then tracker.settings.characters = {}; end
+        if type(tracker.settings.dynamis_accounts) ~= 'table' then tracker.settings.dynamis_accounts = {}; end
+        if tracker.settings.dynamis_account_wide ~= true then tracker.settings.dynamis_account_wide = false; end
+        if tonumber(tracker.settings.chars_per_account or 0) == nil
+           or tonumber(tracker.settings.chars_per_account or 0) < 1 then
+            tracker.settings.chars_per_account = DEFAULT_CHARS_PER_ACCOUNT;
+        end
         local needs_save = false;
+        -- A truncated or partly written homework.json used to leave `tasks` nil,
+        -- which then blew up in the first ipairs() during render.
+        if type(tracker.settings.tasks) ~= 'table' or #tracker.settings.tasks == 0 then
+            tracker.settings.tasks = {};
+            for _, t in ipairs(DEFAULT_TASKS) do table.insert(tracker.settings.tasks, t); end
+            needs_save = true;
+        else
+            -- Append any task added by a newer version that this save predates.
+            for _, t in ipairs(DEFAULT_TASKS) do
+                local found = false;
+                for _, existing in ipairs(tracker.settings.tasks) do
+                    if existing == t then found = true; break; end
+                end
+                if not found then table.insert(tracker.settings.tasks, t); needs_save = true; end
+            end
+        end
         if tracker.settings.characters['Unknown'] ~= nil then
             tracker.settings.characters['Unknown'] = nil;
             needs_save = true;
@@ -1994,9 +2395,21 @@ ashita.events.register('load', 'load_cb', function()
         get_char_data();
         initialize_timer();
         update_char_list();
+        -- Reading key items out of game memory is best-effort: on some clients
+        -- HasKeyItem is simply unavailable and answers false for every id. It is
+        -- never treated as authoritative on its own any more.
         if populate_kis_from_memory() then
             scan_key_items(true);
-            print_success('Auto-scanned key items.');
+        elseif restore_ki_cache() then
+            -- Recovered last session's state from homework.json. Accurate unless
+            -- key items changed elsewhere; the next zone-in corrects it silently.
+            print_msg('Key items restored from your last session. Zone once to refresh.');
+        else
+            -- Nothing to go on. Wait for the 0x055 packets, which arrive on zone-in.
+            tracker.login_state.waiting_for_ki = true;
+            tracker.login_state.suppress_ki_events = true;
+            tracker.login_state.ki_packets_received = 0;
+            print_msg('Key items unavailable - zone once and they will sync automatically.');
         end
     else
         tracker.login_state.waiting_for_login = true;
@@ -2033,15 +2446,14 @@ ashita.events.register('text_in', 'text_in_cb', function(e)
             tracker.pending_dynamis_claim = os.time();
         elseif message:find('Obtained: Perpetual hourglass') then
             if tracker.pending_dynamis_claim ~= nil
-                and (os.time() - tracker.pending_dynamis_claim) <= 5
-                and char_data.dynamis_data ~= nil then
-                local dd = char_data.dynamis_data;
-                if not dd.glass_used and (dd.entries_remaining or 0) > 0 then
-                    dd.entries_remaining = dd.entries_remaining - 1;
-                    dd.glass_used = true;
-                    dd.claimed_before_reset = true;
-                    save_settings();
-                    print_success('Dynamis claim counted! Entries left: ' .. dd.entries_remaining);
+                and (os.time() - tracker.pending_dynamis_claim) <= 5 then
+                local store = get_dynamis_store(tracker.current_char);
+                if store ~= nil then
+                    -- The charged glass is already in the bag by the time this
+                    -- message lands, so its serial can be read immediately.
+                    local serial = find_glass_serial(nil);
+                    store.claimed_at = os.time();
+                    count_dynamis_entry(store, serial, 'glass broken - counted');
                 end
             end
             tracker.pending_dynamis_claim = nil;
@@ -2237,21 +2649,22 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
         
         -- Check if this is a Dynamis zone
         if DYNAMIS_ZONES[zone_id] then
-            local char_data = get_char_data();
-            if char_data and char_data.dynamis_data then
-                -- Count if: new glass (glass_used false) OR different Dynamis zone
-                local is_new_entry = not char_data.dynamis_data.glass_used;
-                local is_different_zone = char_data.dynamis_data.glass_used and char_data.dynamis_data.dynamis_zone ~= zone_id;
-                if is_new_entry or is_different_zone then
-                    if char_data.dynamis_data.entries_remaining > 0 then
-                        char_data.dynamis_data.entries_remaining = char_data.dynamis_data.entries_remaining - 1;
-                        char_data.dynamis_data.glass_used = true;
-                        char_data.dynamis_data.dynamis_zone = zone_id;
-                        save_settings();
-                        print_success('Dynamis entry counted! ' .. char_data.dynamis_data.entries_remaining .. ' entries remaining this week.');
-                    else
-                        print_msg('Dynamis entry detected but counter already at 0.');
-                    end
+            get_char_data();
+            local store = get_dynamis_store(tracker.current_char);
+            if store ~= nil then
+                -- Count once per glass, identified by its serial. A glass we broke
+                -- ourselves was already counted, so walking in changes nothing. A
+                -- glass someone else broke - same zone or not - is a new serial and
+                -- counts here.
+                local serial = find_glass_serial(zone_id);
+                if serial == nil then
+                    -- Could not read a serial (no glass in the bag, or unreadable
+                    -- Extra bytes). Fall back to counting each Dynamis zone once per
+                    -- week so an entry is never silently missed.
+                    serial = 'zone-' .. tostring(zone_id);
+                end
+                if not glass_already_counted(store, serial) then
+                    count_dynamis_entry(store, serial, 'entry counted');
                 end
             end
         end
@@ -2280,7 +2693,8 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
     end
     -- Key Item packet
     if id == 0x0055 then
-        local offset = struct.unpack('B', data, 0x84 + 1) * 512;
+        local ki_table_type = struct.unpack('B', data, 0x84 + 1);
+        local offset = ki_table_type * 512;
         for i = 0, 511 do
             local ki_position = i + offset;
             local byte_index = math.floor(i / 8);
@@ -2307,7 +2721,6 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
                 local char_data = get_char_data();
                 if char_data ~= nil then
                     scan_key_items(true);
-                    print_success('Auto-scanned key items.');
                 end
             end
         end
@@ -2316,57 +2729,9 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
     return;
 end);
 
--- Outgoing packet handler for Dynamis tracking
-ashita.events.register('packet_out', 'packet_out_cb', function(e)
-    -- Drop packet (0x028) - check if dropped item is Perpetual Hourglass
-    if e.id == 0x028 then
-        local char_data = get_char_data();
-        if char_data and char_data.dynamis_data and char_data.dynamis_data.glass_used then
-            -- Read slot info from packet (container at 0x08, slot at 0x09)
-            local container = struct.unpack('B', e.data, 0x08 + 1) or 0;
-            local slot = struct.unpack('B', e.data, 0x09 + 1) or 0;
-            -- Check if this slot contains the Perpetual Hourglass
-            local ok, item_id = pcall(function()
-                local item = AshitaCore:GetMemoryManager():GetInventory():GetContainerItem(container, slot);
-                return item and item.Id or 0;
-            end);
-            if ok and item_id == PERPETUAL_HOURGLASS_ID then
-                -- Before resetting glass_used, scan all bags for any remaining hourglass.
-                -- If the player still has one (e.g. they crafted multiple and dropped extras),
-                -- keep glass_used = true so re-zoning into Dynamis won't false-count.
-                local still_has_glass = false;
-                local sok, _ = pcall(function()
-                    local inv = AshitaCore:GetMemoryManager():GetInventory();
-                    local bags = { 0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
-                    for _, bag in ipairs(bags) do
-                        local bag_max = inv:GetContainerCountMax(bag);
-                        if bag_max and bag_max > 0 then
-                            for s = 1, bag_max do
-                                local it = inv:GetContainerItem(bag, s);
-                                if it ~= nil then
-                                    local iok, iid = pcall(function() return it.Id; end);
-                                    if iok and iid == PERPETUAL_HOURGLASS_ID then
-                                        -- Skip the slot being dropped right now (its Id may still read here)
-                                        if not (bag == container and s == slot) then
-                                            still_has_glass = true;
-                                            return;
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end);
-                if not still_has_glass then
-                    char_data.dynamis_data.glass_used = false;
-                    char_data.dynamis_data.dynamis_zone = nil;
-                    save_settings();
-                end
-            end
-        end
-        return;
-    end
-end);
+-- Note: the old outgoing 0x028 drop handler is gone. Dropping a glass no longer
+-- affects anything, because entries are keyed on glass serials rather than on a
+-- "do I still hold a glass" flag.
 
 ashita.events.register('d3d_present', 'd3d_present_cb', function()
     -- Render UI (always, imgui handles visibility)
@@ -2389,9 +2754,8 @@ ashita.events.register('command', 'command_cb', function(e)
     local char_data = get_char_data();
     if char_data == nil then print_error('Character not loaded yet. Please wait...'); return; end
     local current_time = os.time();
-    if char_data.last_reset > 0 then
-        local last_reset_point = calculate_next_reset(char_data.last_reset);
-        if current_time >= last_reset_point and char_data.last_reset < last_reset_point then reset_tracker(); end
+    if char_data.last_reset > 0 and current_time >= calculate_next_reset(char_data.last_reset) then
+        reset_tracker();
     end
     if (#args == 1) then
         -- /hw alone toggles the window
@@ -2411,6 +2775,7 @@ ashita.events.register('command', 'command_cb', function(e)
         print('  \30\106/hw chars - Show all characters and their progress');
         print('  \30\106/hw chars <n> - Show week & timers for specific character');
         print('  \30\106/hw <task> - Toggle task completion');
+        print('  \30\106/hw task - List every task and its short forms');
         print('  \30\106/hw eco - Toggle EcoWarrior done/undone');
         print('  \30\106/hw eco <nation> - Start EcoWarrior for nation (sandy/basty/windy)');
         print('  \30\106/hw scan - Scan key items for current character');
@@ -2439,30 +2804,53 @@ ashita.events.register('command', 'command_cb', function(e)
         local char_count = 0;
         for _ in pairs(tracker.settings.characters) do char_count = char_count + 1; end
         print_msg('WARNING: This will DELETE all saved data (' .. char_count .. ' characters, progress, timers).');
-        print_msg('Type /hw yes to confirm, or /hw no to cancel.');
-        tracker.pending_reset = true;
+        print_msg('Type /hw yes within 30 seconds to confirm, or /hw no to cancel.');
+        tracker.pending_reset = os.time();
         return;
     end
     if (args[2] == 'yes') then
-        if tracker.pending_reset then
-            factory_reset();
-            tracker.pending_reset = false;
-        else
+        if tracker.pending_reset == nil then
             print_error('Nothing to confirm.');
+        elseif (current_time - tracker.pending_reset) > RESET_CONFIRM_WINDOW then
+            tracker.pending_reset = nil;
+            print_error('That confirmation expired. Run /hw reset again if you meant it.');
+        else
+            tracker.pending_reset = nil;
+            factory_reset();
         end
         return;
     end
     if (args[2] == 'no') then
-        if tracker.pending_reset then
-            print_msg('Reset cancelled.');
-            tracker.pending_reset = false;
-        else
+        if tracker.pending_reset == nil then
             print_error('Nothing to cancel.');
+        else
+            tracker.pending_reset = nil;
+            print_msg('Reset cancelled.');
         end
         return;
     end
+    if (args[2] == 'task' or args[2] == 'tasks') then
+        print_msg('Toggle a task with \30\110/hw <task>\30\106:');
+        for _, task in ipairs(tracker.settings.tasks) do
+            local short = {};
+            for alias, target in pairs(TASK_ALIASES) do
+                if target == task then table.insert(short, alias); end
+            end
+            table.sort(short);
+            local canonical = normalize_task(task);
+            local shown = { canonical };
+            for _, a in ipairs(short) do
+                if a ~= canonical then table.insert(shown, a); end
+            end
+            print(string.format('%s\30\110%-12s\30\106 %s', HDR, task, table.concat(shown, ', ')));
+        end
+        print_msg('Also: \30\110/hw eco <nation>\30\106 to set an EcoWarrior nation.');
+        return;
+    end
     if (args[2] == 'scan') then
-        if not tracker.kis_initialized then populate_kis_from_memory(); end
+        if not tracker.kis_initialized then
+            if not populate_kis_from_memory() then restore_ki_cache(); end
+        end
         scan_key_items();
         return;
     end
