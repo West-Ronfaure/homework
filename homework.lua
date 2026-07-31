@@ -2769,20 +2769,26 @@ ashita.events.register('command', 'command_cb', function(e)
     end
     if (args[2] == 'help') then
         print_msg('Available commands:');
-        print('  \30\106/hw - Toggle tracking window');
-        print('  \30\106/hw weeklys - Show weekly homeworks checklist (chat)');
-        print('  \30\106/hw timers - Show ENM/Limbus timers (chat)');
-        print('  \30\106/hw chars - Show all characters and their progress');
-        print('  \30\106/hw chars <n> - Show week & timers for specific character');
-        print('  \30\106/hw <task> - Toggle task completion');
-        print('  \30\106/hw task - List every task and its short forms');
-        print('  \30\106/hw eco - Toggle EcoWarrior done/undone');
-        print('  \30\106/hw eco <nation> - Start EcoWarrior for nation (sandy/basty/windy)');
-        print('  \30\106/hw scan - Scan key items for current character');
-        print('  \30\106/hw reset - Factory reset (delete all data)');
-        print('  \30\106/hw help - Show this help');
+        -- green command, grey description, aligned so the dashes line up
+        local function help_line(cmd, desc)
+            print(string.format('  \30\110%-22s\30\106- \30\071%s\30\106', cmd, desc));
+        end
+        help_line('/hw',              'Toggle tracking window');
+        help_line('/hw weeklys',      'Weekly checklist in chat');
+        help_line('/hw timers',       'ENM / Limbus timers in chat');
+        help_line('/hw chars',        'All characters and their progress');
+        help_line('/hw chars <name>', 'Week & timers for one character');
         print('');
-        print_msg('Aliases: /hw, /homework, /homeworks');
+        help_line('/hw <task>',       'Toggle a task complete');
+        help_line('/hw task',         'List every task and its short forms');
+        help_line('/hw eco',          'Toggle EcoWarrior done / undone');
+        help_line('/hw eco <nation>', 'Start EcoWarrior (sandy / basty / windy)');
+        print('');
+        help_line('/hw scan',         'Scan key items for this character');
+        help_line('/hw reset',        'Factory reset (deletes everything)');
+        help_line('/hw help',         'Show this help');
+        print('');
+        print_msg('Also answers to \30\110/homework\30\106 and \30\110/homeworks\30\106.');
         return;
     end
     if (args[2] == 'show') then
