@@ -5,7 +5,7 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-addon.version   = '3.5';
+addon.version   = '3.5.1';
 addon.desc      = 'Weekly homework tracker for FFXI';
 addon.link      = '';
 
@@ -338,23 +338,43 @@ local PERPETUAL_HOURGLASS_ID = 4237;
 local GLASS_EXTRA_TIME_OFFSET = 13;
 local GLASS_EXTRA_ZONE_OFFSET = 17;
 
+-- Incoming 0x020 "item obtained" packet, 1-based offsets for struct.unpack:
+--   13 = item id (u16)
+--   18 = start of the item's Extra block, same layout as the inventory copy
+-- Verified byte for byte against a live capture of a Windurst glass being broken.
+local ITEM_PACKET_ID_OFFSET    = 13;
+local ITEM_PACKET_EXTRA_OFFSET = 18;
+
 -- Bags worth scanning for an hourglass.
 local GLASS_BAGS = { 0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
 
--- Reads the serial from one inventory item. Returns serial, zone_id or nil.
-local function glass_serial_from_item(item)
-    if item == nil then return nil; end
+-- Extra layout, 1-based for Lua's struct.unpack:
+--   13 = unix time the timeless glass was traded
+--   17 = destination Dynamis zone id
+-- Confirmed identical whether the bytes come from the inventory or straight out
+-- of an incoming 0x020 item packet.
+local function glass_serial_from_extra(extra)
+    if extra == nil or #extra < GLASS_EXTRA_ZONE_OFFSET + 3 then return nil; end
     local ok, serial, zone = pcall(function()
-        if item.Id ~= PERPETUAL_HOURGLASS_ID then return nil, nil; end
-        local extra = item.Extra;
-        if extra == nil or #extra < GLASS_EXTRA_ZONE_OFFSET + 3 then return nil, nil; end
         local t = struct.unpack('L', extra, GLASS_EXTRA_TIME_OFFSET);
         local z = struct.unpack('L', extra, GLASS_EXTRA_ZONE_OFFSET);
         if t == nil or z == nil or t == 0 then return nil, nil; end
+        if DYNAMIS_ZONES[z] == nil then return nil, nil; end
         return string.format('%d-%d', z, t), z;
     end);
     if not ok then return nil; end
     return serial, zone;
+end
+
+-- Reads the serial from one inventory item. Returns serial, zone_id or nil.
+local function glass_serial_from_item(item)
+    if item == nil then return nil; end
+    local ok, extra = pcall(function()
+        if item.Id ~= PERPETUAL_HOURGLASS_ID then return nil; end
+        return item.Extra;
+    end);
+    if not ok or extra == nil then return nil; end
+    return glass_serial_from_extra(extra);
 end
 
 -- Finds a charged glass. Prefers one booked for prefer_zone when given, so
@@ -485,9 +505,14 @@ local ECOWARRIOR_KI_IDS = {
 -- case the server changes the limit.
 local DEFAULT_CHARS_PER_ACCOUNT = 3;
 
+-- Horizon's Dynamis rules: an account gets 3 entries a week, but no single
+-- character may use more than 2 of them.
+local ACCOUNT_ENTRY_LIMIT   = 3;
+local CHARACTER_ENTRY_LIMIT = 2;
+
 -- Fresh Dynamis bookkeeping.
 local function new_dynamis_data()
-    return { entries_remaining = 2, counted_glasses = {} };
+    return { entries_remaining = CHARACTER_ENTRY_LIMIT, counted_glasses = {} };
 end
 
 -- Which account (if any) a character belongs to. Returns the account table.
@@ -508,7 +533,8 @@ local function get_dynamis_store(char_name)
     if tracker.settings.dynamis_account_wide then
         local acct = find_dynamis_account(char_name);
         if acct ~= nil then
-            if acct.entries_remaining == nil then acct.entries_remaining = 2; end
+            acct.is_account = true;
+            if acct.entries_remaining == nil then acct.entries_remaining = ACCOUNT_ENTRY_LIMIT; end
             if type(acct.counted_glasses) ~= 'table' then acct.counted_glasses = {}; end
             return acct, true;
         end
@@ -538,7 +564,8 @@ local function add_dynamis_account()
     table.insert(accts, {
         name = 'Account ' .. tostring(#accts + 1),
         chars = {},
-        entries_remaining = 2,
+        is_account = true,
+        entries_remaining = ACCOUNT_ENTRY_LIMIT,
         counted_glasses = {}
     });
     return #accts;
@@ -569,7 +596,13 @@ end
 -- counted would count a second time once the pool took over.
 function recalc_account_from_members(acct)
     if acct == nil or type(acct.chars) ~= 'table' or #acct.chars == 0 then return; end
-    local lowest = acct.entries_remaining or 2;
+
+    -- Work from what the members have actually USED, not from whoever has the
+    -- fewest left. Taking the lowest threw away an alt's unused entries: a
+    -- character sitting at 0 would drag the whole pool to 0 even when nobody
+    -- else had run. Each character's own allowance is CHARACTER_ENTRY_LIMIT, so
+    -- (limit - remaining) is how many runs they spent.
+    local used = 0;
     local merged, seen = {}, {};
     for _, sn in ipairs(acct.counted_glasses or {}) do
         if not seen[sn] then seen[sn] = true; table.insert(merged, sn); end
@@ -578,14 +611,20 @@ function recalc_account_from_members(acct)
         local cd = tracker.settings.characters[cname];
         local dd = cd and cd.dynamis_data or nil;
         if dd ~= nil then
-            local e = tonumber(dd.entries_remaining);
-            if e ~= nil and e < lowest then lowest = e; end
+            local left = tonumber(dd.entries_remaining);
+            if left == nil then left = CHARACTER_ENTRY_LIMIT; end
+            if left < 0 then left = 0; end
+            if left > CHARACTER_ENTRY_LIMIT then left = CHARACTER_ENTRY_LIMIT; end
+            used = used + (CHARACTER_ENTRY_LIMIT - left);
             for _, sn in ipairs(dd.counted_glasses or {}) do
                 if not seen[sn] then seen[sn] = true; table.insert(merged, sn); end
             end
         end
     end
-    acct.entries_remaining = lowest;
+
+    local remaining = ACCOUNT_ENTRY_LIMIT - used;
+    if remaining < 0 then remaining = 0; end
+    acct.entries_remaining = remaining;
     acct.counted_glasses = merged;
 end
 
@@ -624,22 +663,71 @@ local function glass_already_counted(store, serial)
     return false;
 end
 
--- Counts one entry against a store. Returns true if it actually counted.
-local function count_dynamis_entry(store, serial, label)
+-- What actually limits this character right now: the lower of their own
+-- remaining entries and (when grouped) their account's.
+local function dynamis_effective_remaining(char_name)
+    local store, shared = get_dynamis_store(char_name);
+    if store == nil then return 0, 0, nil; end
+    local acct_left = store.entries_remaining or 0;
+    if not shared then return acct_left, acct_left, nil; end
+    local cd = char_name and tracker.settings.characters[char_name] or nil;
+    local char_left = cd and cd.dynamis_data and cd.dynamis_data.entries_remaining or 0;
+    local eff = acct_left;
+    if char_left < eff then eff = char_left; end
+    return eff, acct_left, char_left;
+end
+
+-- Counts one entry. When the character is in an account this spends from both
+-- the account's 3 and the character's own 2, because Horizon caps each.
+local function count_dynamis_entry(store, serial, label, char_name)
     if store == nil then return false; end
     if serial ~= nil then
         if glass_already_counted(store, serial) then return false; end
         table.insert(store.counted_glasses, serial);
     end
+    char_name = char_name or tracker.current_char;
+    local _, shared = get_dynamis_store(char_name);
+    local char_data = char_name and tracker.settings.characters[char_name] or nil;
+    local char_store = (shared and char_data) and char_data.dynamis_data or nil;
+
+    -- A character who has already used their personal 2 cannot spend from the
+    -- account pool, so the remaining entry stays available to their alts.
+    if char_store ~= nil and (char_store.entries_remaining or 0) <= 0 then
+        save_settings();
+        print_msg('This character has already used both of their Dynamis runs this week.');
+        return true;
+    end
+
+    local counted = false;
     if (store.entries_remaining or 0) > 0 then
         store.entries_remaining = store.entries_remaining - 1;
-        save_settings();
-        print_success(string.format('Dynamis %s! %d entr%s remaining this week.',
-            label or 'entry counted', store.entries_remaining,
-            store.entries_remaining == 1 and 'y' or 'ies'));
-    else
-        save_settings();
+        counted = true;
+    end
+    -- Mirror the spend onto the character's own allowance so their personal cap
+    -- keeps counting down while the account pool does too.
+    if char_store ~= nil then
+        if serial ~= nil and not glass_already_counted(char_store, serial) then
+            table.insert(char_store.counted_glasses, serial);
+        end
+        if (char_store.entries_remaining or 0) > 0 then
+            char_store.entries_remaining = char_store.entries_remaining - 1;
+            counted = true;
+        end
+    end
+
+    save_settings();
+    if not counted then
         print_msg('Dynamis entry detected but the counter is already at 0.');
+        return true;
+    end
+
+    local eff, acct_left, char_left = dynamis_effective_remaining(char_name);
+    if char_left ~= nil and acct_left ~= char_left then
+        print_success(string.format('Dynamis %s! %d left (account: %d).',
+            label or 'entry counted', char_left, acct_left));
+    else
+        print_success(string.format('Dynamis %s! %d entr%s remaining this week.',
+            label or 'entry counted', eff, eff == 1 and 'y' or 'ies'));
     end
     return true;
 end
@@ -1202,11 +1290,12 @@ function reset_dynamis_store(store, current_time)
     store.claimed_before_reset = nil;
     -- A glass broken in the final day before reset belongs to the new week, so the
     -- entry stays spent and its serial stays on the list.
+    local full = store.is_account and ACCOUNT_ENTRY_LIMIT or CHARACTER_ENTRY_LIMIT;
     if store.claimed_at ~= nil and (current_time - store.claimed_at) <= DYNAMIS_CLAIM_CARRY_WINDOW then
-        store.entries_remaining = 1;
+        store.entries_remaining = full - 1;
         store.counted_glasses = { 'carried-' .. tostring(store.claimed_at) };
     else
-        store.entries_remaining = 2;
+        store.entries_remaining = full;
         store.counted_glasses = {};
     end
     store.claimed_at = nil;
@@ -1428,11 +1517,29 @@ local function format_dynamis_line(char_name, char_data)
     local store, shared = get_dynamis_store(char_name);
     if store == nil then store = char_data.dynamis_data; end
     if store == nil then return HDR .. '\30\104[ ? ]\30\106 Dynamis'; end
-    local entries = store.entries_remaining or 2;
-    local suffix = shared and ' \30\067[account]\30\106' or '';
-    if entries <= 0 then return HDR .. '\30\076[X]\30\106 Dynamis \30\071(no runs left)\30\106' .. suffix;
-    elseif entries == 1 then return HDR .. '\30\104[1 Run]\30\106 Dynamis \30\071(1 run left)\30\106' .. suffix;
-    else return HDR .. '\30\110[' .. entries .. ' Runs]\30\106 Dynamis \30\071(' .. entries .. ' runs left)\30\106' .. suffix; end
+    -- Show what actually limits this character: the lower of their own cap and
+    -- the account pool. Saying "1 left" when the character is capped would lie.
+    local entries, acct_left, char_left = dynamis_effective_remaining(char_name);
+    if not shared then entries = store.entries_remaining or CHARACTER_ENTRY_LIMIT; end
+    local suffix = '';
+    if shared then
+        if char_left ~= nil and acct_left ~= char_left then
+            suffix = string.format(', account: %d', acct_left);
+        else
+            suffix = ', account';
+        end
+    end
+    -- When the account still holds entries the character cannot use, say so
+    -- compactly rather than stacking two bracketed phrases.
+    if suffix ~= '' then
+        local icon = (entries <= 0) and '\30\076[X]\30\106'
+                  or (entries == 1) and '\30\104[1 Run]\30\106'
+                  or ('\30\110[' .. entries .. ' Runs]\30\106');
+        return HDR .. icon .. ' Dynamis \30\071(' .. entries .. ' left' .. suffix .. ')\30\106';
+    end
+    if entries <= 0 then return HDR .. '\30\076[X]\30\106 Dynamis \30\071(no runs left)\30\106';
+    elseif entries == 1 then return HDR .. '\30\104[1 Run]\30\106 Dynamis \30\071(1 run left)\30\106';
+    else return HDR .. '\30\110[' .. entries .. ' Runs]\30\106 Dynamis \30\071(' .. entries .. ' runs left)\30\106'; end
 end
 
 -- One chat line for one ENM/Limbus timer.
@@ -1779,7 +1886,8 @@ local function render_ui()
         -- Dynamis entry counter (displayed above EcoWarrior)
         local dyn_store, dyn_shared = get_dynamis_store(char_name);
         if dyn_store then
-            local entries = dyn_store.entries_remaining or 2;
+            local entries, dyn_acct_left, dyn_char_left = dynamis_effective_remaining(char_name);
+            if not dyn_shared then entries = dyn_store.entries_remaining or CHARACTER_ENTRY_LIMIT; end
             local dyn_icon, dyn_color;
             if entries == 0 then
                 dyn_icon = '[X]';
@@ -1797,7 +1905,15 @@ local function render_ui()
             imgui.Text('Dynamis');
             imgui.SameLine();
             imgui.SetCursorPosX(col_location);
-            imgui.TextColored({ 0.6, 0.8, 1.0, 1.0 }, entries .. ' entries left' .. (dyn_shared and ' (account)' or ''));
+            local dyn_note = '';
+            if dyn_shared then
+                if dyn_char_left ~= nil and dyn_acct_left ~= dyn_char_left then
+                    dyn_note = string.format(' (account: %d)', dyn_acct_left);
+                else
+                    dyn_note = ' (account)';
+                end
+            end
+            imgui.TextColored({ 0.6, 0.8, 1.0, 1.0 }, entries .. ' left' .. dyn_note);
         end
 
         for _, task in ipairs(tracker.settings.tasks) do
@@ -2080,10 +2196,10 @@ local function render_ui()
                 imgui.Spacing();
 
                 draw_gradient_header('Dynamis Sharing', imgui.GetContentRegionAvail(),
-                    'Turn on when the server counts Dynamis entries per account instead of per character.\nGroup the characters that share one account. Characters left out of every account keep their own count.');
+                    'Horizon counts Dynamis per account: 3 entries per account, 2 per character.\nGroup the characters that share one account. Characters left out of every account just get their own 2.');
 
                 local aw = { tracker.settings.dynamis_account_wide == true };
-                if imgui.Checkbox('Dynamis entries are account-wide', aw) then
+                if imgui.Checkbox('Horizon: account-wide Dynamis entries', aw) then
                     tracker.settings.dynamis_account_wide = aw[1];
                     ui.pending_account_add = nil;
                     save_settings();
@@ -2092,6 +2208,9 @@ local function render_ui()
                 if tracker.settings.dynamis_account_wide then
                     local accts = dynamis_accounts();
                     local limit = chars_per_account();
+                    imgui.TextColored({ 0.7, 0.7, 0.7, 1.0 },
+                        string.format('%d entries per account, %d per character.',
+                            ACCOUNT_ENTRY_LIMIT, CHARACTER_ENTRY_LIMIT));
 
                     for ai, acct in ipairs(accts) do
                         imgui.Spacing();
@@ -2194,33 +2313,42 @@ local function render_ui()
                     imgui.Spacing();
                     imgui.Spacing();
                     
-                    -- Dynamis Run Count manual override
+                    -- Dynamis Run Count manual override. An account can hold 3,
+                    -- a character only ever 2, so the button row adapts.
                     local set_store, set_shared = get_dynamis_store(settings_char);
                     if set_store then
-                        imgui.TextColored({ 0.7, 0.7, 0.7, 1.0 }, 'Dynamis Run Count:' .. (set_shared and '  (shared by account)' or ''));
-                        local entries = set_store.entries_remaining or 2;
-                        
-                        -- Radio buttons for 0, 1, 2 runs
+                        local max_runs = set_shared and ACCOUNT_ENTRY_LIMIT or CHARACTER_ENTRY_LIMIT;
+                        imgui.TextColored({ 0.7, 0.7, 0.7, 1.0 },
+                            'Dynamis Run Count:' .. (set_shared and '  (account pool)' or ''));
+                        local entries = set_store.entries_remaining or max_runs;
                         imgui.Indent(2);
-                        local sel_0 = { entries == 0 };
-                        local sel_1 = { entries == 1 };
-                        local sel_2 = { entries == 2 };
-                        
-                        if imgui.RadioButton('0 Runs', sel_0[1]) then
-                            set_store.entries_remaining = 0;
-                            save_settings();
-                        end
-                        imgui.SameLine();
-                        if imgui.RadioButton('1 Run', sel_1[1]) then
-                            set_store.entries_remaining = 1;
-                            save_settings();
-                        end
-                        imgui.SameLine();
-                        if imgui.RadioButton('2 Runs', sel_2[1]) then
-                            set_store.entries_remaining = 2;
-                            save_settings();
+                        for n = 0, max_runs do
+                            if n > 0 then imgui.SameLine(); end
+                            local lbl = (n == 1) and '1 Run' or (tostring(n) .. ' Runs');
+                            if imgui.RadioButton(lbl, entries == n) then
+                                set_store.entries_remaining = n;
+                                save_settings();
+                            end
                         end
                         imgui.Unindent(2);
+
+                        if set_shared then
+                            local cd_sel = tracker.settings.characters[settings_char];
+                            if cd_sel and cd_sel.dynamis_data then
+                                imgui.TextColored({ 0.7, 0.7, 0.7, 1.0 }, 'This character\'s own limit:');
+                                local own = cd_sel.dynamis_data.entries_remaining or CHARACTER_ENTRY_LIMIT;
+                                imgui.Indent(2);
+                                for n = 0, CHARACTER_ENTRY_LIMIT do
+                                    if n > 0 then imgui.SameLine(); end
+                                    local lbl = (n == 1) and '1 Run##own' or (tostring(n) .. ' Runs##own');
+                                    if imgui.RadioButton(lbl, own == n) then
+                                        cd_sel.dynamis_data.entries_remaining = n;
+                                        save_settings();
+                                    end
+                                end
+                                imgui.Unindent(2);
+                            end
+                        end
                     end
 
                     imgui.Spacing();
@@ -2415,6 +2543,21 @@ ashita.events.register('load', 'load_cb', function()
         tracker.login_state.waiting_for_login = true;
         print_msg('Waiting for character data...');
     end
+    -- Re-derive every account pool from its members' usage. Without this an
+    -- account keeps whatever number was stored when it was last edited, so a
+    -- value written by an older version (or by a member's count changing
+    -- outside the settings tab) would stick until the user happened to toggle
+    -- a checkbox.
+    if tracker.settings.dynamis_account_wide then
+        local changed = false;
+        for _, acct in ipairs(tracker.settings.dynamis_accounts or {}) do
+            local before = acct.entries_remaining;
+            recalc_account_from_members(acct);
+            if acct.entries_remaining ~= before then changed = true; end
+        end
+        if changed then save_settings(); end
+    end
+
     print_success('Loaded successfully! Use /hw to open or /hw help for commands.');
 end);
 
@@ -2445,17 +2588,10 @@ ashita.events.register('text_in', 'text_in_cb', function(e)
         if message:find('The time and destination for your foray into Dynamis has been recorded') then
             tracker.pending_dynamis_claim = os.time();
         elseif message:find('Obtained: Perpetual hourglass') then
-            if tracker.pending_dynamis_claim ~= nil
-                and (os.time() - tracker.pending_dynamis_claim) <= 5 then
-                local store = get_dynamis_store(tracker.current_char);
-                if store ~= nil then
-                    -- The charged glass is already in the bag by the time this
-                    -- message lands, so its serial can be read immediately.
-                    local serial = find_glass_serial(nil);
-                    store.claimed_at = os.time();
-                    count_dynamis_entry(store, serial, 'glass broken - counted');
-                end
-            end
+            -- Deliberately does NOT count here. A live capture shows the server
+            -- sends the charged glass in a 0x020 packet about a second AFTER this
+            -- message, so the inventory is still empty at this point. The 0x020
+            -- handler carries the Extra bytes and does the counting.
             tracker.pending_dynamis_claim = nil;
         end
         return;
@@ -2643,6 +2779,35 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
         return;
     end
     -- Login packet (also received on zone-in)
+    -- A charged hourglass arriving. This is the real "you broke a glass" moment:
+    -- the chat message fires about a second BEFORE the server sends the item, so
+    -- searching the inventory when the text lands finds nothing. The packet
+    -- carries the Extra block itself, so no inventory lookup is needed at all.
+    if id == 0x0020 then
+        if tracker.current_char ~= nil and tracker.current_char ~= 'Unknown' then
+            local ok_id, item_id = pcall(function()
+                return struct.unpack('H', data, ITEM_PACKET_ID_OFFSET);
+            end);
+            if ok_id and item_id == PERPETUAL_HOURGLASS_ID then
+                local ok_ex, extra = pcall(function()
+                    return data:sub(ITEM_PACKET_EXTRA_OFFSET, ITEM_PACKET_EXTRA_OFFSET + 27);
+                end);
+                if ok_ex then
+                    local serial = glass_serial_from_extra(extra);
+                    if serial ~= nil then
+                        local store = get_dynamis_store(tracker.current_char);
+                        if store ~= nil and not glass_already_counted(store, serial) then
+                            get_char_data();
+                            store.claimed_at = os.time();
+                            count_dynamis_entry(store, serial, 'glass broken - counted');
+                        end
+                    end
+                end
+            end
+        end
+        return;
+    end
+
     if id == 0x000A then
         -- Get zone ID from packet
         local zone_id = struct.unpack('H', data, 0x30 + 1) or 0;
