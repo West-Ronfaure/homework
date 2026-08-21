@@ -20,7 +20,7 @@ This addon tracks your weekly objectives and ENM timers. It was created specific
 - Account-wide entry pooling for Dynamis and Limbus
 - Auto-detects progress via Key Items
 - Auto-resets weekly
-- ENM/Limbus timers
+- ENM timers
 - ImGui window and chat commands
 
 ## Commands
@@ -31,9 +31,11 @@ This addon tracks your weekly objectives and ENM timers. It was created specific
 - Add `/addon load homework` to your `scripts/default.txt` file to load it automatically on startup. This addon relies on Key Item changes and NPC conversations to track progress, so it must be running at all times.
 - Speak to Eeko-Weeko in Ru'Lude Gardens once to initialize the EcoWarrior nation rotation.
 - Talk to Rytaal once to pick up your Assault tag count.
+- Counts start as unknown mid-week and settle at the next weekly reset.
 
 <table><tr>
-<td><img width="363" height="642" alt="image" src="https://github.com/user-attachments/assets/d33e9d4c-3a31-475a-8493-f3d59aa4c36b" /></td>
-<td><img width="665" height="476" alt="image2" src="https://github.com/user-attachments/assets/ec7c24cc-ab05-4b9a-9b3b-09d9895df47d" /></td>
+<td><img width="330" alt="Tasks" src="https://github.com/user-attachments/assets/069b3533-ab3e-473a-a7f0-53e7ebd2eb9d" /></td>
+<td><img width="330" alt="Settings" src="https://github.com/user-attachments/assets/610a2991-a6c5-451d-ac7d-3fd83034a761" /></td>
+</tr><tr>
+<td colspan="2"><img width="670" alt="Chat" src="https://github.com/user-attachments/assets/20115a2b-0500-4745-9903-4fe43f1416b7" /></td>
 </tr></table>
-
