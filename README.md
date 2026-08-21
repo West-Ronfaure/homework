@@ -1,4 +1,4 @@
-# Homework (Horizon Server Approved by Aerec)
+# Homework (Horizon Server Approved by Horizon)
 
 Weekly task tracker for FFXI Horizon Server.
 
@@ -6,6 +6,8 @@ This addon tracks your weekly objectives and ENM timers. It was created specific
 
 ## Tracked Tasks
 - Dynamis entry
+- Limbus entry
+- Assault tags
 - EcoWarrior (with nation rotation)
 - Highwind
 - UnInvited
@@ -15,6 +17,7 @@ This addon tracks your weekly objectives and ENM timers. It was created specific
 
 ## Features
 - Multi-character support
+- Account-wide entry pooling for Dynamis and Limbus
 - Auto-detects progress via Key Items
 - Auto-resets weekly
 - ENM/Limbus timers
@@ -27,6 +30,7 @@ This addon tracks your weekly objectives and ENM timers. It was created specific
 ## Setup
 - Add `/addon load homework` to your `scripts/default.txt` file to load it automatically on startup. This addon relies on Key Item changes and NPC conversations to track progress, so it must be running at all times.
 - Speak to Eeko-Weeko in Ru'Lude Gardens once to initialize the EcoWarrior nation rotation.
+- Talk to Rytaal once to pick up your Assault tag count.
 
 <table><tr>
 <td><img width="363" height="642" alt="image" src="https://github.com/user-attachments/assets/d33e9d4c-3a31-475a-8493-f3d59aa4c36b" /></td>
