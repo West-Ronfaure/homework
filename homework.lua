@@ -5,7 +5,7 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-addon.version   = '3.5.1';
+addon.version   = '3.6';
 addon.desc      = 'Weekly homework tracker for FFXI';
 addon.link      = '';
 
@@ -16,9 +16,23 @@ local imgui = require('imgui');
 local ui = {
     is_open = { false },
     selected_char = { 0 },  -- Shared character selection for both tabs
+    selected_name = nil,    -- Name behind that index, so a rebuild keeps the choice
     char_list = {},
     font_scale = 1.2,
-    window_flags = ImGuiWindowFlags_NoCollapse,
+    -- Resolved lazily in render_ui: read at file-load time this could capture
+    -- nil if the ImGui globals are not populated yet, leaving the window
+    -- permanently collapsible with no way back short of a reload.
+    window_flags = nil,
+    -- Set when render_ui throws, so a broken frame does not repeat 60x a second.
+    -- Cleared by /hw show and by a factory reset, both of which change the state
+    -- that caused it.
+    render_failed = false,
+    char_list_combo = nil,   -- cached '\0'-joined dropdown string
+    -- Push depths, so a throw inside render_ui can be unwound cleanly
+    style_colors = 0,
+    style_vars = 0,
+    fonts_pushed = 0,
+    began = false,
     -- Set when a tick lands on a full account: { char = name, from = index }
     pending_account_add = nil,
 };
@@ -32,6 +46,11 @@ local build_ki_cache;
 -- so users can share the addon without accidentally leaking their character data.
 local settings_file = nil;
 local display_settings_file = nil;
+
+-- Defined below with the rest of the file I/O, but migrate_settings_file runs
+-- above it. Without this the name compiled to a global read - nil - and the
+-- migration threw inside load_cb for every user upgrading from a legacy path.
+local write_file_atomic;
 
 local function get_config_dir()
     return AshitaCore:GetInstallPath() .. 'config/addons/' .. addon.name .. '/';
@@ -67,10 +86,10 @@ local function migrate_settings_file(legacy_path, new_path)
     src:close();
     local new_dir = get_config_dir();
     if not ashita.fs.exists(new_dir) then ashita.fs.create_dir(new_dir); end
-    local dst = io.open(new_path, 'wb');
-    if not dst then return; end
-    dst:write(content);
-    dst:close();
+    -- Use the shared writer: a crash between write and verify used to leave a
+    -- corrupt file at the new path, which then blocked migration forever via the
+    -- exists-check while the good legacy file sat untouched.
+    if not write_file_atomic(new_path, content) then return; end
     os.remove(legacy_path);
 end
 
@@ -85,19 +104,33 @@ end
 local ARRAY_FIELDS = { locked_nations = true, ki_cache = true, counted_glasses = true, chars = true, dynamis_accounts = true };
 
 local function escape_json_string(str)
-    return str:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t');
+    -- Parenthesised: a tail-returned gsub also yields its replacement count, so
+    -- any caller that forwards the result onward silently gets two values.
+    -- Control bytes below 0x20 have to be encoded too, or the save-verify parse
+    -- can reject the file and persistence stops silently. The parser below
+    -- decodes \uXXXX to match; escaping on the writer alone would corrupt
+    -- round-trips, because the unescape would return the literal 'u'.
+    return (str:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
+               :gsub('[%z\1-\8\11\12\14-\31]', function(c)
+                   return string.format('\\u%04X', string.byte(c));
+               end));
 end
 
-local function serialize_value(val, indent, key)
+local function serialize_value(val, indent, key, depth)
     indent = indent or '';
+    depth = (depth or 0) + 1;
     local t = type(val);
+    -- A cycle would recurse until the stack blew, and the throw would land in
+    -- whatever event handler called save rather than in write_file_atomic's
+    -- polite failure path. Nothing legitimate here nests anywhere near this deep.
+    if depth > 32 then return 'null'; end
     if t == 'table' then
         -- Check if this should be an array (has numeric keys OR is a known array field)
         local is_array = #val > 0 or (key ~= nil and ARRAY_FIELDS[key]);
         if is_array then
             local items = {};
             for _, v in ipairs(val) do
-                table.insert(items, serialize_value(v, indent));
+                table.insert(items, serialize_value(v, indent, nil, depth));
             end
             return '[' .. table.concat(items, ', ') .. ']';
         else
@@ -107,7 +140,7 @@ local function serialize_value(val, indent, key)
                 if not first then result = result .. ',\n'; end
                 first = false;
                 local key_str = '"' .. escape_json_string(tostring(k)) .. '"';
-                result = result .. indent .. '  ' .. key_str .. ': ' .. serialize_value(v, indent .. '  ', k);
+                result = result .. indent .. '  ' .. key_str .. ': ' .. serialize_value(v, indent .. '  ', k, depth);
             end
             if not first then result = result .. '\n' .. indent; end
             return result .. '}';
@@ -116,6 +149,12 @@ local function serialize_value(val, indent, key)
         return '"' .. escape_json_string(val) .. '"';
     elseif t == 'boolean' then
         return val and 'true' or 'false';
+    elseif t == 'number' then
+        -- tostring(0/0) emits 'nan', which the save verification then fails to
+        -- parse - so one bad number silently stopped the addon persisting at all
+        -- for the rest of the session. Anything non-finite becomes 0.
+        if val ~= val or val == math.huge or val == -math.huge then return '0'; end
+        return tostring(val);
     else
         return tostring(val);
     end
@@ -140,12 +179,34 @@ local function parse_json_value(str, pos)
         end
         -- Single-pass unescape. Chained gsubs used to mis-handle a literal
         -- backslash followed by 'n', because '\\n' was expanded before '\\\\'.
-        local s = str:sub(pos + 1, endpos - 1):gsub('\\(.)', function(c)
-            if c == 'n' then return '\n';
-            elseif c == 't' then return '\t';
-            elseif c == 'r' then return '\r';
-            else return c; end
-        end);
+        -- An explicit scanner, not a gsub. Lua patterns cannot express the
+        -- lookahead this needs: `\\(u?)(%x?%x?%x?%x?)` can never capture n, t or
+        -- r (not 'u', not hex), so the match consumed only the backslash and
+        -- left the letter behind - \\n decoded to the letter n, and an escaped
+        -- backslash vanished entirely. Three attempts at a clever one-liner
+        -- produced three different corruptions; this is boring and correct.
+        local raw = str:sub(pos + 1, endpos - 1);
+        local out, i = {}, 1;
+        while i <= #raw do
+            local j = raw:find('\\', i, true);
+            if j == nil then table.insert(out, raw:sub(i)); break; end
+            table.insert(out, raw:sub(i, j - 1));
+            local c = raw:sub(j + 1, j + 1);
+            if c == 'u' and raw:sub(j + 2, j + 5):match('^%x%x%x%x$') then
+                local n = tonumber(raw:sub(j + 2, j + 5), 16);
+                -- Out of byte range: hand back the original text rather than
+                -- silently dropping the character.
+                table.insert(out, n < 256 and string.char(n) or raw:sub(j, j + 5));
+                i = j + 6;
+            else
+                if c == 'n' then c = '\n';
+                elseif c == 't' then c = '\t';
+                elseif c == 'r' then c = '\r'; end
+                table.insert(out, c);
+                i = j + 2;
+            end
+        end
+        local s = table.concat(out);
         return s, endpos + 1;
     end
     
@@ -170,7 +231,9 @@ local function parse_json_value(str, pos)
             if str:sub(pos, pos) == ']' then return arr, pos + 1; end
             local val;
             val, pos = parse_json_value(str, pos);
-            table.insert(arr, val);
+            -- table.insert with nil leaves a hole that breaks # and ipairs, and
+            -- this parser exists precisely because files get hand-edited.
+            if val ~= nil then table.insert(arr, val); end
             while pos <= #str and str:sub(pos, pos):match('%s') do pos = pos + 1; end
             if str:sub(pos, pos) == ',' then pos = pos + 1; end
         end
@@ -199,16 +262,94 @@ local function parse_json_value(str, pos)
     return nil, pos + 1;
 end
 
-local function load_settings()
-    local path = get_settings_path();
+-- Set once when a save is dropped, so the warning is not repeated every second.
+local save_warned = false;
+local display_save_warned = false;
+
+local function print_msg(message)
+    print('\30\081[\30\082Homework\30\081]\30\106 ' .. message);
+end
+
+local function print_error(message)
+    print('\30\081[\30\082Homework\30\081]\30\068 ' .. message);
+end
+
+local function print_success(message)
+    print('\30\081[\30\082Homework\30\081]\30\110 ' .. message);
+end
+
+-- ===== FILE I/O =====
+-- Every write in this addon goes through here. Three hand-rolled copies of this
+-- logic had drifted apart, each hardened at a different time; the one that was
+-- never hardened silently destroyed display.json on a failed write.
+--
+-- Writes to a temp file, checks the return of write (which yields nil on
+-- failure rather than raising), reads the bytes back and compares them, then
+-- rotates the previous file to .bak and renames the temp into place. Any
+-- failure leaves the existing file exactly as it was.
+function write_file_atomic(path, body, verify)
+    local tmp = path .. '.tmp';
+    local f = io.open(tmp, 'wb');
+    if f == nil then return false, 'cannot open temp file'; end
+    local wrote = f:write(body);
+    f:close();
+    if wrote == nil then os.remove(tmp); return false, 'write failed'; end
+
+    local vf = io.open(tmp, 'rb');
+    if vf == nil then return false, 'temp file vanished'; end
+    local back = vf:read('*all');
+    vf:close();
+    if back ~= body then os.remove(tmp); return false, 'short write'; end
+    if verify ~= nil then
+        local ok, err = verify(back);
+        if not ok then os.remove(tmp); return false, err or 'verification failed'; end
+    end
+
+    if ashita.fs.exists(path) then
+        os.remove(path .. '.bak');
+        if not os.rename(path, path .. '.bak') then
+            os.remove(tmp); return false, 'cannot rotate backup';
+        end
+    end
+    if not os.rename(tmp, path) then
+        os.rename(path .. '.bak', path);   -- put the old one back
+        os.remove(tmp);
+        return false, 'cannot replace file';
+    end
+    return true;
+end
+
+-- Reads and parses, tolerating anything. Returns nil rather than throwing, so a
+-- corrupt file can never take a load path down with it.
+local function read_json_file(path)
     if not ashita.fs.exists(path) then return nil; end
-    local f = io.open(path, 'r');
-    if not f then return nil; end
+    local f = io.open(path, 'rb');
+    if f == nil then return nil; end
     local content = f:read('*all');
     f:close();
-    if not content or content == '' then return nil; end
-    local result = parse_json_value(content, 1);
+    if content == nil or content == '' then return nil; end
+    local ok, result = pcall(parse_json_value, content, 1);
+    if not ok or type(result) ~= 'table' then return nil; end
     return result;
+end
+
+-- Defined further down, once the limit constants it clamps against exist.
+local sanitize_loaded_settings;
+
+local function load_settings()
+    local path = get_settings_path();
+    -- Judge the RAW read: sanitize backfills characters = {}, so asking the
+    -- sanitized copy whether it has characters always says yes and the backup
+    -- would never be consulted.
+    local raw = read_json_file(path);
+    if raw == nil or type(raw.characters) ~= 'table' then
+        local backup = read_json_file(path .. '.bak');
+        if backup ~= nil and type(backup.characters) == 'table' then
+            print_msg('homework.json was unreadable - restored from the backup copy.');
+            return sanitize_loaded_settings(backup);
+        end
+    end
+    return sanitize_loaded_settings(raw);
 end
 
 -- Canonical task list. Saved files carry their own copy, so this is merged into
@@ -223,22 +364,12 @@ local DEFAULT_TASKS = {
     'X\'sKnife'
 };
 
-local function print_msg(message)
-    print('\30\081[\30\082Homework\30\081]\30\106 ' .. message);
-end
-
-local function print_error(message)
-    print('\30\081[\30\082Homework\30\081]\30\068 ' .. message);
-end
-
-local function print_success(message)
-    print('\30\081[\30\082Homework\30\081]\30\110 ' .. message);
-end
-
 -- Tracker data
 local tracker = {
     settings = {
-        tasks = { 'EcoWarrior', 'Highwind', 'UnInvited', 'CookBook', 'SpiceGals', 'X\'sKnife' },
+        -- Filled from DEFAULT_TASKS in the load handler, so a new task cannot be
+        -- added to one list and forgotten in the other.
+        tasks = {},
         -- Dynamis entry pooling. Off means every character counts its own.
         dynamis_account_wide = false,
         dynamis_accounts = {},
@@ -252,21 +383,27 @@ local tracker = {
         waiting_for_login = false,  -- Set true after logout, cleared on next zone-in
         waiting_for_ki = false,     -- Set true after login/zone, cleared after KI packets received
         ki_packets_received = 0,    -- Count of 0x0055 packets received (need 7 total)
-        suppress_ki_events = false  -- Set true during zone-in to prevent false "obtained" messages
+        suppress_ki_events = false, -- Set true during zone-in to prevent false "obtained" messages
+        suppress_started = 0,       -- When suppression began, so it cannot stick forever
+        blocks_this_zone = 0        -- Blocks seen since the last zone-in
     },
     -- KI state tracking (for detecting gain/loss via 0x055)
     -- 3 states: nil = unknown, true = has KI, false = doesn't have KI
     kis = {},  -- [ki_id] = true/false/nil, populated from packets or memory
     kis_initialized = false,  -- Don't trigger gain/loss on initial population
     -- Frame throttle for render
-    last_render_time = 0,
-    render_interval = 2,          -- Only check every 2 seconds
+    -- These throttle the periodic reset/suppression checks, NOT rendering -
+    -- render_ui runs every frame regardless.
+    last_check_time = 0,
+    check_interval = 2,
     -- UnInvited inventory check
     uninvited_done_time = 0,       -- Timestamp when UnInvited marked done
     -- Timestamp of a pending /hw reset, nil when none outstanding
     pending_reset = nil,
     -- Set by the Dynamis claim message, consumed by the hourglass-obtained message
-    pending_dynamis_claim = nil
+    pending_dynamis_claim = nil,
+    -- Session only: stops the "already used both runs" notice repeating
+    last_denied_serial = nil
 };
 
 -- Save settings function (must be after tracker is defined)
@@ -283,16 +420,29 @@ local function save_settings()
     if not ashita.fs.exists(dir) then
         ashita.fs.create_dir(dir);
     end
-    local f = io.open(path, 'w');
-    if f then
-        f:write(serialize_value(tracker.settings));
-        f:close();
+    local body = serialize_value(tracker.settings);
+    local ok, why = write_file_atomic(path, body, function(bytes)
+        local parsed = parse_json_value(bytes, 1);
+        if type(parsed) ~= 'table' or parsed.characters == nil then
+            return false, 'saved data did not parse back';
+        end
+        return true;
+    end);
+    if not ok then
+        -- Silent failure here is invisible data loss, so say it once.
+        if not save_warned then
+            save_warned = true;
+            print_error('Could not save homework.json (' .. tostring(why)
+                .. '). Your previous save is intact.');
+        end
+        return false;
     end
+    save_warned = false;
+    return true;
 end
 
 -- ENM/Limbus Key Items (needed for display settings initialization)
 local ENM_KEY_ITEMS = {
-    { name = 'Limbus', ki_id = 734, ki_name = 'Cosmo-Cleanse', cooldown = 72 * 3600 },
     { name = 'Boneyard Gully', ki_id = 678, ki_name = 'Miasma Filter', cooldown = 120 * 3600 },
     { name = 'Bearclaw Pinnacle', ki_id = 677, ki_name = 'Zephyr Fan', cooldown = 120 * 3600 },
     { name = 'Mine Shaft #2716', ki_id = 676, ki_name = 'Shaft #2716 Operating Lever', cooldown = 120 * 3600 },
@@ -344,6 +494,127 @@ local GLASS_EXTRA_ZONE_OFFSET = 17;
 -- Verified byte for byte against a live capture of a Windurst glass being broken.
 local ITEM_PACKET_ID_OFFSET    = 13;
 local ITEM_PACKET_EXTRA_OFFSET = 18;
+
+-- ===== ASSAULT =====
+-- Key item ids, matching LandSandBoat's key_item enum. Confirmed against a live
+-- /debug ki capture of three assault runs.
+local IMPERIAL_ARMY_ID_TAG = 787;
+local ASSAULT_ARMBAND      = 797;
+
+-- Rytaal's tag counter menu. The server fills it via
+--   startEvent(268, 2, tagStock, currentAssault, haveIDtag, allTagsTimeCS, tagsAvail)
+-- so those six event params land in the 0x034 packet in order starting at 0x08.
+local RYTAAL_MENU_ID       = 268;
+local MENU_OFFSET_MENU_ID  = 0x2C;   -- u16
+local MENU_PARAM_TAG_STOCK = 0x0C;   -- u32, tags Rytaal is holding
+local MENU_PARAM_ASSAULT   = 0x10;   -- u32, current assault mission id
+local MENU_PARAM_HAVE_TAG  = 0x14;   -- u32, 1 when carrying a tag
+local MENU_PARAM_TAG_TIME  = 0x18;   -- u32, restock anchor
+
+-- One tag per 24h. It is 600s instead for anyone holding Rhapsody in Azure,
+-- which we cannot see, so the countdown will read long for those players.
+local ASSAULT_TAG_PERIOD = 24 * 3600;
+
+-- allTagsTimeCS + this = unix time of the next tag.
+-- PROVISIONAL: calibrated from a single capture (allTagsTimeCS 776652833 against
+-- Rytaal saying 2026-08-13 18:53:53 local). That is LandSandBoat's
+-- VANADIEL_EPOCH plus exactly 2 days and the offset is not yet explained, so the
+-- countdown is the least trustworthy part of this feature.
+local ASSAULT_TAG_EPOCH = 1009983600;
+
+-- Rytaal stocks 3, or 4 for a Second Lieutenant who has cleared every assault.
+-- The packet never states the cap, so start at 3 and raise it if we see more.
+local ASSAULT_DEFAULT_MAX_STOCK = 3;
+
+-- Picking a mission makes key item 787 flicker off/on/off inside a single
+-- second, so a withdrawal is only believed if the previous one was longer ago
+-- than this. A real trip to Rytaal takes minutes, so a few seconds is plenty.
+local ASSAULT_TAG_DEBOUNCE = 5;
+
+-- Cancelling an assault turns your orders back into a tag in your own inventory.
+-- Rytaal's stock never moves, so that arrival must not decrement it.
+--
+-- Orders (762-766) and the tag (787) both live in key item table 1, so a cancel
+-- decodes BOTH from a single 0x055 packet. A turn-in followed by taking a tag is
+-- always two separate packets, seconds apart. Packet identity therefore separates
+-- them exactly.
+--
+-- This used to be a five second timer, which threw away a genuine withdrawal from
+-- anyone who took their reward and grabbed a tag quickly. Measured gaps for a
+-- deliberate player were 9-10 seconds; a fast one lands inside 5 and lost the
+-- count until their next Rytaal visit.
+local ASSAULT_KI_PACKET_SEQ = 0;
+
+-- Assault Orders key items, one per area. Whichever of these the player is
+-- holding tells us which assault they are currently on. All five confirmed
+-- against a live capture.
+-- Longest of these is 16 characters, which clears the indented row's ~19
+-- character budget at the widened status column.
+local ASSAULT_ORDERS = {
+    [762] = 'Leujaoam Sanctum',
+    [763] = 'Mamool Ja T.G.',
+    [764] = 'Lebros Cavern',
+    [765] = 'Periqia',
+    [766] = 'Ilrusi Atoll',
+};
+
+local ASSAULT_AREA_FULL = {
+    ['Mamool Ja T.G.'] = 'Mamool Ja Training Grounds',
+};
+
+-- The five mission-giver menus. Each fills its 0x034 with
+--   startEvent(offset, rank, hasIDtag, assaultPoints, currentAssault, cipher)
+-- so rank sits at 0x08 and that area's points at 0x10.
+local MISSION_GIVER_MENUS = {
+    [273] = 'Leujaoam Sanctum',
+    [274] = 'Mamool Ja T.G.',
+    [275] = 'Lebros Cavern',
+    [276] = 'Periqia',
+    [277] = 'Ilrusi Atoll',
+};
+local MENU_PARAM_RANK   = 0x08;   -- u32, 1..11
+local MENU_PARAM_POINTS = 0x10;   -- u32, assault points for that area
+
+-- Mercenary ranks, from LandSandBoat's xi.assault.mercenaryRank.
+local MERCENARY_RANKS = {
+    [1]  = 'Private Second Class',
+    [2]  = 'Private First Class',
+    [3]  = 'Superior Private',
+    [4]  = 'Lance Corporal',
+    [5]  = 'Corporal',
+    [6]  = 'Sergeant',
+    [7]  = 'Sergeant Major',
+    [8]  = 'Chief Sergeant',
+    [9]  = 'Second Lieutenant',
+    [10] = 'First Lieutenant',
+    [11] = 'Captain',
+};
+
+-- Short forms so the row stays inside the status column.
+local MERCENARY_RANKS_SHORT = {
+    [1] = 'PSC', [2] = 'PFC', [3] = 'SP',  [4] = 'LC',  [5] = 'Cpl',
+    [6] = 'Sgt', [7] = 'SgtM', [8] = 'CSgt', [9] = '2Lt', [10] = '1Lt', [11] = 'Capt',
+};
+
+-- Row labels, also the keys used by the show/hide checkboxes.
+local ASSAULT_ROW_LABEL = 'Assault Tags';   -- settings key and checkbox text
+local ASSAULT_ROW_SHORT = 'Assault';        -- what the row itself shows
+local DYNAMIS_ROW_LABEL = 'Dynamis';
+local LIMBUS_ROW_LABEL  = 'Limbus';
+local LIMBUS_KI_ID      = 734;   -- Cosmo-Cleanse
+local LIMBUS_NPC        = 'Mister Glean';
+
+-- Limbus lost its 71h cooldown and became a weekly allowance: 4 Cosmo-Cleanses
+-- per account per week, no more than 2 to any one character.
+local LIMBUS_ACCOUNT_LIMIT   = 4;
+local LIMBUS_CHARACTER_LIMIT = 2;
+
+-- Runs are counted when Mister Glean hands the Cosmo-Cleanse over, not when you
+-- enter. A cleanse held across the weekly reset was counted in the week it was
+-- issued, so spending it later costs nothing - which is the behaviour we want.
+-- Taking a key item makes the 0x055 table flicker, so repeats inside this window
+-- are ignored.
+local LIMBUS_DEBOUNCE = 5;
 
 -- Bags worth scanning for an hourglass.
 local GLASS_BAGS = { 0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
@@ -406,9 +677,28 @@ end
 -- How long a /hw reset confirmation stays valid.
 local RESET_CONFIRM_WINDOW = 30;
 
+-- Key item event suppression is lifted by the 7th 0x055 block of a zone-in. If a
+-- zone ever sends fewer, this stops the addon going deaf for the whole session.
+local KI_SUPPRESS_TIMEOUT = 15;
+
 -- How long before the weekly reset a Dynamis claim still counts against the
 -- upcoming week's allowance.
-local DYNAMIS_CLAIM_CARRY_WINDOW = 24 * 3600;
+-- A charged hourglass expires an hour after it is broken, so only a run
+-- genuinely straddling the reset can spill into the new week. This was 24h,
+-- which docked the new week an entry for any glass broken across the whole of
+-- Sunday - an arbitrary overreach, not a server rule. Two hours is the glass
+-- lifetime plus slack.
+local DYNAMIS_CLAIM_CARRY_WINDOW = 2 * 3600;
+
+-- A charged hourglass expires an hour after it is broken, so a break older than
+-- this cannot be the run you are now walking into.
+local DYNAMIS_GLASS_LIFETIME = 60 * 60;
+
+-- How long after the "time and destination recorded" message the glass may take
+-- to reach the bag and still be treated as your own break. Live captures show a
+-- gap of anywhere from a millisecond to about a second; five is generous without
+-- being long enough to swallow a trade.
+local DYNAMIS_BREAK_WINDOW = 5;
 
 -- Display settings structure
 -- font_scale is not stored here; it lives on `ui` and is written out at save time.
@@ -422,26 +712,59 @@ local function save_display_settings()
     if not ashita.fs.exists(dir) then
         ashita.fs.create_dir(dir);
     end
-    local f = io.open(path, 'w');
-    if f then
-        f:write(serialize_value({ font_scale = ui.font_scale, tracked = display_settings.tracked }));
-        f:close();
+    -- Same writer as homework.json. This was the third copy of "write a file"
+    -- in the addon and the only one never hardened, so a failed write silently
+    -- destroyed every show/hide preference and the font scale.
+    local body = serialize_value({ font_scale = ui.font_scale, tracked = display_settings.tracked });
+    local ok, why = write_file_atomic(path, body, function(bytes)
+        local parsed = parse_json_value(bytes, 1);
+        if type(parsed) ~= 'table' then return false, 'did not parse back'; end
+        return true;
+    end);
+    if not ok and not display_save_warned then
+        display_save_warned = true;
+        print_error('Could not save display.json (' .. tostring(why) .. ').');
+    elseif ok then
+        display_save_warned = false;
     end
 end
 
 local function load_display_settings()
-    local path = get_display_settings_path();
-    if not ashita.fs.exists(path) then return; end
-    local f = io.open(path, 'r');
-    if not f then return; end
-    local content = f:read('*all');
-    f:close();
-    if not content or content == '' then return; end
-    local result = parse_json_value(content, 1);
-    if result then
-        if result.font_scale then ui.font_scale = result.font_scale; end
-        if result.tracked then display_settings.tracked = result.tracked; end
+    -- Shares read_json_file with homework.json, which pcalls the parse and
+    -- rejects non-tables. Previously this called the parser bare.
+    local result = read_json_file(get_display_settings_path());
+    if result == nil then return; end
+
+    -- A hand-edited or corrupt value here multiplies every column position and
+    -- would throw on the very first frame.
+    local fs = tonumber(result.font_scale);
+    -- NaN fails BOTH comparisons below, so it sailed through the clamp and made
+    -- every column position NaN.
+    if fs ~= nil and fs == fs and fs ~= math.huge and fs ~= -math.huge then
+        if fs < 0.8 then fs = 0.8; elseif fs > 2.0 then fs = 2.0; end
+        ui.font_scale = fs;
     end
+
+    -- Validate all the way down. `tracked` arriving as a string or number used
+    -- to make get_char_tracking index a non-table, killing render_ui on every
+    -- frame with no way back short of hand-editing the file.
+    if type(result.tracked) ~= 'table' then return; end
+    local clean = {};
+    for char_name, entry in pairs(result.tracked) do
+        if type(char_name) == 'string' and type(entry) == 'table' then
+            -- Coerce the leaves too: a string here reaches imgui as a string,
+            -- because `tracking.tasks[task] or false` passes it straight through.
+            local tasks, timers = {}, {};
+            for k, v in pairs(type(entry.tasks) == 'table' and entry.tasks or {}) do
+                if type(k) == 'string' then tasks[k] = (v == true); end
+            end
+            for k, v in pairs(type(entry.timers) == 'table' and entry.timers or {}) do
+                if type(k) == 'string' then timers[k] = (v == true); end
+            end
+            clean[char_name] = { tasks = tasks, timers = timers };
+        end
+    end
+    display_settings.tracked = clean;
 end
 
 -- Get or initialize tracked items for a character
@@ -462,6 +785,12 @@ local function get_char_tracking(char_name)
         for _, enm in ipairs(ENM_KEY_ITEMS) do
             display_settings.tracked[char_name].timers[enm.name] = true;
         end
+
+        -- Dynamis and Assault are not entries in tracker.settings.tasks /
+        -- ENM_KEY_ITEMS, but they get show/hide toggles of their own.
+        display_settings.tracked[char_name].tasks[DYNAMIS_ROW_LABEL] = true;
+        display_settings.tracked[char_name].timers[ASSAULT_ROW_LABEL] = true;
+        display_settings.tracked[char_name].tasks[LIMBUS_ROW_LABEL] = true;
     else
         -- For existing characters, only add NEW tasks/timers that don't exist yet
         local tracking = display_settings.tracked[char_name];
@@ -477,6 +806,29 @@ local function get_char_tracking(char_name)
                 tracking.timers[enm.name] = true;
             end
         end
+
+        if tracking.tasks[DYNAMIS_ROW_LABEL] == nil then tracking.tasks[DYNAMIS_ROW_LABEL] = true; end
+
+        -- Limbus moved from `timers` to `tasks` when its cooldown was dropped.
+        if tracking.tasks[LIMBUS_ROW_LABEL] == nil then
+            if tracking.timers[LIMBUS_ROW_LABEL] ~= nil then
+                tracking.tasks[LIMBUS_ROW_LABEL] = tracking.timers[LIMBUS_ROW_LABEL];
+            else
+                tracking.tasks[LIMBUS_ROW_LABEL] = true;
+            end
+        end
+        tracking.timers[LIMBUS_ROW_LABEL] = nil;
+
+        -- Assault went the other way: it refills on a rolling clock, so it belongs
+        -- with the timers. 3.6.1 briefly filed it under tasks.
+        if tracking.timers[ASSAULT_ROW_LABEL] == nil then
+            if tracking.tasks[ASSAULT_ROW_LABEL] ~= nil then
+                tracking.timers[ASSAULT_ROW_LABEL] = tracking.tasks[ASSAULT_ROW_LABEL];
+            else
+                tracking.timers[ASSAULT_ROW_LABEL] = true;
+            end
+        end
+        tracking.tasks[ASSAULT_ROW_LABEL] = nil;
     end
 
     return display_settings.tracked[char_name];
@@ -511,6 +863,182 @@ local ACCOUNT_ENTRY_LIMIT   = 3;
 local CHARACTER_ENTRY_LIMIT = 2;
 
 -- Fresh Dynamis bookkeeping.
+-- Every sub-table in a character record was only ever nil-checked, never
+-- type-checked, so a hand-edited "enm_timers": "x" survived every ensure-block
+-- and then threw on the first assignment into it. display.json got this
+-- treatment in 3.13; homework.json is the bigger file with more to lose.
+--
+-- One pass, at load, so nothing downstream has to defend itself.
+function sanitize_loaded_settings(st)
+    if type(st) ~= 'table' then return nil; end
+
+    local function tbl(v)  return type(v) == 'table' and v or {}; end
+    local function num(v, default, lo, hi)
+        local n = tonumber(v);
+        if n == nil or n ~= n then return default; end        -- nil or NaN
+        if n == math.huge or n == -math.huge then return default; end
+        if lo ~= nil and n < lo then return lo; end
+        if hi ~= nil and n > hi then return hi; end
+        return n;
+    end
+    -- Strings only. Allowing numbers through let a numeric task name reach
+    -- normalize_task, which indexes it.
+    local function strlist(v)
+        local out = {};
+        for _, item in ipairs(tbl(v)) do
+            if type(item) == 'string' then table.insert(out, item); end
+        end
+        return out;
+    end
+
+    -- ki_cache is the one list whose payload is legitimately numeric, so it
+    -- needs its own helper. Making strlist strict without checking every
+    -- consumer emptied the cache on load: an empty cache still passes
+    -- restore_ki_cache's type check, so the addon reported "restored from your
+    -- last session" over an all-false picture, mirrored that back to disk, and
+    -- left /hw scan free to write "no KI" across every record.
+    local function numlist(v)
+        local out = {};
+        for _, item in ipairs(tbl(v)) do
+            local n = tonumber(item);
+            if n ~= nil and n == n then table.insert(out, n); end
+        end
+        return out;
+    end
+
+    st.characters = tbl(st.characters);
+    st.dynamis_accounts = tbl(st.dynamis_accounts);
+    st.dynamis_account_wide = st.dynamis_account_wide == true;
+    st.chars_per_account = num(st.chars_per_account, DEFAULT_CHARS_PER_ACCOUNT, 1, 16);
+    st.tasks = strlist(st.tasks);
+
+    for name, cd in pairs(st.characters) do
+        if type(name) ~= 'string' or type(cd) ~= 'table' then
+            st.characters[name] = nil;
+        else
+            cd.last_reset    = num(cd.last_reset, 0, 0);
+            cd.enm_timers    = tbl(cd.enm_timers);
+            cd.quest_steps   = tbl(cd.quest_steps);
+            for k, v in pairs(cd.quest_steps) do
+                if type(k) ~= 'string' or type(v) ~= 'string' then cd.quest_steps[k] = nil; end
+            end
+            cd.xsknife_data  = tbl(cd.xsknife_data);
+            cd.ecowarrior_data = tbl(cd.ecowarrior_data);
+            cd.ecowarrior_data.locked_nations = strlist(cd.ecowarrior_data.locked_nations);
+            cd.ki_cache      = numlist(cd.ki_cache);
+
+            cd.dynamis_data = tbl(cd.dynamis_data);
+            cd.dynamis_data.entries_remaining =
+                num(cd.dynamis_data.entries_remaining, CHARACTER_ENTRY_LIMIT, 0, CHARACTER_ENTRY_LIMIT);
+            cd.dynamis_data.counted_glasses = strlist(cd.dynamis_data.counted_glasses);
+            -- These reach arithmetic and comparisons directly. A string
+            -- claimed_at throws inside reset_dynamis_store, which aborts
+            -- reset_tracker partway and leaves some characters reset and some
+            -- not - the exact partial state the stale-reset guard exists for.
+            if cd.dynamis_data.claimed_at ~= nil then
+                cd.dynamis_data.claimed_at = num(cd.dynamis_data.claimed_at, nil, 0);
+            end
+            if cd.dynamis_data.last_break_time ~= nil then
+                cd.dynamis_data.last_break_time = num(cd.dynamis_data.last_break_time, nil, 0);
+            end
+            if cd.dynamis_data.last_break_zone ~= nil then
+                cd.dynamis_data.last_break_zone = num(cd.dynamis_data.last_break_zone, nil, 0);
+            end
+            if type(cd.dynamis_data.last_break_serial) ~= 'string' then
+                cd.dynamis_data.last_break_serial = nil;
+            end
+
+            cd.limbus_data = tbl(cd.limbus_data);
+            cd.limbus_data.runs_remaining =
+                num(cd.limbus_data.runs_remaining, LIMBUS_CHARACTER_LIMIT, 0, LIMBUS_CHARACTER_LIMIT);
+            cd.limbus_data.seen = num(cd.limbus_data.seen, 0, 0);
+            cd.limbus_data.known = cd.limbus_data.known == true;
+            cd.limbus_data.last_gain = num(cd.limbus_data.last_gain, 0, 0);
+
+            cd.assault_data = tbl(cd.assault_data);
+            cd.assault_data.points = tbl(cd.assault_data.points);
+            if cd.assault_data.tags_stored ~= nil then
+                cd.assault_data.tags_stored = num(cd.assault_data.tags_stored, nil, 0, 16);
+            end
+            if cd.assault_data.rank ~= nil then
+                cd.assault_data.rank = num(cd.assault_data.rank, nil, 1, 11);
+            end
+            -- next_tag_time is compared with > in assault_state, so a string
+            -- here throws inside render_ui on every frame.
+            cd.assault_data.next_tag_time  = num(cd.assault_data.next_tag_time, 0, 0);
+            cd.assault_data.checked_at     = num(cd.assault_data.checked_at, 0, 0);
+            cd.assault_data.last_withdraw  = num(cd.assault_data.last_withdraw, 0, 0);
+            -- Packet sequence is session-only; a value carried in from disk is
+            -- meaningless and could suppress a real withdrawal after a reload.
+            cd.assault_data.orders_lost_seq = nil;
+            cd.assault_data.orders_lost_at = nil;
+            cd.assault_data.rank_seen_at   = num(cd.assault_data.rank_seen_at, 0, 0);
+            cd.assault_data.max_stock      = num(cd.assault_data.max_stock, ASSAULT_DEFAULT_MAX_STOCK, 1, 16);
+            for k, v in pairs(cd.assault_data.points) do
+                if type(k) ~= 'string' then cd.assault_data.points[k] = nil;
+                else cd.assault_data.points[k] = num(v, 0, 0); end
+            end
+
+            -- enm_timers entries must be tables with sane fields
+            for tname, td in pairs(cd.enm_timers) do
+                if type(td) ~= 'table' then
+                    cd.enm_timers[tname] = nil;
+                else
+                    td.has_ki = td.has_ki == true;
+                    td.next_ki_time = num(td.next_ki_time, 0, 0);
+                    -- Compared against 'scan' downstream; a non-string silently
+                    -- misclassifies the timer rather than crashing, which is
+                    -- exactly the sort of accidental defence the sanitizer is
+                    -- meant to make unnecessary.
+                    if type(td.timer_source) ~= 'string' then td.timer_source = 'scan'; end
+                end
+            end
+        end
+    end
+
+    for i = #st.dynamis_accounts, 1, -1 do
+        local acct = st.dynamis_accounts[i];
+        if type(acct) ~= 'table' then
+            table.remove(st.dynamis_accounts, i);
+        else
+            acct.chars = strlist(acct.chars);
+            acct.counted_glasses = strlist(acct.counted_glasses);
+            acct.entries_remaining = num(acct.entries_remaining, ACCOUNT_ENTRY_LIMIT, 0, ACCOUNT_ENTRY_LIMIT);
+            acct.limbus_remaining = num(acct.limbus_remaining, LIMBUS_ACCOUNT_LIMIT, 0, LIMBUS_ACCOUNT_LIMIT);
+            -- limbus_seen sat directly beside limbus_remaining and was missed.
+            acct.limbus_seen = num(acct.limbus_seen, 0, 0);
+            acct.limbus_known = acct.limbus_known == true;
+            acct.is_account = true;
+            acct.manual_override = acct.manual_override == true;
+            -- remove_dynamis_account calls :match on this.
+            if type(acct.name) ~= 'string' then acct.name = 'Account ' .. tostring(i); end
+            if acct.claimed_at ~= nil then acct.claimed_at = num(acct.claimed_at, nil, 0); end
+            if acct.last_break_time ~= nil then acct.last_break_time = num(acct.last_break_time, nil, 0); end
+            if acct.last_break_zone ~= nil then acct.last_break_zone = num(acct.last_break_zone, nil, 0); end
+            if type(acct.last_break_serial) ~= 'string' then acct.last_break_serial = nil; end
+        end
+    end
+
+    return st;
+end
+
+-- runs_remaining starts at the cap, but `known` stays false until a weekly reset
+-- has passed with the addon running. Until then the addon cannot know what was
+-- taken before it was installed, so the row shows the yellow "unknown" marker
+-- instead of a confident number it cannot back up.
+local function new_limbus_data()
+    return { runs_remaining = LIMBUS_CHARACTER_LIMIT, seen = 0, known = false, last_gain = 0 };
+end
+
+-- Account-side Limbus pool. Stored on the same account record as Dynamis, since
+-- the character grouping is shared, but counted independently.
+local function ensure_limbus_account(acct)
+    if acct.limbus_remaining == nil then acct.limbus_remaining = LIMBUS_ACCOUNT_LIMIT; end
+    if acct.limbus_seen == nil then acct.limbus_seen = 0; end
+    if acct.limbus_known == nil then acct.limbus_known = false; end
+    return acct;
+end
+
 local function new_dynamis_data()
     return { entries_remaining = CHARACTER_ENTRY_LIMIT, counted_glasses = {} };
 end
@@ -544,6 +1072,41 @@ local function get_dynamis_store(char_name)
     if cd.dynamis_data == nil then cd.dynamis_data = new_dynamis_data(); end
     if type(cd.dynamis_data.counted_glasses) ~= 'table' then cd.dynamis_data.counted_glasses = {}; end
     return cd.dynamis_data, false;
+end
+
+-- Mirrors get_dynamis_store: the table holding this character's Limbus counters,
+-- plus true when it is an account-wide pool.
+local function get_limbus_store(char_name)
+    if tracker.settings.dynamis_account_wide then
+        local acct = find_dynamis_account(char_name);
+        if acct ~= nil then return ensure_limbus_account(acct), true; end
+    end
+    local cd = char_name and tracker.settings.characters[char_name] or nil;
+    if cd == nil then return nil, false; end
+    if cd.limbus_data == nil then cd.limbus_data = new_limbus_data(); end
+    return cd.limbus_data, false;
+end
+
+-- Returns effective_remaining, char_remaining, acct_remaining, known, shared.
+local function limbus_state(char_name)
+    local cd = char_name and tracker.settings.characters[char_name] or nil;
+    if cd == nil then return nil; end
+    if cd.limbus_data == nil then cd.limbus_data = new_limbus_data(); end
+    local own = cd.limbus_data;
+    local store, shared = get_limbus_store(char_name);
+
+    local char_left = own.runs_remaining or LIMBUS_CHARACTER_LIMIT;
+    local acct_left = shared and (store.limbus_remaining or LIMBUS_ACCOUNT_LIMIT) or nil;
+    local known = (own.known == true) and (not shared or store.limbus_known == true);
+
+    -- Watched handouts are proof whatever happened before the addon existed: if
+    -- it saw two, this character is out regardless of the unknown starting point.
+    if (own.seen or 0) >= LIMBUS_CHARACTER_LIMIT then char_left = 0; known = true; end
+    if shared and (store.limbus_seen or 0) >= LIMBUS_ACCOUNT_LIMIT then acct_left = 0; known = true; end
+
+    local eff = char_left;
+    if acct_left ~= nil and acct_left < eff then eff = acct_left; end
+    return eff, char_left, acct_left, known, shared;
 end
 
 local function chars_per_account()
@@ -582,7 +1145,7 @@ local function unassign_char(char_name)
             for i = #acct.chars, 1, -1 do
                 if acct.chars[i] == char_name then table.remove(acct.chars, i); removed = true; end
             end
-            if removed then recalc_account_from_members(acct); end
+            if removed then recalc_account_from_members(acct, true); end
         end
     end
 end
@@ -594,8 +1157,17 @@ end
 -- only lower the count - delete the account to start it over.
 -- Member glass serials are merged in too, otherwise a glass one character already
 -- counted would count a second time once the pool took over.
-function recalc_account_from_members(acct)
+-- `from_membership` marks the call as triggered by ticking a character in or out
+-- of an account, as opposed to deriving the pool from scratch (load, or turning
+-- sharing on). Only membership changes are clamped: unticking a member who spent
+-- two runs would otherwise hand those entries back, which is a way to top the
+-- pool up from the settings tab. A genuine re-derivation has to be free to raise,
+-- or a stale 0 from a previous session could never recover.
+function recalc_account_from_members(acct, from_membership)
     if acct == nil or type(acct.chars) ~= 'table' or #acct.chars == 0 then return; end
+    -- A number the player typed in beats anything derived. Cleared at the weekly
+    -- reset, when the addon's own count becomes trustworthy again.
+    if acct.manual_override then return; end
 
     -- Work from what the members have actually USED, not from whoever has the
     -- fewest left. Taking the lowest threw away an alt's unused entries: a
@@ -623,6 +1195,10 @@ function recalc_account_from_members(acct)
     end
 
     local remaining = ACCOUNT_ENTRY_LIMIT - used;
+    local previous = acct.entries_remaining;
+    if from_membership and type(previous) == 'number' and remaining > previous then
+        remaining = previous;
+    end
     if remaining < 0 then remaining = 0; end
     acct.entries_remaining = remaining;
     acct.counted_glasses = merged;
@@ -639,7 +1215,7 @@ local function assign_char_to_account(char_name, acct_index)
     if not already and #acct.chars >= chars_per_account() then return false; end
     unassign_char(char_name);
     if not already then table.insert(acct.chars, char_name); end
-    recalc_account_from_members(acct);
+    recalc_account_from_members(acct, true);
     return true;
 end
 
@@ -655,6 +1231,73 @@ local function remove_dynamis_account(acct_index)
     end
 end
 
+local function new_assault_data()
+    return { tags_stored = nil, checked_at = 0, next_tag_time = 0,
+             max_stock = ASSAULT_DEFAULT_MAX_STOCK, current_assault = 0,
+             rank = nil, rank_seen_at = 0, points = {}, last_withdraw = 0,
+             orders_lost_seq = nil };
+end
+
+-- Whether the player is carrying a tag right now. Read live from the key item
+-- table rather than the Rytaal packet, so it stays correct between visits.
+-- Key items for a NAMED character. tracker.kis only ever describes whoever is
+-- logged in, so reading it while the window shows an alt reported your own
+-- Cosmo-Cleanse, cards and assault orders under their name. Every character
+-- persists ki_cache, so use that for anyone else.
+local function ki_held(char_name, ki_id)
+    if char_name == nil or char_name == tracker.current_char then
+        -- Before the first zone-in tracker.kis is empty, which showed the
+        -- current character holding nothing while alts correctly showed their
+        -- cached state. Fall through to the cache during that window.
+        if tracker.kis_initialized or char_name == nil then
+            return tracker.kis[ki_id] == true;
+        end
+    end
+    local cd = tracker.settings.characters[char_name];
+    if cd == nil or type(cd.ki_cache) ~= 'table' then return false; end
+    for _, id in ipairs(cd.ki_cache) do
+        if id == ki_id then return true; end
+    end
+    return false;
+end
+
+local function assault_holding_tag(char_name)
+    return ki_held(char_name, IMPERIAL_ARMY_ID_TAG);
+end
+
+-- The Assault Orders key item names the area. Read live rather than stored, so
+-- it clears itself the moment the orders are handed back to Rytaal.
+local function assault_active_area(char_name)
+    for id, area in pairs(ASSAULT_ORDERS) do
+        if ki_held(char_name, id) then return area; end
+    end
+    return nil;
+end
+
+-- Projects the stored count forward from the last Rytaal reading. Returns
+-- stored, next_tag_unix, max_stock - or nil when Rytaal has never been seen.
+-- This function writes nothing back; the next Rytaal visit is the source of
+-- truth and this only keeps the display honest in between. Note that the tag
+-- withdrawal handler in on_ki_gained DOES materialise the result into
+-- assault_data before spending, because it has to decrement the projected stock
+-- rather than the stale stored one.
+local function assault_state(char_data)
+    local ad = char_data and char_data.assault_data or nil;
+    if ad == nil or ad.tags_stored == nil then return nil; end
+    local maxs   = ad.max_stock or ASSAULT_DEFAULT_MAX_STOCK;
+    local stored = ad.tags_stored;
+    local nxt    = ad.next_tag_time or 0;
+    local now    = os.time();
+    if nxt > 0 then
+        while stored < maxs and now >= nxt do
+            stored = stored + 1;
+            nxt = nxt + ASSAULT_TAG_PERIOD;
+        end
+    end
+    if stored >= maxs then nxt = 0; end
+    return stored, nxt, maxs;
+end
+
 local function glass_already_counted(store, serial)
     if store == nil or serial == nil then return false; end
     for _, sn in ipairs(store.counted_glasses or {}) do
@@ -668,35 +1311,57 @@ end
 local function dynamis_effective_remaining(char_name)
     local store, shared = get_dynamis_store(char_name);
     if store == nil then return 0, 0, nil; end
-    local acct_left = store.entries_remaining or 0;
+    -- Default to the caps, matching recalc_account_from_members. Defaulting to
+    -- zero rendered a missing value as a red "none left" rather than a full one.
+    local acct_left = store.entries_remaining or ACCOUNT_ENTRY_LIMIT;
     if not shared then return acct_left, acct_left, nil; end
     local cd = char_name and tracker.settings.characters[char_name] or nil;
-    local char_left = cd and cd.dynamis_data and cd.dynamis_data.entries_remaining or 0;
+    local char_left = (cd and cd.dynamis_data and cd.dynamis_data.entries_remaining)
+        or CHARACTER_ENTRY_LIMIT;
     local eff = acct_left;
     if char_left < eff then eff = char_left; end
-    return eff, acct_left, char_left;
+    -- (eff, char_left, acct_left) to match limbus_state. These two returned
+    -- their extras in opposite orders, which is a trap in a codebase whose
+    -- documented failure mode is copying between siblings.
+    return eff, char_left, acct_left;
 end
 
 -- Counts one entry. When the character is in an account this spends from both
 -- the account's 3 and the character's own 2, because Horizon caps each.
 local function count_dynamis_entry(store, serial, label, char_name)
     if store == nil then return false; end
-    if serial ~= nil then
-        if glass_already_counted(store, serial) then return false; end
-        table.insert(store.counted_glasses, serial);
-    end
+    if serial ~= nil and glass_already_counted(store, serial) then return false; end
+
     char_name = char_name or tracker.current_char;
     local _, shared = get_dynamis_store(char_name);
     local char_data = char_name and tracker.settings.characters[char_name] or nil;
     local char_store = (shared and char_data) and char_data.dynamis_data or nil;
 
     -- A character who has already used their personal 2 cannot spend from the
-    -- account pool, so the remaining entry stays available to their alts.
+    -- account pool, so the remaining entry stays available to their alts. The
+    -- serial is NOT recorded here: nothing was spent, and marking it counted
+    -- would stop an alt's entry on that same glass from counting either.
     if char_store ~= nil and (char_store.entries_remaining or 0) <= 0 then
-        save_settings();
-        print_msg('This character has already used both of their Dynamis runs this week.');
+        -- Nothing is recorded here on purpose, so without a session-only guard
+        -- this message repeated on every zone-in, relog and re-entry.
+        if tracker.last_denied_serial ~= serial then
+            tracker.last_denied_serial = serial;
+            print_msg('This character has already used both of their Dynamis runs this week.');
+        end
         return true;
     end
+
+    -- Same reasoning as the character guard above, which an earlier fix stopped
+    -- one step short of: if the pool is empty too, nothing is spent, so the
+    -- glass must not be marked counted. Recording it would stop the entry being
+    -- counted later if the numbers are corrected by hand.
+    if (store.entries_remaining or 0) <= 0
+       and (char_store == nil or (char_store.entries_remaining or 0) <= 0) then
+        print_msg('Dynamis entry detected but the counter is already at 0.');
+        return true;
+    end
+
+    if serial ~= nil then table.insert(store.counted_glasses, serial); end
 
     local counted = false;
     if (store.entries_remaining or 0) > 0 then
@@ -721,8 +1386,13 @@ local function count_dynamis_entry(store, serial, label, char_name)
         return true;
     end
 
-    local eff, acct_left, char_left = dynamis_effective_remaining(char_name);
-    if char_left ~= nil and acct_left ~= char_left then
+    local eff, char_left, acct_left = dynamis_effective_remaining(char_name);
+    -- Guard on acct_left, which is the value that is nil when the character is
+    -- not in an account. The reorder in 3.17 moved that nil from the third
+    -- return to the second: the destructure here was updated, but this test
+    -- still asked "is the third value nil", which is now never true - so every
+    -- ungrouped character hit %d with a nil and threw inside the packet handler.
+    if acct_left ~= nil and acct_left ~= char_left then
         print_success(string.format('Dynamis %s! %d left (account: %d).',
             label or 'entry counted', char_left, acct_left));
     else
@@ -740,8 +1410,11 @@ do
         if id ~= nil and not seen[id] then seen[id] = true; table.insert(TRACKED_KI_IDS, id); end
     end
     for _, enm in ipairs(ENM_KEY_ITEMS) do add(enm.ki_id); end
+    add(LIMBUS_KI_ID);
     for _, card in ipairs(LIMBUS_CARDS) do add(card.ki_id); end
     add(XSKNIFE_KI_ID_FIRST); add(XSKNIFE_KI_ID_REPEAT);
+    add(IMPERIAL_ARMY_ID_TAG); add(ASSAULT_ARMBAND);
+    for id in pairs(ASSAULT_ORDERS) do add(id); end
     add(COOKBOOK_KI_ID); add(SPICEGALS_KI_ID); add(UNINVITED_KI_ID);
     for _, id in pairs(ECOWARRIOR_KI_IDS) do add(id); end
 end
@@ -801,8 +1474,14 @@ local function get_char_name()
 end
 
 local function get_zone_id()
-    local party = AshitaCore:GetMemoryManager():GetParty();
-    return party:GetMemberZone(0);
+    -- text_in reaches this before get_char_data(), guarded only by a cached name
+    -- string, which is not proof the party object exists right now.
+    local ok, zone = pcall(function()
+        local party = AshitaCore:GetMemoryManager():GetParty();
+        return party:GetMemberZone(0);
+    end);
+    if ok and type(zone) == 'number' then return zone; end
+    return 0;
 end
 
 
@@ -828,7 +1507,9 @@ local function get_char_data()
             xsknife_data = { step = 'unknown', has_ki = false },
             quest_steps = { highwind = 'scanned', uninvited = 'unknown', spicegals = 'unknown', cookbook = 'unknown' },
             ecowarrior_data = { step = 'unknown', current_nation = nil, locked_nations = {}, knows_status = false },
-            dynamis_data = new_dynamis_data()
+            dynamis_data = new_dynamis_data(),
+            assault_data = new_assault_data(),
+            limbus_data = new_limbus_data()
         };
         save_settings();
         print_success('Created new tracker for character: ' .. tracker.current_char);
@@ -864,6 +1545,14 @@ local function get_char_data()
     if tracker.settings.characters[tracker.current_char].dynamis_data == nil then
         tracker.settings.characters[tracker.current_char].dynamis_data = new_dynamis_data();
     end
+    -- Ensure assault_data exists
+    if tracker.settings.characters[tracker.current_char].assault_data == nil then
+        tracker.settings.characters[tracker.current_char].assault_data = new_assault_data();
+    end
+    -- Ensure limbus_data exists
+    if tracker.settings.characters[tracker.current_char].limbus_data == nil then
+        tracker.settings.characters[tracker.current_char].limbus_data = new_limbus_data();
+    end
     return tracker.settings.characters[tracker.current_char];
 end
 
@@ -874,28 +1563,41 @@ end
 
 -- Populates tracker.kis from game memory - ONLY called once on addon load if already logged in
 local function populate_kis_from_memory()
-    local player = AshitaCore:GetMemoryManager():GetPlayer();
-    if player == nil then return false; end
+    -- On this server HasKeyItem resolves and returns false for everything, which
+    -- is handled below. On a client where the scanned pointer is genuinely
+    -- absent the member is nil and the call throws - and this runs bare inside
+    -- load_cb and /hw scan, while every other AshitaCore call in the file is
+    -- wrapped.
+    local ok, player = pcall(function()
+        return AshitaCore:GetMemoryManager():GetPlayer();
+    end);
+    if not ok or player == nil then return false; end
+    local has_ki = function(id)
+        local got, v = pcall(function() return player:HasKeyItem(id); end);
+        return got and v == true;
+    end
     local found_any = false;
     for _, enm in ipairs(ENM_KEY_ITEMS) do
-        local has = player:HasKeyItem(enm.ki_id);
+        local has = has_ki(enm.ki_id);
         tracker.kis[enm.ki_id] = has;
         if has then found_any = true; end
     end
     -- Limbus cards (for floating window display)
     for _, card in ipairs(LIMBUS_CARDS) do
-        local has = player:HasKeyItem(card.ki_id);
+        local has = has_ki(card.ki_id);
         tracker.kis[card.ki_id] = has;
         if has then found_any = true; end
     end
-    local extras = { XSKNIFE_KI_ID_FIRST, XSKNIFE_KI_ID_REPEAT, COOKBOOK_KI_ID, SPICEGALS_KI_ID, UNINVITED_KI_ID };
+    local extras = { XSKNIFE_KI_ID_FIRST, XSKNIFE_KI_ID_REPEAT, COOKBOOK_KI_ID, SPICEGALS_KI_ID, UNINVITED_KI_ID,
+                     IMPERIAL_ARMY_ID_TAG, ASSAULT_ARMBAND };
+    for id in pairs(ASSAULT_ORDERS) do table.insert(extras, id); end
     for _, ki_id in ipairs(extras) do
-        local has = player:HasKeyItem(ki_id);
+        local has = has_ki(ki_id);
         tracker.kis[ki_id] = has;
         if has then found_any = true; end
     end
     for _, ki_id in pairs(ECOWARRIOR_KI_IDS) do
-        local has = player:HasKeyItem(ki_id);
+        local has = has_ki(ki_id);
         tracker.kis[ki_id] = has;
         if has then found_any = true; end
     end
@@ -917,6 +1619,10 @@ local function restore_ki_cache()
     if tracker.current_char == nil or tracker.current_char == 'Unknown' then return false; end
     local cd = tracker.settings.characters[tracker.current_char];
     if cd == nil or type(cd.ki_cache) ~= 'table' then return false; end
+    -- An empty list is indistinguishable from a wiped one, and claiming a
+    -- restore on it produces a confident all-false picture. Waiting for the
+    -- 0x055 blocks is the safe reading of nothing.
+    if #cd.ki_cache == 0 then return false; end
     local held = {};
     for _, id in ipairs(cd.ki_cache) do held[id] = true; end
     tracker.kis = {};
@@ -928,6 +1634,8 @@ local function restore_ki_cache()
 end
 
 local function scan_key_items(silent)
+    -- Callers have always guarded this, but the safety lived in them rather than
+    -- here; one new call site away from an error every frame or command.
     -- HARD GUARD. Without a real key item read, has_key_item() answers false for
     -- everything and this function will happily write "you own nothing" across
     -- every ENM, quest and timer, then save it. That is exactly how data was
@@ -940,6 +1648,7 @@ local function scan_key_items(silent)
         return false;
     end
     local char_data = get_char_data();
+    if char_data == nil then return false; end
     local current_time = os.time();
     local found_count = 0;
     local new_entries = 0;
@@ -1044,9 +1753,94 @@ local function scan_key_items(silent)
     return true;
 end
 
+-- The 0x055 table flickers when a key item is taken, so one handout can arrive
+-- as several events inside a second.
+local function cd_limbus_debounce_ok(char_data, now)
+    if char_data.limbus_data == nil then char_data.limbus_data = new_limbus_data(); end
+    return (now - (char_data.limbus_data.last_gain or 0)) > LIMBUS_DEBOUNCE;
+end
+
 local function on_ki_gained(ki_id)
     local char_data = get_char_data();
     if char_data == nil then return; end
+    -- Taking a tag moves it from Rytaal's stock into your hands. The menu packet
+    -- is sent when the menu OPENS, before the option is picked, so it always
+    -- reports the count from before the withdrawal - there is no second packet
+    -- to correct it. Without this the same tag is counted in both places.
+    -- Mister Glean handing over a Cosmo-Cleanse is one Limbus run, against both
+    -- this character's 2 and the account's 4.
+    if ki_id == LIMBUS_KI_ID then
+        local now = os.time();
+        if cd_limbus_debounce_ok(char_data, now) then
+            local own = char_data.limbus_data;
+            own.last_gain = now;
+            -- A character who has already used their 2 cannot spend from the
+            -- account's 4, so the rest stays available to their alts.
+            if (own.runs_remaining or LIMBUS_CHARACTER_LIMIT) <= 0 then
+                own.seen = (own.seen or 0) + 1;
+                save_settings();
+                print_msg('This character has already used both Limbus runs this week.');
+                return;
+            end
+            own.seen = (own.seen or 0) + 1;
+            own.runs_remaining = math.max(0, (own.runs_remaining or LIMBUS_CHARACTER_LIMIT) - 1);
+            local store, shared = get_limbus_store(tracker.current_char);
+            if shared and store ~= nil then
+                store.limbus_seen = (store.limbus_seen or 0) + 1;
+                store.limbus_remaining = math.max(0, (store.limbus_remaining or LIMBUS_ACCOUNT_LIMIT) - 1);
+            end
+            save_settings();
+            local eff, char_left, acct_left = limbus_state(tracker.current_char);
+            if acct_left ~= nil then
+                print_success(string.format('Cosmo-Cleanse taken! %d left for this character, %d on the account.',
+                    char_left, acct_left));
+            else
+                print_success(string.format('Cosmo-Cleanse taken! %d Limbus run%s left this week.',
+                    char_left, char_left == 1 and '' or 's'));
+            end
+        end
+        return;
+    end
+
+    if ki_id == IMPERIAL_ARMY_ID_TAG then
+        local ad = char_data.assault_data;
+        if ad ~= nil and ad.tags_stored ~= nil then
+            local now = os.time();
+            -- Materialise the projection first. assault_state ticks the stock
+            -- forward every 24h since the anchor, but this handler read the raw
+            -- stored value: with Rytaal last seen at 0 and three days elapsed,
+            -- the display correctly showed 3 while `tags_stored > 0` was false,
+            -- so the withdrawal was skipped and the restock clock never
+            -- restarted.
+            local projected, proj_next = assault_state(char_data);
+            if projected ~= nil then
+                ad.tags_stored = projected;
+                ad.next_tag_time = proj_next or 0;
+            end
+            -- Same packet as the orders vanishing means this is a cancellation
+            -- refund, not a withdrawal from Rytaal.
+            if ad.orders_lost_seq ~= nil and ad.orders_lost_seq == ASSAULT_KI_PACKET_SEQ then
+                ad.orders_lost_seq = nil;
+                return;
+            end
+            if (now - (ad.last_withdraw or 0)) > ASSAULT_TAG_DEBOUNCE then
+                ad.last_withdraw = now;
+                if ad.tags_stored > 0 then
+                    local was_full = ad.tags_stored >= (ad.max_stock or ASSAULT_DEFAULT_MAX_STOCK);
+                    ad.tags_stored = ad.tags_stored - 1;
+                    -- Dropping below a full stock is what starts the restock clock.
+                    -- Without this the row keeps showing whatever countdown Rytaal
+                    -- last reported, which can be an hour or more out of date until
+                    -- the next visit corrects it.
+                    if was_full then
+                        ad.next_tag_time = now + ASSAULT_TAG_PERIOD;
+                    end
+                    save_settings();
+                end
+            end
+        end
+        return;
+    end
     -- Check ENM/Limbus KIs
     for _, enm in ipairs(ENM_KEY_ITEMS) do
         if ki_id == enm.ki_id then
@@ -1121,6 +1915,13 @@ end
 local function on_ki_lost(ki_id)
     local char_data = get_char_data();
     if char_data == nil then return; end
+    -- Losing Assault Orders means the run ended one way or another. Note the
+    -- moment: if a tag turns up immediately afterwards it was a cancellation.
+    if ASSAULT_ORDERS[ki_id] ~= nil then
+        if char_data.assault_data == nil then char_data.assault_data = new_assault_data(); end
+        -- Which packet, not which second.
+        char_data.assault_data.orders_lost_seq = ASSAULT_KI_PACKET_SEQ;
+    end
     -- Check ENM/Limbus KIs
     for _, enm in ipairs(ENM_KEY_ITEMS) do
         if ki_id == enm.ki_id then
@@ -1176,7 +1977,9 @@ local function on_ki_lost(ki_id)
         if char_data.quest_steps.uninvited == 'bcnm' then
             char_data.quest_steps.uninvited = 'justinius_return';
             save_settings();
-            print_success('Entered BCNM - Fight the NM then return to Justinius!');
+            -- The permit leaving the bag means entered OR abandoned; we cannot
+            -- tell which, so do not congratulate.
+            print_msg('Monarch Linn permit used. Return to Justinius when done.');
         end
         return;
     end
@@ -1223,7 +2026,9 @@ end
 local update_char_list;
 
 local function normalize_task(task)
-    return task:lower():gsub('%s+', ''):gsub("'", '');
+    -- Parenthesised: a tail-returned gsub also yields its replacement count,
+    -- which silently corrupts any caller that uses this in a list or arg slot.
+    return (task:lower():gsub('%s+', ''):gsub("'", ''));
 end
 
 -- Short forms advertised in the UI tooltips. Previously these were suggested to
@@ -1232,7 +2037,8 @@ local TASK_ALIASES = {
     knife     = "X'sKnife",
     xknife    = "X'sKnife",
     high      = 'Highwind',
-    hw        = 'Highwind',
+    -- 'hw' deliberately omitted: /hw hw reads like "open the window" and would
+    -- instead silently toggle a quest.
     spice     = 'SpiceGals',
     gals      = 'SpiceGals',
     cook      = 'CookBook',
@@ -1288,15 +2094,33 @@ function reset_dynamis_store(store, current_time)
     store.glass_used = nil;
     store.dynamis_zone = nil;
     store.claimed_before_reset = nil;
-    -- A glass broken in the final day before reset belongs to the new week, so the
-    -- entry stays spent and its serial stays on the list.
+
     local full = store.is_account and ACCOUNT_ENTRY_LIMIT or CHARACTER_ENTRY_LIMIT;
-    if store.claimed_at ~= nil and (current_time - store.claimed_at) <= DYNAMIS_CLAIM_CARRY_WINDOW then
+    local carried = store.claimed_at ~= nil
+        and (current_time - store.claimed_at) <= DYNAMIS_CLAIM_CARRY_WINDOW;
+
+    if carried then
+        -- A glass broken just before the reset stays spent in the new week. Keep
+        -- its REAL serial and its break zone: an earlier version substituted a
+        -- 'carried-<time>' placeholder and wiped the zone guard, so walking into
+        -- that zone after the reset found an unrecognised serial and charged a
+        -- second entry for one run.
         store.entries_remaining = full - 1;
-        store.counted_glasses = { 'carried-' .. tostring(store.claimed_at) };
+        local keep = {};
+        if store.last_break_serial ~= nil then
+            table.insert(keep, store.last_break_serial);
+        else
+            table.insert(keep, 'carried-' .. tostring(store.claimed_at));
+        end
+        store.counted_glasses = keep;
+        -- last_break_zone / last_break_time deliberately survive so the zone-in
+        -- guard still recognises the arrival.
     else
         store.entries_remaining = full;
         store.counted_glasses = {};
+        store.last_break_zone = nil;
+        store.last_break_time = nil;
+        store.last_break_serial = nil;
     end
     store.claimed_at = nil;
 end
@@ -1360,6 +2184,14 @@ local function reset_character_data(char_data)
             char_data.xsknife_data.step = 'despachiaire';
         end
     end
+    -- Limbus: fresh allowance. From this point the addon has watched a whole
+    -- week, so the count is trustworthy and the unknown marker can go.
+    if char_data.limbus_data == nil then char_data.limbus_data = new_limbus_data(); end
+    char_data.limbus_data.runs_remaining = LIMBUS_CHARACTER_LIMIT;
+    char_data.limbus_data.seen = 0;
+    char_data.limbus_data.known = true;
+    char_data.limbus_data.last_gain = 0;
+
     -- Dynamis: fresh allowance and a fresh list of counted glass serials.
     if char_data.dynamis_data then
         reset_dynamis_store(char_data.dynamis_data, current_time);
@@ -1369,7 +2201,31 @@ local function reset_character_data(char_data)
 end
 
 local function reset_tracker()
-    -- Reset ALL characters, not just current one
+    -- Reset ALL characters, not just the current one.
+    --
+    -- Guard first: a single character with a stale last_reset - from a restored
+    -- backup, a hand-edit, or a merged save - used to drag every character
+    -- through a reset and wipe usage that was legitimately tracked this week.
+    -- If the NEWEST last_reset on file is still inside the current week, this is
+    -- one desynced record rather than a real weekly rollover, so just bring the
+    -- laggards forward and leave everyone's counts alone.
+    local newest = 0;
+    for char_name, cd in pairs(tracker.settings.characters) do
+        if char_name ~= 'Unknown' and type(cd.last_reset) == 'number' and cd.last_reset > newest then
+            newest = cd.last_reset;
+        end
+    end
+    if newest > 0 and os.time() < calculate_next_reset(newest) then
+        for _, cd in pairs(tracker.settings.characters) do
+            if type(cd.last_reset) == 'number' and cd.last_reset < newest then
+                cd.last_reset = newest;
+            end
+        end
+        save_settings();
+        tracker.next_check_time = calculate_next_reset(os.time());
+        return;
+    end
+
     local reset_count = 0;
     for char_name, char_data in pairs(tracker.settings.characters) do
         if char_name ~= nil and char_name ~= '' and char_name ~= 'Unknown' then
@@ -1381,6 +2237,11 @@ local function reset_tracker()
     local now = os.time();
     for _, acct in ipairs(tracker.settings.dynamis_accounts or {}) do
         reset_dynamis_store(acct, now);
+        ensure_limbus_account(acct);
+        acct.manual_override = nil;
+        acct.limbus_remaining = LIMBUS_ACCOUNT_LIMIT;
+        acct.limbus_seen = 0;
+        acct.limbus_known = true;
     end
     save_settings();
     print_success('Weekly tracker has been reset for all ' .. reset_count .. ' characters!');
@@ -1388,13 +2249,27 @@ local function reset_tracker()
     tracker.next_check_time = next_reset;
 end
 
+-- The newest last_reset across all characters. A single stale value - from a
+-- restored backup or a hand-edited save - used to trigger reset_tracker(), which
+-- wipes every character's week, not just the stale one.
+local function newest_last_reset()
+    local newest = 0;
+    for _, cd in pairs(tracker.settings.characters or {}) do
+        local lr = tonumber(cd.last_reset) or 0;
+        if lr > newest then newest = lr; end
+    end
+    return newest;
+end
+
 local function initialize_timer()
     local char_data = get_char_data();
+    if char_data == nil then return; end
     local current_time = os.time();
     -- calculate_next_reset always returns a strictly future timestamp, so the old
     -- `current_time >= calculate_next_reset(current_time)` guard could never fire
     -- and `last_reset < last_reset_point` was likewise always true. Both dropped.
-    if current_time >= calculate_next_reset(char_data.last_reset) then
+    local anchor = math.max(tonumber(char_data.last_reset) or 0, newest_last_reset());
+    if current_time >= calculate_next_reset(anchor) then
         reset_tracker(); return;
     end
     tracker.next_check_time = calculate_next_reset(current_time);
@@ -1434,10 +2309,10 @@ local function eco_available_text(locked)
             elseif n == 'bastok' then table.insert(available, 'Bastok'); end
         end
     end
-    if #available == 0 then return 'All Nations', 0; end      -- cycle complete, all reopen
-    if #available == 3 then return 'All Nations', 3; end
-    if #available == 2 then return available[1] .. ' & ' .. available[2], 2; end
-    return available[1], 1;
+    if #available == 0 then return 'All Nations'; end         -- cycle complete, all reopen
+    if #available == 3 then return 'All Nations'; end
+    if #available == 2 then return available[1] .. ' & ' .. available[2]; end
+    return available[1];
 end
 
 -- One chat line for one task. Shared by /hw weeklys and /hw chars <name>,
@@ -1519,7 +2394,7 @@ local function format_dynamis_line(char_name, char_data)
     if store == nil then return HDR .. '\30\104[ ? ]\30\106 Dynamis'; end
     -- Show what actually limits this character: the lower of their own cap and
     -- the account pool. Saying "1 left" when the character is capped would lie.
-    local entries, acct_left, char_left = dynamis_effective_remaining(char_name);
+    local entries, char_left, acct_left = dynamis_effective_remaining(char_name);
     if not shared then entries = store.entries_remaining or CHARACTER_ENTRY_LIMIT; end
     local suffix = '';
     if shared then
@@ -1529,17 +2404,75 @@ local function format_dynamis_line(char_name, char_data)
             suffix = ', account';
         end
     end
-    -- When the account still holds entries the character cannot use, say so
-    -- compactly rather than stacking two bracketed phrases.
+    -- Counts render as n/max here too, matching the window: brackets mean
+    -- status, a bare fraction means a count.
+    local dmax = CHARACTER_ENTRY_LIMIT;   -- see the window row: always the character's cap
+    local colour = (entries <= 0) and '\30\076'
+                or (entries == 1) and '\30\104'
+                or '\30\110';
+    local count = string.format('%s%d/%d\30\106', colour, entries, dmax);
     if suffix ~= '' then
-        local icon = (entries <= 0) and '\30\076[X]\30\106'
-                  or (entries == 1) and '\30\104[1 Run]\30\106'
-                  or ('\30\110[' .. entries .. ' Runs]\30\106');
-        return HDR .. icon .. ' Dynamis \30\071(' .. entries .. ' left' .. suffix .. ')\30\106';
+        return HDR .. count .. ' Dynamis \30\071(' .. entries .. ' left' .. suffix .. ')\30\106';
     end
-    if entries <= 0 then return HDR .. '\30\076[X]\30\106 Dynamis \30\071(no runs left)\30\106';
-    elseif entries == 1 then return HDR .. '\30\104[1 Run]\30\106 Dynamis \30\071(1 run left)\30\106';
-    else return HDR .. '\30\110[' .. entries .. ' Runs]\30\106 Dynamis \30\071(' .. entries .. ' runs left)\30\106'; end
+    if entries <= 0 then return HDR .. count .. ' Dynamis \30\071(no runs left)\30\106'; end
+    return HDR .. count .. string.format(' Dynamis \30\071(%d run%s left)\30\106',
+        entries, entries == 1 and '' or 's');
+end
+
+local function format_time_short(seconds)
+    if seconds <= 0 then return 'Ready'; end
+    local days = math.floor(seconds / 86400);
+    local hours = math.floor((seconds % 86400) / 3600);
+    local minutes = math.floor((seconds % 3600) / 60);
+    if days > 0 then return string.format('%dd %dh', days, hours);
+    elseif hours > 0 then return string.format('%dh %dm', hours, minutes);
+    else return string.format('%dm', minutes); end
+end
+
+-- Limbus in chat. Cooldown is gone, so this reports the Cosmo-Cleanse and the
+-- three cards rather than a timer.
+local function format_limbus_line(char_name)
+    local has_cosmo = ki_held(char_name, LIMBUS_KI_ID);
+    local eff, char_left, acct_left, known = limbus_state(char_name);
+    local cards = {};
+    for _, card in ipairs(LIMBUS_CARDS) do
+        if ki_held(char_name, card.ki_id) then table.insert(cards, card.name); end
+    end
+    local suffix = '';
+    if #cards > 0 then suffix = ' \30\071(' .. table.concat(cards, ', ') .. ')\30\106'; end
+
+    local icon;
+    if eff == nil then icon = '\30\104 ? \30\106';
+    elseif not known then icon = string.format('\30\104?/%d\30\106', LIMBUS_CHARACTER_LIMIT);
+    elseif eff <= 0 then icon = string.format('\30\076%d/%d\30\106', eff, LIMBUS_CHARACTER_LIMIT);
+    else icon = string.format('\30\110%d/%d\30\106', eff, LIMBUS_CHARACTER_LIMIT); end
+
+    local where = has_cosmo and 'Apollyon/Temenos' or LIMBUS_NPC;
+    local counts = '';
+    if eff ~= nil then
+        counts = string.format(', %d left', char_left);
+        if acct_left ~= nil then counts = counts .. string.format(', account %d', acct_left); end
+    end
+    return HDR .. icon .. ' Limbus \30\071(' .. where .. counts .. ')\30\106' .. suffix;
+end
+
+-- Assault tags in chat: Rytaal's stock, plus what is in hand.
+local function format_assault_line(char_data, char_name)
+    local stored, next_tag, max_stock = assault_state(char_data);
+    local carried = assault_holding_tag(char_name);
+    local area = assault_active_area(char_name);
+    if stored == nil then
+        return HDR .. '\30\104[ ? ]\30\106 Assault \30\071(talk to Rytaal)\30\106';
+    end
+    local colour = (stored == 0) and '\30\076'
+                or (stored == 1) and '\30\104'
+                or '\30\110';
+    local icon = string.format('%s%d/%d\30\106', colour, stored, max_stock);
+    local bits = { stored .. ' at Rytaal' };
+    if carried then table.insert(bits, 'carrying 1'); end
+    if next_tag > 0 then table.insert(bits, 'next in ' .. format_time_short(next_tag - os.time())); end
+    if area ~= nil then table.insert(bits, 'on ' .. area); end
+    return HDR .. icon .. ' Assault \30\071(' .. table.concat(bits, ', ') .. ')\30\106';
 end
 
 -- One chat line for one ENM/Limbus timer.
@@ -1616,6 +2549,8 @@ local function print_weekly_block(char_name, char_data, current_time)
     print_task_legend(char_data);
     print_msg('=================');
     print(format_dynamis_line(char_name, char_data));
+    print(format_limbus_line(char_name));
+    print(format_assault_line(char_data, char_name));
     for _, task in ipairs(tracker.settings.tasks) do
         local line = format_task_line(task, char_data);
         if line then print(line); end
@@ -1625,7 +2560,7 @@ local function print_weekly_block(char_name, char_data, current_time)
 end
 
 local function print_timer_block(char_name, char_data, current_time)
-    print_msg('ENM & Limbus Timers for \30\110' .. char_name .. '\30\106:');
+    print_msg('ENM Timers for \30\110' .. char_name .. '\30\106:');
     print_msg('====================');
     for _, enm in ipairs(ENM_KEY_ITEMS) do
         print(format_timer_line(enm, char_data.enm_timers[enm.name], current_time));
@@ -1659,7 +2594,7 @@ local function show_timers()
             end
         end
     end
-    print_msg('ENM & Limbus Timers for \30\110' .. tracker.current_char .. '\30\106:');
+    print_msg('ENM Timers for \30\110' .. tracker.current_char .. '\30\106:');
     if not has_any_timers then print('\30\081[\30\082Homework\30\081]\30\106 Please use \30\110/hw scan\30\106 to scan for your current KIs'); end
     if has_unknown_question then print('\30\104[ ? ]\30\067 = Unknown status. Use /hw scan to update.'); end
     if has_unknown_no_ki then
@@ -1679,7 +2614,7 @@ local function show_timers()
                 if timer_data.timer_source == 'scan' and timer_data.next_ki_time > longest_ki_timer then
                     longest_ki_timer = timer_data.next_ki_time;
                 elseif timer_data.next_ki_time == 0 then
-                    longest_ki_timer = math.max(longest_ki_timer, current_time + 432000);
+                    longest_ki_timer = math.max(longest_ki_timer, current_time + enm.cooldown);
                 end
             end
         end
@@ -1705,39 +2640,61 @@ end
 -- UI Rendering (imgui)
 -- ============================================================================
 
-local function format_time_short(seconds)
-    if seconds <= 0 then return 'Ready'; end
+-- format_time_short answers 'Ready' at zero, which reads badly as "N ago".
+local function format_elapsed_short(seconds)
+    if seconds < 60 then return 'moments'; end
     local days = math.floor(seconds / 86400);
     local hours = math.floor((seconds % 86400) / 3600);
     local minutes = math.floor((seconds % 3600) / 60);
-    if days > 0 then return string.format('%dd %dh', days, hours);
-    elseif hours > 0 then return string.format('%dh %dm', hours, minutes);
-    else return string.format('%dm', minutes); end
+    if days > 0 then return string.format('%dd %dh', days, hours); end
+    if hours > 0 then return string.format('%dh %dm', hours, minutes); end
+    return string.format('%dm', minutes);
 end
 
 function update_char_list()
     ui.char_list = {};
+    ui.char_list_combo = nil;   -- rebuilt lazily below
     for char_name, _ in pairs(tracker.settings.characters) do
         if char_name ~= nil and char_name ~= '' and char_name ~= 'Unknown' then
             table.insert(ui.char_list, char_name);
         end
     end
     table.sort(ui.char_list);
-    -- Find current char index
-    for i, name in ipairs(ui.char_list) do
-        if name == tracker.current_char then
-            ui.selected_char[1] = i - 1;
-            break;
+    -- Keep whatever the player was looking at. Re-pointing at the logged-in
+    -- character every time snapped the dropdown back off an alt whenever
+    -- anything rebuilt the list.
+    local keep = ui.selected_name;
+    local target = nil;
+    if keep ~= nil then
+        for i, name in ipairs(ui.char_list) do
+            if name == keep then target = i - 1; break; end
         end
     end
+    if target == nil then
+        for i, name in ipairs(ui.char_list) do
+            if name == tracker.current_char then target = i - 1; break; end
+        end
+    end
+    ui.selected_char[1] = target or 0;
+    -- Clamp BEFORE deriving the name, or the two disagree whenever the list has
+    -- shrunk. This function has produced two rounds of selection bugs already.
+    if ui.selected_char[1] >= #ui.char_list then
+        ui.selected_char[1] = math.max(0, #ui.char_list - 1);
+    end
+    ui.selected_name = ui.char_list[ui.selected_char[1] + 1];
 end
 
 local function factory_reset()
-    -- Delete homework.json
+    -- Delete homework.json, plus the backup and any stray temp file. Without
+    -- the .bak the reset is undone on the next load: if no fresh save follows
+    -- (resetting while logged out writes none), load_settings finds no main
+    -- file and restores everything from the backup.
     local settings_path = get_settings_path();
     if ashita.fs.exists(settings_path) then
         os.remove(settings_path);
     end
+    os.remove(settings_path .. '.bak');
+    os.remove(settings_path .. '.tmp');
     -- Delete display.json
     local display_path = get_display_settings_path();
     if ashita.fs.exists(display_path) then
@@ -1745,6 +2702,12 @@ local function factory_reset()
     end
     -- Reset in-memory state
     tracker.settings.characters = {};
+    -- Accounts reference character names. Left behind, they get written straight
+    -- back into the fresh save pointing at characters that no longer exist.
+    tracker.settings.dynamis_accounts = {};
+    tracker.settings.dynamis_account_wide = false;
+    tracker.settings.chars_per_account = DEFAULT_CHARS_PER_ACCOUNT;
+    ui.pending_account_add = nil;
     tracker.kis = {};
     tracker.kis_initialized = false;
     tracker.login_state.waiting_for_login = false;
@@ -1752,10 +2715,17 @@ local function factory_reset()
     tracker.login_state.ki_packets_received = 0;
     tracker.login_state.suppress_ki_events = false;
     tracker.pending_dynamis_claim = nil;
+    tracker.last_denied_serial = nil;
+    tracker.pending_reset = nil;
+    tracker.uninvited_done_time = 0;
+    tracker.login_state.suppress_started = 0;
+    tracker.login_state.blocks_this_zone = 0;
     display_settings.tracked = {};
     ui.font_scale = 1.2;
+    ui.render_failed = false;
     ui.char_list = {};
     ui.selected_char = { 0 };
+    ui.selected_name = nil;
     -- Re-initialize current character
     local char_name = get_char_name();
     if char_name ~= 'Unknown' then
@@ -1826,12 +2796,23 @@ local function render_ui()
     -- Get selected character data
     local char_name = ui.char_list[ui.selected_char[1] + 1] or tracker.current_char;
     local char_data = tracker.settings.characters[char_name];
+    if char_data == nil then
+        -- Fall back rather than drawing nothing: silently vanishing looks like a
+        -- crash to anyone whose selected character was just removed.
+        char_name = tracker.current_char;
+        char_data = char_name and tracker.settings.characters[char_name] or nil;
+        if char_data ~= nil then
+            ui.selected_name = char_name;
+            update_char_list();
+        end
+    end
     if char_data == nil then return; end
     
     local current_time = os.time();
     
     -- Window styling - minimal
-    imgui.SetNextWindowSize({ 280, 400 }, ImGuiCond_FirstUseEver);
+    imgui.SetNextWindowSize({ 340, 400 }, ImGuiCond_FirstUseEver);
+    ui.style_colors = 5; ui.style_vars = 2;
     imgui.PushStyleColor(ImGuiCol_WindowBg, { 0.0, 0.0, 0.0, 0.85 });
     imgui.PushStyleColor(ImGuiCol_TitleBg, { 0.0, 0.0, 0.0, 0.9 });
     imgui.PushStyleColor(ImGuiCol_TitleBgActive, { 0.0, 0.0, 0.0, 0.9 });
@@ -1840,9 +2821,17 @@ local function render_ui()
     imgui.PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
     imgui.PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
     
+    ui.began = true;
+    if ui.window_flags == nil then
+        ui.window_flags = ImGuiWindowFlags_NoCollapse or 0;
+    end
     if imgui.Begin('Homework v' .. addon.version, ui.is_open, ui.window_flags) then
-        imgui.PopStyleColor(5);
+        -- Only WindowBg/TitleBg/TitleBgActive are consumed by Begin itself, so
+        -- FrameBg and Border must stay pushed to reach the combos and checkboxes
+        -- inside. Popping all five here made two of them no-ops.
+        imgui.PopStyleColor(3);
         imgui.PopStyleVar(2);
+        ui.style_colors = 2; ui.style_vars = 0;
         
         -- Apply font scale (compatible with both old and new Ashita)
         local _useNewFont = (imgui.SetWindowFontScale == nil);
@@ -1850,6 +2839,7 @@ local function render_ui()
             local defaultFont = imgui.GetFont();
             local defaultSize = imgui.GetFontSize();
             imgui.PushFont(defaultFont, defaultSize * ui.font_scale);
+            ui.fonts_pushed = 1;
         else
             imgui.SetWindowFontScale(ui.font_scale);
         end
@@ -1859,10 +2849,16 @@ local function render_ui()
             -- Tasks tab
             if imgui.BeginTabItem('Tasks') then
             -- Character dropdown + Reset timer on same line
-            local char_names = table.concat(ui.char_list, '\0') .. '\0';
+            -- Cached: this ran twice a frame, once per tab, allocating a new
+            -- string each time for a list that changes only on character switch.
+            if ui.char_list_combo == nil then
+                ui.char_list_combo = table.concat(ui.char_list, '\0') .. '\0';
+            end
+            local char_names = ui.char_list_combo;
             imgui.SetNextItemWidth(100 * ui.font_scale);
             if imgui.Combo('##char_select', ui.selected_char, char_names) then
                 char_name = ui.char_list[ui.selected_char[1] + 1];
+                ui.selected_name = char_name;
                 char_data = tracker.settings.characters[char_name];
             end
 
@@ -1877,44 +2873,183 @@ local function render_ui()
         draw_gradient_header('Weeklies', imgui.GetContentRegionAvail(), '[?] = Use /hw scan to detect progress\n[  ] = Unknown progress. Resolves at next tally or use /hw <task>');
 
         -- Column positions scaled with font
-        local col_task = 35 * ui.font_scale;
-        local col_location = 120 * ui.font_scale;
+        local col_task = 40 * ui.font_scale;
+        local col_location = 130 * ui.font_scale;
 
         -- Get tracking settings for current character
         local tracking = get_char_tracking(char_name);
 
         -- Dynamis entry counter (displayed above EcoWarrior)
         local dyn_store, dyn_shared = get_dynamis_store(char_name);
-        if dyn_store then
-            local entries, dyn_acct_left, dyn_char_left = dynamis_effective_remaining(char_name);
+        if dyn_store and tracking.tasks[DYNAMIS_ROW_LABEL] ~= false then
+            local entries, dyn_char_left, dyn_acct_left = dynamis_effective_remaining(char_name);
             if not dyn_shared then entries = dyn_store.entries_remaining or CHARACTER_ENTRY_LIMIT; end
-            local dyn_icon, dyn_color;
+            -- Counts render as n/max WITHOUT brackets. Bracketed digits were
+            -- indistinguishable from the [O] used for a ready task in the game's
+            -- font, so square brackets now always mean status and a bare
+            -- fraction always means a count. The cap comes along for free.
+            -- Always the character's own cap. `entries` is the LOWER of the
+            -- character and account figures, so pairing it with the account cap
+            -- read as "1/3" for someone who can only ever do 2. The account
+            -- total is already shown in the column beside this.
+            local dyn_max = CHARACTER_ENTRY_LIMIT;
+            local dyn_icon = string.format('%d/%d', entries, dyn_max);
+            local dyn_color;
             if entries == 0 then
-                dyn_icon = '[X]';
                 dyn_color = { 1.0, 0.3, 0.3, 1.0 };  -- Red
             elseif entries == 1 then
-                dyn_icon = '[1]';
                 dyn_color = { 1.0, 1.0, 0.0, 1.0 };  -- Yellow
             else
-                dyn_icon = '[2]';
                 dyn_color = { 0.0, 1.0, 0.0, 1.0 };  -- Green
             end
             imgui.TextColored(dyn_color, dyn_icon);
             imgui.SameLine();
             imgui.SetCursorPosX(col_task);
             imgui.Text('Dynamis');
+            -- Always print the number when grouped. Hiding it whenever the
+            -- personal and account figures happened to match meant it appeared
+            -- on one character and vanished on another for no visible reason,
+            -- which reads as the addon failing to track the account.
+            local dyn_note = '';
+            if dyn_shared and dyn_acct_left ~= nil then
+                dyn_note = string.format('(account: %d/%d)', dyn_acct_left, ACCOUNT_ENTRY_LIMIT);
+            end
+            -- SameLine only when something actually follows. Calling it and then
+            -- printing nothing left the cursor parked mid-row, so the NEXT row
+            -- drew on top of this one - which is why an ungrouped character (no
+            -- account text) saw Dynamis and Limbus overlapping.
+            if dyn_note ~= '' then
+                imgui.SameLine();
+                imgui.SetCursorPosX(col_location);
+                imgui.TextColored({ 0.6, 0.8, 1.0, 1.0 }, dyn_note);
+            end
+        end
+
+        -- Limbus lost its 71h Cosmo-Cleanse cooldown, so it is a weekly now
+        -- rather than a timer. The cards move up with it.
+        if tracking.tasks[LIMBUS_ROW_LABEL] ~= false then
+            local has_cosmo = ki_held(char_name, LIMBUS_KI_ID);
+            local eff, char_left, acct_left, known = limbus_state(char_name);
+            local l_icon, l_color, l_where, l_where_color;
+
+            local l_max = LIMBUS_CHARACTER_LIMIT;
+            if eff == nil then
+                l_icon = ' ? '; l_color = { 1.0, 1.0, 0.0, 1.0 };
+            elseif not known then
+                -- Counting, but the addon never saw the start of this week.
+                l_icon = string.format('?/%d', l_max); l_color = { 1.0, 1.0, 0.0, 1.0 };
+            elseif eff <= 0 then
+                l_icon = string.format('%d/%d', eff, l_max); l_color = { 1.0, 0.3, 0.3, 1.0 };
+            else
+                l_icon = string.format('%d/%d', eff, l_max); l_color = { 0.0, 1.0, 0.0, 1.0 };
+            end
+
+            -- Holding a cleanse means the next step is the zone, not the NPC.
+            -- Zone name abbreviated so the account figure below still fits the
+            -- column at the default window width.
+            local l_dest;
+            if has_cosmo then
+                l_dest = 'Apollyon/Tem';
+                l_where_color = { 0.0, 1.0, 0.0, 1.0 };
+            elseif eff ~= nil and known and eff <= 0 then
+                l_dest = LIMBUS_NPC;
+                l_where_color = { 1.0, 0.3, 0.3, 1.0 };
+            else
+                l_dest = LIMBUS_NPC;
+                l_where_color = (eff ~= nil and known)
+                    and { 0.0, 1.0, 0.0, 1.0 } or { 1.0, 1.0, 0.0, 1.0 };
+            end
+            -- The account total lived only in the hover tooltip, so there was no
+            -- way to see the 4-per-account cap at a glance the way Dynamis shows
+            -- its 3. When the week is still unknown the account figure is just as
+            -- untrustworthy as the personal one, so it shows ? too.
+            local l_shared = select(5, limbus_state(char_name));
+            if l_shared and acct_left ~= nil then
+                l_where = string.format('(%s - %s/%d)', l_dest,
+                    known and tostring(acct_left) or '?', LIMBUS_ACCOUNT_LIMIT);
+            else
+                l_where = '(' .. l_dest .. ')';
+            end
+
+            imgui.TextColored(l_color, l_icon);
+            imgui.SameLine();
+            imgui.SetCursorPosX(col_task);
+            imgui.Text(LIMBUS_ROW_LABEL);
             imgui.SameLine();
             imgui.SetCursorPosX(col_location);
-            local dyn_note = '';
-            if dyn_shared then
-                if dyn_char_left ~= nil and dyn_acct_left ~= dyn_char_left then
-                    dyn_note = string.format(' (account: %d)', dyn_acct_left);
+            imgui.TextColored(l_where_color, l_where);
+
+            local l_help;
+            if eff == nil then
+                l_help = 'No data for this character yet.';
+            else
+                l_help = string.format('%d run%s left for this character (max %d)',
+                    char_left, char_left == 1 and '' or 's', LIMBUS_CHARACTER_LIMIT);
+                if acct_left ~= nil then
+                    l_help = l_help .. string.format('\n%d left on the account (max %d)',
+                        acct_left, LIMBUS_ACCOUNT_LIMIT);
+                end
+                if not known then
+                    l_help = l_help .. '\n\n[?] = the addon was installed mid-week and cannot know'
+                          .. '\nwhat you already took. Correct it in Settings, or it will'
+                          .. '\nsort itself out at the next weekly reset.';
+                end
+                l_help = l_help .. (has_cosmo
+                    and '\n\nYou hold a Cosmo-Cleanse - head to Apollyon or Temenos.'
+                    or  ('\n\nTake a Cosmo-Cleanse from ' .. LIMBUS_NPC .. ' in Lower Jeuno.'));
+                l_help = l_help .. '\nA cleanse kept across the reset does not cost a run.';
+            end
+            help_marker(l_help);
+
+            local card_indent = 20 * ui.font_scale;
+            local card_col_name = col_task + card_indent;
+            local held_short, held_full, missing = {}, {}, {};
+            for _, card in ipairs(LIMBUS_CARDS) do
+                if ki_held(char_name, card.ki_id) then
+                    -- 'White Card' -> 'White', so all three still fit the column
+                    table.insert(held_short, (card.name:gsub(' Card$', '')));
+                    table.insert(held_full, card.name .. ' - ' .. card.location);
                 else
-                    dyn_note = ' (account)';
+                    table.insert(missing, card.name);
                 end
             end
-            imgui.TextColored({ 0.6, 0.8, 1.0, 1.0 }, entries .. ' left' .. dyn_note);
+
+            imgui.SetCursorPosX(card_indent);
+            if #held_short > 0 then
+                imgui.TextColored({ 0.0, 1.0, 0.0, 1.0 }, '[KI]');
+            else
+                imgui.TextColored({ 0.5, 0.5, 0.5, 1.0 }, '[  ]');
+            end
+            imgui.SameLine();
+            imgui.SetCursorPosX(card_col_name);
+            imgui.TextColored({ 1.0, 1.0, 1.0, 1.0 },
+                string.format('Cards %d/%d', #held_short, #LIMBUS_CARDS));
+            if #held_short > 0 then
+                imgui.SameLine();
+                imgui.SetCursorPosX(col_location);
+                imgui.TextColored({ 0.0, 1.0, 0.0, 1.0 }, table.concat(held_short, ', '));
+            end
+
+            -- Held cards with where they came from, then the ones still to find
+            -- with where to look. Listing a missing card twice, once by name and
+            -- again with its location, just made the tooltip longer.
+            local need_full = {};
+            for _, card in ipairs(LIMBUS_CARDS) do
+                if not ki_held(char_name, card.ki_id) then
+                    table.insert(need_full, card.name .. ' - ' .. card.location);
+                end
+            end
+            local card_help = '';
+            if #held_full > 0 then
+                card_help = 'Holding:\n  ' .. table.concat(held_full, '\n  ');
+            end
+            if #need_full > 0 then
+                if card_help ~= '' then card_help = card_help .. '\n\n'; end
+                card_help = card_help .. 'Still needed:\n  ' .. table.concat(need_full, '\n  ');
+            end
+            help_marker(card_help);
         end
+
 
         for _, task in ipairs(tracker.settings.tasks) do
             -- Skip if not tracked for this character
@@ -2071,7 +3206,95 @@ local function render_ui()
 
         -- Timer column positions scaled with font
         local timer_col_name = 40 * ui.font_scale;
-        local timer_col_status = 170 * ui.font_scale;
+        local timer_col_status = 200 * ui.font_scale;
+
+        -- Assault tags belong here, not in Weeklies: they refill on a rolling
+        -- 24 hour clock rather than resetting with the week.
+        if tracking.timers[ASSAULT_ROW_LABEL] ~= false then
+            local carried = assault_holding_tag(char_name);
+            local stored, next_tag, max_stock = assault_state(char_data);
+            local ad_r = char_data.assault_data or {};
+            local a_icon, a_color, a_status, a_help;
+
+            if stored == nil then
+                a_icon = ' ? '; a_color = { 1.0, 1.0, 0.0, 1.0 };
+                a_status = 'Unknown';
+                a_help = 'Talk to Rytaal once and the tag count will appear.\n'
+                      .. 'Carrying a tag: ' .. (carried and 'yes' or 'no');
+            else
+                a_icon = string.format('%d/%d', stored, max_stock);
+                if stored == 0 then a_color = { 1.0, 0.3, 0.3, 1.0 };
+                elseif stored == 1 then a_color = { 1.0, 1.0, 0.0, 1.0 };
+                else a_color = { 0.0, 1.0, 0.0, 1.0 }; end
+                a_status = (next_tag > 0) and format_time_short(next_tag - current_time) or 'full';
+                local ago = current_time - (ad_r.checked_at or 0);
+                a_help = string.format(
+                    'Waiting at Rytaal: %d / %d\nCarrying: %d      Total usable: %d\n%s\n'
+                 .. 'Last checked with Rytaal %s ago.\n'
+                 .. 'Counts refresh whenever you open Rytaal\'s menu.',
+                    stored, max_stock, carried and 1 or 0, stored + (carried and 1 or 0),
+                    next_tag > 0
+                        and ('Next tag in ' .. format_time_short(next_tag - current_time))
+                        or  'Stock is full - no clock running.',
+                    format_elapsed_short(ago));
+            end
+            if ad_r.rank then
+                a_help = a_help .. '\nRank: ' .. (MERCENARY_RANKS[ad_r.rank] or '?');
+            end
+            if type(ad_r.points) == 'table' then
+                local plist = {};
+                for aname, pv in pairs(ad_r.points) do
+                    table.insert(plist, string.format('%s %d', aname, pv));
+                end
+                table.sort(plist);
+                if #plist > 0 then a_help = a_help .. '\nPoints: ' .. table.concat(plist, ', '); end
+            end
+
+            imgui.TextColored(a_color, a_icon);
+            imgui.SameLine();
+            imgui.SetCursorPosX(timer_col_name);
+            imgui.Text(ASSAULT_ROW_SHORT);
+            imgui.SameLine();
+            imgui.SetCursorPosX(timer_col_status);
+            imgui.TextColored({ 0.4, 0.7, 0.9, 1.0 }, '(' .. a_status .. ')');
+            if a_help then help_marker(a_help); end
+
+            -- One sub-row, not two. A tag becomes orders the moment you pick a
+            -- mission, so you can never hold both - two lines meant one was
+            -- always empty.
+            local area = assault_active_area(char_name);
+            local sub_indent = 20 * ui.font_scale;
+            local sub_col_name = timer_col_name + sub_indent;
+            local rank_name = ad_r.rank and MERCENARY_RANKS[ad_r.rank] or nil;
+
+            imgui.SetCursorPosX(sub_indent);
+            if area ~= nil or carried then
+                imgui.TextColored({ 0.0, 1.0, 0.0, 1.0 }, '[KI]');
+            else
+                imgui.TextColored({ 0.5, 0.5, 0.5, 1.0 }, '[  ]');
+            end
+            imgui.SameLine();
+            imgui.SetCursorPosX(sub_col_name);
+            imgui.TextColored({ 1.0, 1.0, 1.0, 1.0 },
+                area or (carried and 'Carrying Tag' or 'No Tag'));
+            if area ~= nil and rank_name ~= nil then
+                imgui.SameLine();
+                imgui.SetCursorPosX(timer_col_status);
+                imgui.TextColored({ 0.4, 0.7, 0.9, 1.0 },
+                    '(' .. (MERCENARY_RANKS_SHORT[ad_r.rank] or '?') .. ')');
+            end
+            local pts = (area and type(ad_r.points) == 'table') and ad_r.points[area] or nil;
+            help_marker((area
+                    and ('On assault: ' .. (ASSAULT_AREA_FULL[area] or area)
+                         .. '\nOrders go back to Rytaal when you finish.')
+                    or  (carried
+                        and 'You are carrying an Imperial Army I.D. Tag.\nTrade it to a mission giver to start an assault.'
+                        or  'No tag and no assault. Pick a tag up from Rytaal.'))
+                .. (rank_name and ('\nRank: ' .. rank_name) or
+                    '\nRank shows after you talk to a mission giver.')
+                .. (pts and ('\nAssault points here: ' .. pts) or ''));
+        end
+
 
         for _, enm in ipairs(ENM_KEY_ITEMS) do
             -- Skip if not tracked for this character
@@ -2143,31 +3366,6 @@ local function render_ui()
                 help_marker(timer_help_text);
             end
             
-            -- Show Limbus cards as sub-items (only in floating window)
-            if enm.name == 'Limbus' then
-                local card_indent = 20 * ui.font_scale;
-                local card_col_name = timer_col_name + card_indent;
-                
-                for _, card in ipairs(LIMBUS_CARDS) do
-                    local has_card = tracker.kis[card.ki_id] == true;
-                    local card_icon, card_color;
-                    if has_card then
-                        card_icon = '[KI]';
-                        card_color = { 0.0, 1.0, 0.0, 1.0 };
-                    else
-                        card_icon = '[  ]';
-                        card_color = { 0.5, 0.5, 0.5, 1.0 };
-                    end
-                    
-                    imgui.SetCursorPosX(card_indent);
-                    imgui.TextColored(card_color, card_icon);
-                    imgui.SameLine();
-                    imgui.SetCursorPosX(card_col_name);
-                    imgui.TextColored({ 1.0, 1.0, 1.0, 1.0 }, card.name);
-                    help_marker(card.location);
-                end
-            end
-
             ::continue_timer::
         end
 
@@ -2181,14 +3379,14 @@ local function render_ui()
                 imgui.Text('Font Scale:');
                 imgui.SameLine();
                 if imgui.SmallButton('-##font') and ui.font_scale > 0.8 then
-                    ui.font_scale = ui.font_scale - 0.1;
+                    ui.font_scale = math.floor((ui.font_scale - 0.1) * 10 + 0.5) / 10;
                     save_display_settings();
                 end
                 imgui.SameLine();
                 imgui.Text(string.format('%.1f', ui.font_scale));
                 imgui.SameLine();
                 if imgui.SmallButton('+##font') and ui.font_scale < 2.0 then
-                    ui.font_scale = ui.font_scale + 0.1;
+                    ui.font_scale = math.floor((ui.font_scale + 0.1) * 10 + 0.5) / 10;
                     save_display_settings();
                 end
 
@@ -2202,6 +3400,13 @@ local function render_ui()
                 if imgui.Checkbox('Horizon: account-wide Dynamis entries', aw) then
                     tracker.settings.dynamis_account_wide = aw[1];
                     ui.pending_account_add = nil;
+                    -- Pools can be stale from a previous session; turning sharing
+                    -- back on has to re-derive them rather than trust old numbers.
+                    if aw[1] then
+                        for _, acct in ipairs(dynamis_accounts()) do
+                            recalc_account_from_members(acct);
+                        end
+                    end
                     save_settings();
                 end
 
@@ -2285,10 +3490,13 @@ local function render_ui()
                 draw_gradient_header('Display Task', imgui.GetContentRegionAvail(), 'Check to affect which tasks are displayed. All are actively tracked.');
 
                 -- Character selector for tracking settings (synchronized with Tasks tab)
-                local char_names = table.concat(ui.char_list, '\0') .. '\0';
+                if ui.char_list_combo == nil then
+                    ui.char_list_combo = table.concat(ui.char_list, '\0') .. '\0';
+                end
+                local char_names = ui.char_list_combo;
                 imgui.SetNextItemWidth(150 * ui.font_scale);
                 if imgui.Combo('##settings_char_select', ui.selected_char, char_names) then
-                    -- Character selection changed - will affect both tabs
+                    ui.selected_name = ui.char_list[ui.selected_char[1] + 1];
                 end
 
                 local settings_char = ui.char_list[ui.selected_char[1] + 1];
@@ -2298,6 +3506,18 @@ local function render_ui()
                     imgui.Spacing();
                     imgui.TextColored({ 0.7, 0.7, 0.7, 1.0 }, 'Weekly Tasks:');
                     imgui.Spacing();
+
+                    -- Dynamis is not one of tracker.settings.tasks, but it has a
+                    -- row in the Weeklies list so it gets its own toggle.
+                    imgui.Indent(2);
+                    for _, label in ipairs({ DYNAMIS_ROW_LABEL, LIMBUS_ROW_LABEL }) do
+                        local box = { tracking.tasks[label] ~= false };
+                        if imgui.Checkbox(label, box) then
+                            tracking.tasks[label] = box[1];
+                            save_display_settings();
+                        end
+                    end
+                    imgui.Unindent(2);
 
                     -- Weekly task checkboxes (show/hide only)
                     for _, task in ipairs(tracker.settings.tasks) do
@@ -2327,6 +3547,10 @@ local function render_ui()
                             local lbl = (n == 1) and '1 Run' or (tostring(n) .. ' Runs');
                             if imgui.RadioButton(lbl, entries == n) then
                                 set_store.entries_remaining = n;
+                                -- Mark it hand-set. The load handler re-derives
+                                -- pools from member usage, which silently undid
+                                -- this on the next reload.
+                                if set_shared then set_store.manual_override = true; end
                                 save_settings();
                             end
                         end
@@ -2343,6 +3567,11 @@ local function render_ui()
                                     local lbl = (n == 1) and '1 Run##own' or (tostring(n) .. ' Runs##own');
                                     if imgui.RadioButton(lbl, own == n) then
                                         cd_sel.dynamis_data.entries_remaining = n;
+                                        -- Refresh the pool now, rather than
+                                        -- leaving the account total stale until
+                                        -- the next load.
+                                        local acct = find_dynamis_account(settings_char);
+                                        if acct ~= nil then recalc_account_from_members(acct); end
                                         save_settings();
                                     end
                                 end
@@ -2353,10 +3582,61 @@ local function render_ui()
 
                     imgui.Spacing();
                     imgui.Spacing();
-                    imgui.TextColored({ 0.7, 0.7, 0.7, 1.0 }, 'Timers (ENM/Limbus):');
+
+                    -- Limbus override. The addon cannot see what was taken before
+                    -- it was installed, so this is how the real number gets in.
+                    local lim_store, lim_shared = get_limbus_store(settings_char);
+                    if lim_store ~= nil then
+                        local lim_cd = tracker.settings.characters[settings_char];
+                        if lim_cd.limbus_data == nil then lim_cd.limbus_data = new_limbus_data(); end
+                        if lim_shared then
+                            imgui.TextColored({ 0.7, 0.7, 0.7, 1.0 }, 'Limbus Run Count:  (account pool)');
+                            local av = lim_store.limbus_remaining or LIMBUS_ACCOUNT_LIMIT;
+                            imgui.Indent(2);
+                            for n = 0, LIMBUS_ACCOUNT_LIMIT do
+                                if n > 0 then imgui.SameLine(); end
+                                if imgui.RadioButton((n == 1 and '1 Run##lima' or (tostring(n) .. ' Runs##lima')), av == n) then
+                                    lim_store.limbus_remaining = n;
+                                    lim_store.limbus_seen = LIMBUS_ACCOUNT_LIMIT - n;
+                                    lim_store.limbus_known = true;
+                                    save_settings();
+                                end
+                            end
+                            imgui.Unindent(2);
+                            imgui.TextColored({ 0.7, 0.7, 0.7, 1.0 }, 'This character\'s own limit:');
+                        else
+                            imgui.TextColored({ 0.7, 0.7, 0.7, 1.0 }, 'Limbus Run Count:');
+                        end
+                        local ov = lim_cd.limbus_data.runs_remaining or LIMBUS_CHARACTER_LIMIT;
+                        imgui.Indent(2);
+                        for n = 0, LIMBUS_CHARACTER_LIMIT do
+                            if n > 0 then imgui.SameLine(); end
+                            if imgui.RadioButton((n == 1 and '1 Run##limc' or (tostring(n) .. ' Runs##limc')), ov == n) then
+                                lim_cd.limbus_data.runs_remaining = n;
+                                lim_cd.limbus_data.seen = LIMBUS_CHARACTER_LIMIT - n;
+                                lim_cd.limbus_data.known = true;
+                                save_settings();
+                            end
+                        end
+                        imgui.Unindent(2);
+                    end
+
+                    imgui.Spacing();
+                    imgui.Spacing();
+                    imgui.TextColored({ 0.7, 0.7, 0.7, 1.0 }, 'Timers (ENM):');
                     imgui.Spacing();
 
-                    -- Timer checkboxes (indented)
+                    -- Assault heads the Timers list, so its toggle heads this one.
+                    imgui.Indent(2);
+                    local asl_box = { tracking.timers[ASSAULT_ROW_LABEL] ~= false };
+                    if imgui.Checkbox(ASSAULT_ROW_LABEL, asl_box) then
+                        tracking.timers[ASSAULT_ROW_LABEL] = asl_box[1];
+                        save_display_settings();
+                    end
+                    imgui.Unindent(2);
+
+                    -- Timer checkboxes (indented). Limbus is a weekly now, so it
+                    -- is listed with the tasks above instead.
                     for _, enm in ipairs(ENM_KEY_ITEMS) do
                         imgui.Indent(2);
                         local checked = { tracking.timers[enm.name] or false };
@@ -2377,13 +3657,18 @@ local function render_ui()
         -- Pop font if we used PushFont
         if _useNewFont then
             imgui.PopFont();
+            ui.fonts_pushed = 0;
         end
+        imgui.PopStyleColor(2);   -- FrameBg, Border - held through the widgets
+        ui.style_colors = 0;
 
     else
         imgui.PopStyleColor(5);
         imgui.PopStyleVar(2);
+        ui.style_colors = 0; ui.style_vars = 0;
     end
     imgui.End();
+    ui.began = false;
 end
 
 local function show_all_chars()
@@ -2391,15 +3676,22 @@ local function show_all_chars()
     print_msg('=================');
     for char_name, char_data in pairs(tracker.settings.characters) do
         if char_name ~= nil and char_name ~= '' and char_name ~= 'Unknown' and string.len(char_name) > 0 then
+            -- Derive both halves from the same list. The numerator used to be
+            -- six hardcoded checks against a denominator of #tasks, so any save
+            -- with an extra or renamed task reported nonsense like "4/7".
             local completed_count = 0;
-            if char_data.quest_steps then
-                if char_data.quest_steps.highwind == 'done' then completed_count = completed_count + 1; end
-                if char_data.quest_steps.uninvited == 'done' then completed_count = completed_count + 1; end
-                if char_data.quest_steps.spicegals == 'done' then completed_count = completed_count + 1; end
-                if char_data.quest_steps.cookbook == 'done' then completed_count = completed_count + 1; end
+            for _, task in ipairs(tracker.settings.tasks) do
+                local n = normalize_task(task);
+                local done = false;
+                if n == 'ecowarrior' then
+                    done = (char_data.ecowarrior_data or {}).step == 'done';
+                elseif n == 'xsknife' then
+                    done = (char_data.xsknife_data or {}).step == 'done';
+                else
+                    done = (char_data.quest_steps or {})[n] == 'done';
+                end
+                if done then completed_count = completed_count + 1; end
             end
-            if char_data.ecowarrior_data and char_data.ecowarrior_data.step == 'done' then completed_count = completed_count + 1; end
-            if char_data.xsknife_data and char_data.xsknife_data.step == 'done' then completed_count = completed_count + 1; end
             local is_current = char_name == tracker.current_char and ' \30\110(current)\30\106' or '';
             print(string.format('\30\081[\30\082Homework\30\081]\30\106 %s: %d/%d completed%s', char_name, completed_count, #tracker.settings.tasks, is_current));
         end
@@ -2407,6 +3699,13 @@ local function show_all_chars()
 end
 
 local function show_char_details(char_name)
+    -- FFXI names are capitalised, but nobody types them that way.
+    if tracker.settings.characters[char_name] == nil then
+        local want = tostring(char_name):lower();
+        for name in pairs(tracker.settings.characters) do
+            if tostring(name):lower() == want then char_name = name; break; end
+        end
+    end
     if tracker.settings.characters[char_name] == nil then print_error('Character not found: ' .. char_name); return; end
     local char_data = tracker.settings.characters[char_name];
     local current_time = os.time();
@@ -2465,15 +3764,18 @@ ashita.events.register('load', 'load_cb', function()
     -- One-shot migration from legacy path (addon/settings) to config/addons/Homework
     migrate_legacy_settings();
     -- Try to remove the now-empty legacy dir (best-effort; only succeeds if empty)
-    local legacy_dir = get_legacy_dir();
-    if ashita.fs.exists(legacy_dir) then
-        os.remove(legacy_dir);
-    end
+    -- The old settings/ folder is left in place: os.remove cannot delete a
+    -- directory on the Windows CRT, so the call was doing nothing anyway.
     local dir = get_config_dir();
     if not ashita.fs.exists(dir) then
         ashita.fs.create_dir(dir);
     end
     local loaded_settings = load_settings();
+    -- Seed the defaults before the merge below, so a first run with no file on
+    -- disk gets the full list rather than the empty table the tracker starts with.
+    if #tracker.settings.tasks == 0 then
+        for _, t in ipairs(DEFAULT_TASKS) do table.insert(tracker.settings.tasks, t); end
+    end
     if loaded_settings ~= nil then
         tracker.settings = loaded_settings;
         if tracker.settings.characters == nil then tracker.settings.characters = {}; end
@@ -2567,6 +3869,8 @@ ashita.events.register('unload', 'unload_cb', function()
 end);
 
 ashita.events.register('text_in', 'text_in_cb', function(e)
+    -- Same reasoning as packet_in: an injected chat line is not evidence.
+    if e.injected then return; end
     local base_mode = bit.band(e.mode, 0xFF);
     -- Early exit for modes we don't care about (cheapest check first)
     if base_mode ~= 150 and base_mode ~= 9 and base_mode ~= 142 then return; end
@@ -2576,23 +3880,21 @@ ashita.events.register('text_in', 'text_in_cb', function(e)
     local message = e.message;
     local zone_id = get_zone_id();
     local char_data = get_char_data();
+    if char_data == nil then return; end
     
     -- Base mode 142: Highwind completion & Dynamis claim
     if base_mode == 142 then
-        if is_in_highwind_zone() and message:contains('Obtained 3000 gil') then
+        if is_in_highwind_zone() and message:find('Obtained 3000 gil', 1, true) then
             char_data.quest_steps.highwind = 'done';
             save_settings();
             print_success('Highwind complete!');
         end
-        -- Dynamis zone-claim detection (two-step: claim message then obtain confirmation)
+        -- Only this line means "you charged a glass". It arrives a beat before the
+        -- item does, so the flag is left standing for the 0x020 handler to consume.
+        -- Clearing it on the "Obtained:" line, as an earlier version did, killed it
+        -- before the packet could ever see it.
         if message:find('The time and destination for your foray into Dynamis has been recorded') then
             tracker.pending_dynamis_claim = os.time();
-        elseif message:find('Obtained: Perpetual hourglass') then
-            -- Deliberately does NOT count here. A live capture shows the server
-            -- sends the charged glass in a 0x020 packet about a second AFTER this
-            -- message, so the inventory is still empty at this point. The 0x020
-            -- handler carries the Extra bytes and does the counting.
-            tracker.pending_dynamis_claim = nil;
         end
         return;
     end
@@ -2604,7 +3906,9 @@ ashita.events.register('text_in', 'text_in_cb', function(e)
             local eco_data = char_data.ecowarrior_data;
             local locked = {};
             if message:find('Windurst Consulate') then table.insert(locked, 'windurst'); end
-            if message:find("San d'Oria Consulate") or message:find("San d\'Oria Consulate") then table.insert(locked, 'sandoria'); end
+            -- \' and ' are the same string in Lua, so the old second test was a
+            -- no-op copy of the first.
+            if message:find("San d'Oria Consulate", 1, true) then table.insert(locked, 'sandoria'); end
             if message:find('Bastok Consulate') then table.insert(locked, 'bastok'); end
             if #locked > 0 then
                 eco_data.locked_nations = locked;
@@ -2634,7 +3938,8 @@ ashita.events.register('text_in', 'text_in_cb', function(e)
     -- Base mode 150: NPC dialogue
     -- CookBook quest start (Jonette in Tavnazian Safehold)
     if zone_id == 26 and message:find('The information you have brought me on Tavnazian cuisine') then
-        if char_data.quest_steps.cookbook == 'jonette' or char_data.quest_steps.cookbook == 'unknown' then
+        if char_data.quest_steps.cookbook == 'jonette' or char_data.quest_steps.cookbook == 'unknown'
+           or char_data.quest_steps.cookbook == 'scanned' then
             char_data.quest_steps.cookbook = 'sacrarium';
             save_settings();
             print_success('CookBook started - Head to ??? in Sacrarium!');
@@ -2649,7 +3954,7 @@ ashita.events.register('text_in', 'text_in_cb', function(e)
         end
     end
     -- EcoWarrior quest acceptance San d'Oria (Norejaie in Southern San d'Oria)
-    if zone_id == 230 and (message:find("Rojaireaut, our V.E.R.M.I.N. agent") or message:find("I knew you'd come through for us")) then
+    if zone_id == 230 and (message:find("Rojaireaut, our V.E.R.M.I.N. agent", 1, true) or message:find("I knew you'd come through for us")) then
         local eco_data = char_data.ecowarrior_data;
         if eco_data.step == 'ready' or eco_data.step == 'scanned' or eco_data.step == 'unknown' then
             eco_data.step = 'field_agent'; eco_data.current_nation = 'sandoria';
@@ -2669,7 +3974,7 @@ ashita.events.register('text_in', 'text_in_cb', function(e)
         end
     end
     -- EcoWarrior quest acceptance Bastok (Raifa in Port Bastok)
-    if zone_id == 236 and message:find("Degga, one of our V.E.R.M.I.N.") then
+    if zone_id == 236 and message:find("Degga, one of our V.E.R.M.I.N.", 1, true) then
         local eco_data = char_data.ecowarrior_data;
         if eco_data.step == 'ready' or eco_data.step == 'scanned' or eco_data.step == 'unknown' then
             eco_data.step = 'field_agent'; eco_data.current_nation = 'bastok';
@@ -2763,12 +4068,21 @@ ashita.events.register('text_in', 'text_in_cb', function(e)
 end);
 
 ashita.events.register('packet_in', 'packet_in_cb', function(e)
+    -- Every counter in this addon exists to record something that really
+    -- happened. A packet injected by another addon did not happen, so it must
+    -- never reach the gain/loss handlers or spend a Dynamis or Limbus entry.
+    if e.injected then return; end
     local id = e.id;
     local data = e.data;
     -- Logout packet
     if id == 0x000B then
+        if data == nil or #data < 0x08 then return; end
         local logout_state = struct.unpack('I', data, 0x04 + 1);
         if logout_state == 1 then
+            -- Flush first: the ki_cache mirror only happens inside save_settings
+            -- while kis_initialized is true, so wiping before saving could lose
+            -- whatever changed since the last write.
+            save_settings();
             tracker.current_char = 'Unknown';
             tracker.next_check_time = 0;
             tracker.login_state.waiting_for_login = true;
@@ -2778,7 +4092,6 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
         end
         return;
     end
-    -- Login packet (also received on zone-in)
     -- A charged hourglass arriving. This is the real "you broke a glass" moment:
     -- the chat message fires about a second BEFORE the server sends the item, so
     -- searching the inventory when the text lands finds nothing. The packet
@@ -2793,12 +4106,42 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
                     return data:sub(ITEM_PACKET_EXTRA_OFFSET, ITEM_PACKET_EXTRA_OFFSET + 27);
                 end);
                 if ok_ex then
-                    local serial = glass_serial_from_extra(extra);
+                    local serial, glass_zone = glass_serial_from_extra(extra);
+                    -- An hourglass can reach your bag two ways: you charged one, or
+                    -- somebody traded you theirs. They look identical in this packet,
+                    -- so the chat line is what tells them apart. A traded glass is
+                    -- left alone here and counts when you actually walk in.
+                    local was_break = tracker.pending_dynamis_claim ~= nil
+                        and (os.time() - tracker.pending_dynamis_claim) <= DYNAMIS_BREAK_WINDOW;
+                    -- Only consume the flag when this packet really was a
+                    -- charged glass. An unparsable hourglass landing inside the
+                    -- five second window used to eat the flag, so the real break
+                    -- that followed was misread as a trade.
+                    if serial == nil then return; end
+                    local store = get_dynamis_store(tracker.current_char);
+                    -- Race, documented rather than papered over: a glass traded
+                    -- to you inside the five second window is just as parsable
+                    -- as your own, and nothing in the packet distinguishes them.
+                    -- Whichever arrives first consumes the flag. Copies of one
+                    -- glass share Extra bytes, so an identical serial is the
+                    -- same break and can be ignored; a different one inside the
+                    -- window is genuinely ambiguous and gets treated as the
+                    -- break, which is the safer of the two guesses.
+                    if store ~= nil and store.last_break_serial == serial then return; end
+                    tracker.pending_dynamis_claim = nil;
+                    if not was_break then return; end
                     if serial ~= nil then
-                        local store = get_dynamis_store(tracker.current_char);
                         if store ~= nil and not glass_already_counted(store, serial) then
                             get_char_data();
                             store.claimed_at = os.time();
+                            -- Record what this glass was booked for. Walking into
+                            -- that same zone shortly after is this run arriving,
+                            -- not a second entry - and the serial check alone is
+                            -- not enough, because reading the glass back out of
+                            -- the inventory at zone-in has proven unreliable.
+                            store.last_break_zone = glass_zone;
+                            store.last_break_time = os.time();
+                            store.last_break_serial = serial;
                             count_dynamis_entry(store, serial, 'glass broken - counted');
                         end
                     end
@@ -2808,11 +4151,91 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
         return;
     end
 
+    -- Rytaal's tag counter. Opening the menu is enough - no need to take a tag.
+    -- This is the only moment the server tells us how many tags are in stock.
+    if id == 0x0034 then
+        if tracker.current_char ~= nil and tracker.current_char ~= 'Unknown' then
+            pcall(function()
+                if #data < MENU_OFFSET_MENU_ID + 2 then return; end
+                local menu_id = struct.unpack('H', data, MENU_OFFSET_MENU_ID + 1);
+
+                -- One of the five mission givers: their menu carries the
+                -- mercenary rank and that area's assault points.
+                local giver_area = MISSION_GIVER_MENUS[menu_id];
+                if giver_area ~= nil then
+                    local rank   = struct.unpack('L', data, MENU_PARAM_RANK + 1);
+                    local points = struct.unpack('L', data, MENU_PARAM_POINTS + 1);
+                    local cd = get_char_data();
+                    if cd == nil then return; end
+                    if cd.assault_data == nil then cd.assault_data = new_assault_data(); end
+                    local a = cd.assault_data;
+                    local changed = false;
+                    if rank ~= nil and rank >= 1 and rank <= 11 then
+                        if a.rank ~= rank then changed = true; end
+                        a.rank = rank;
+                        a.rank_seen_at = os.time();
+                    end
+                    if points ~= nil and points < 1000000 then
+                        if type(a.points) ~= 'table' then a.points = {}; end
+                        if a.points[giver_area] ~= points then
+                            a.points[giver_area] = points;
+                            changed = true;
+                        end
+                    end
+                    -- Opening a mission giver's menu usually changes nothing, and
+                    -- a full serialise per menu open just feeds the save spam.
+                    if changed then save_settings(); end
+                    return;
+                end
+
+                if menu_id ~= RYTAAL_MENU_ID then return; end
+
+                local stock  = struct.unpack('L', data, MENU_PARAM_TAG_STOCK + 1);
+                local mission = struct.unpack('L', data, MENU_PARAM_ASSAULT + 1);
+                local anchor = struct.unpack('L', data, MENU_PARAM_TAG_TIME + 1);
+                if stock == nil or stock > 16 then return; end   -- sanity guard
+
+                local char_data = get_char_data();
+                if char_data == nil then return; end
+                if char_data.assault_data == nil then char_data.assault_data = new_assault_data(); end
+                local ad = char_data.assault_data;
+
+                ad.tags_stored     = stock;
+                ad.checked_at      = os.time();
+                ad.current_assault = mission or 0;
+                -- The cap is never sent, so infer it upward if we ever see more
+                -- than the default. It can legitimately be 4.
+                if stock > (ad.max_stock or ASSAULT_DEFAULT_MAX_STOCK) then ad.max_stock = stock; end
+                -- anchor == 0 means the stock is full and no timer is running.
+                -- The anchor field can hold a stale value while the stock is
+                -- full - seen in a live capture where Rytaal had all 3 and still
+                -- reported a countdown from an earlier cycle. A full stock has no
+                -- clock running, so ignore it.
+                if stock >= (ad.max_stock or ASSAULT_DEFAULT_MAX_STOCK) then
+                    ad.next_tag_time = 0;
+                elseif anchor ~= nil and anchor > 0 then
+                    ad.next_tag_time = anchor + ASSAULT_TAG_EPOCH;
+                else
+                    ad.next_tag_time = 0;
+                end
+                save_settings();
+            end);
+        end
+        return;
+    end
+
     if id == 0x000A then
+        if data == nil or #data < 0x94 then return; end
         -- Get zone ID from packet
         local zone_id = struct.unpack('H', data, 0x30 + 1) or 0;
         
-        -- Check if this is a Dynamis zone
+        -- Check if this is a Dynamis zone.
+        -- ORDERING IS LOAD-BEARING: on a fresh login current_char is still
+        -- 'Unknown' here, because the waiting_for_login branch further down is
+        -- what sets it. The store lookup therefore returns nil and a relog
+        -- straight into Dynamis is not counted. That is the safer default - a
+        -- relog is not a new entry - but it is a consequence of ordering, so do
+        -- not reorder these two blocks without re-testing that case.
         if DYNAMIS_ZONES[zone_id] then
             get_char_data();
             local store = get_dynamis_store(tracker.current_char);
@@ -2821,15 +4244,36 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
                 -- ourselves was already counted, so walking in changes nothing. A
                 -- glass someone else broke - same zone or not - is a new serial and
                 -- counts here.
-                local serial = find_glass_serial(zone_id);
-                if serial == nil then
-                    -- Could not read a serial (no glass in the bag, or unreadable
-                    -- Extra bytes). Fall back to counting each Dynamis zone once per
-                    -- week so an entry is never silently missed.
-                    serial = 'zone-' .. tostring(zone_id);
-                end
-                if not glass_already_counted(store, serial) then
-                    count_dynamis_entry(store, serial, 'entry counted');
+                -- Arriving in the zone we just broke a glass for is that run
+                -- starting, so it must not count again. An hourglass is only good
+                -- for an hour, so anything older than that is a genuinely new run
+                -- into the same zone.
+                local since_break = os.time() - (store.last_break_time or 0);
+                if store.last_break_zone == zone_id and since_break <= DYNAMIS_GLASS_LIFETIME then
+                    -- already counted when the glass was broken
+                else
+                    local serial = find_glass_serial(zone_id);
+                    if serial == nil then
+                        -- No readable glass. A bare 'zone-N' key swallowed a
+                        -- second legitimate run into the same zone; a fixed hour
+                        -- bucket split one run across a boundary (relog at :59
+                        -- then :01 produced two keys). Instead reuse the key
+                        -- this store already holds for this zone if it is still
+                        -- inside the hourglass lifetime.
+                        local now = os.time();
+                        local prefix = 'zone-' .. tostring(zone_id) .. '-';
+                        for _, sn in ipairs(store.counted_glasses or {}) do
+                            local stamp = tostring(sn):match('^' .. prefix .. '(%d+)$');
+                            if stamp ~= nil and (now - tonumber(stamp)) <= DYNAMIS_GLASS_LIFETIME then
+                                serial = sn;
+                                break;
+                            end
+                        end
+                        if serial == nil then serial = prefix .. tostring(now); end
+                    end
+                    if not glass_already_counted(store, serial) then
+                        count_dynamis_entry(store, serial, 'entry counted');
+                    end
                 end
             end
         end
@@ -2843,50 +4287,78 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
             local raw_name = data:sub(name_offset, name_offset + 15);
             local current_char = raw_name:match("^[%w]+") or 'Unknown';
             if current_char ~= 'Unknown' and current_char ~= '' then
+                -- on_character_change already announces this; a second message
+                -- here meant two lines for one event.
                 on_character_change(current_char);
-                print_success('Character loaded: ' .. current_char);
                 tracker.login_state.waiting_for_ki = true;
                 tracker.login_state.ki_packets_received = 0;
+                -- Also zero this: a stale count of 7 carried over from the
+                -- previous session let the timeout backstop treat a genuinely
+                -- partial table as a complete baseline.
+                tracker.login_state.blocks_this_zone = 0;
                 tracker.login_state.suppress_ki_events = true;
+                tracker.login_state.suppress_started = os.time();
             end
         else
             -- Zone-in (not a fresh login) - suppress KI events until packets stabilize
             tracker.login_state.suppress_ki_events = true;
+            tracker.login_state.suppress_started = os.time();
             tracker.login_state.ki_packets_received = 0;
+            tracker.login_state.blocks_this_zone = 0;
         end
         return;
     end
     -- Key Item packet
     if id == 0x0055 then
+        if data == nil or #data < 0x85 then return; end
+        -- Identifies this packet, so on_ki_gained can tell whether the tag it is
+        -- looking at arrived alongside the orders that just vanished.
+        ASSAULT_KI_PACKET_SEQ = ASSAULT_KI_PACKET_SEQ + 1;
         local ki_table_type = struct.unpack('B', data, 0x84 + 1);
+        -- Seven blocks of 512 ids is the whole space; anything else is junk and
+        -- would write nonsense positions into tracker.kis.
+        if ki_table_type == nil or ki_table_type > 6 then return; end
         local offset = ki_table_type * 512;
-        for i = 0, 511 do
-            local ki_position = i + offset;
-            local byte_index = math.floor(i / 8);
-            local bit_index = i % 8;
+        local suppressed = tracker.login_state.suppress_ki_events;
+        local kis = tracker.kis;
+        -- 64 bytes, 8 bits each. The old loop re-read the same byte once per bit,
+        -- so 512 unpacks per packet and seven packets per zone.
+        for byte_index = 0, 63 do
             local ki_byte = struct.unpack('B', data, 0x04 + byte_index + 1);
-            local has_ki = bit.band(bit.rshift(ki_byte, bit_index), 1) == 1;
-            -- Only trigger events if not suppressed (zone-in/login in progress)
-            if not tracker.login_state.suppress_ki_events then
-                if (tracker.kis[ki_position] ~= nil) and (has_ki ~= tracker.kis[ki_position]) then
-                    if has_ki then on_ki_gained(ki_position); else on_ki_lost(ki_position); end
+            if ki_byte ~= nil then
+                local base = offset + byte_index * 8;
+                for bit_index = 0, 7 do
+                    local ki_position = base + bit_index;
+                    local has_ki = bit.band(bit.rshift(ki_byte, bit_index), 1) == 1;
+                    local was = kis[ki_position];
+                    if (not suppressed) and was ~= nil and has_ki ~= was then
+                        if has_ki then on_ki_gained(ki_position); else on_ki_lost(ki_position); end
+                    end
+                    kis[ki_position] = has_ki;
                 end
             end
-            tracker.kis[ki_position] = has_ki;
         end
-        -- Track packets received during login/zone
+        -- Only count while a zone-in rebaseline is actually running. Ordinary
+        -- mid-session key item changes also arrive as 0x055, and after seven of
+        -- them this branch used to fire spuriously - a pointless scan and save.
+        if not (tracker.login_state.suppress_ki_events or tracker.login_state.waiting_for_ki) then
+            return;
+        end
         tracker.login_state.ki_packets_received = tracker.login_state.ki_packets_received + 1;
+        tracker.login_state.blocks_this_zone = (tracker.login_state.blocks_this_zone or 0) + 1;
         if tracker.login_state.ki_packets_received >= 7 then
             -- All KI packets received - clear suppression and update state
             tracker.login_state.suppress_ki_events = false;
             tracker.login_state.ki_packets_received = 0;
             tracker.kis_initialized = true;
-            if tracker.login_state.waiting_for_ki then
-                tracker.login_state.waiting_for_ki = false;
-                local char_data = get_char_data();
-                if char_data ~= nil then
-                    scan_key_items(true);
-                end
+            tracker.login_state.waiting_for_ki = false;
+            -- Reconcile after EVERY rebaseline, not just the first. Key items
+            -- consumed as part of zoning never fire on_ki_lost, because events
+            -- are suppressed while the baseline is being rebuilt - so has_ki
+            -- would quietly go stale until a manual /hw scan.
+            local char_data = get_char_data();
+            if char_data ~= nil then
+                scan_key_items(true);
             end
         end
         return;
@@ -2899,13 +4371,61 @@ end);
 -- "do I still hold a glass" flag.
 
 ashita.events.register('d3d_present', 'd3d_present_cb', function()
-    -- Render UI (always, imgui handles visibility)
-    render_ui();
+    -- Render UI (always, imgui handles visibility). Wrapped because a malformed
+    -- save would otherwise throw on every single frame.
+    if not ui.render_failed then
+        -- Count what render_ui pushes so the stack can be unwound if it throws.
+        -- Ashita shares one ImGui context across all addons: an unbalanced stack
+        -- from one bad frame corrupts every other addon until the game restarts.
+        ui.style_colors = 0;
+        ui.style_vars = 0;
+        ui.fonts_pushed = 0;
+        local ok, err = pcall(render_ui);
+        if not ok then
+            pcall(function()
+                if ui.fonts_pushed > 0 then imgui.PopFont(); end
+                if ui.style_vars > 0 then imgui.PopStyleVar(ui.style_vars); end
+                if ui.style_colors > 0 then imgui.PopStyleColor(ui.style_colors); end
+                -- Only End a window that was actually Begun: a throw before
+                -- Begin would otherwise leave an unmatched End, which is its own
+                -- stack violation in a context shared with every other addon.
+                if ui.began then imgui.End(); end
+                ui.began = false;
+            end);
+        end
+        if not ok then
+            ui.render_failed = true;
+            print_error('Display error, window hidden: ' .. tostring(err));
+            print_msg('Your tracking data is safe. Use /hw show to try again.');
+        end
+    end
     
     -- Throttled checks
     local current_time = os.time();
-    if current_time - tracker.last_render_time < tracker.render_interval then return; end
-    tracker.last_render_time = current_time;
+    if current_time - tracker.last_check_time < tracker.check_interval then return; end
+    tracker.last_check_time = current_time;
+
+    -- Safety net: suppression is normally lifted by the 7th key item packet, but
+    -- if a zone ever delivers fewer the addon would go deaf for the rest of the
+    -- session. Clear it on a timer instead of trusting the count alone.
+    if tracker.login_state.suppress_ki_events
+       and (current_time - (tracker.login_state.suppress_started or 0)) > KI_SUPPRESS_TIMEOUT then
+        tracker.login_state.suppress_ki_events = false;
+        tracker.login_state.ki_packets_received = 0;
+        -- Also clear this: leaving it set meant the packet counter kept
+        -- incrementing on ordinary mid-session key item changes, and after seven
+        -- of them the rebaseline branch fired spuriously - exactly what the
+        -- "only count during a rebaseline" guard was added to stop.
+        tracker.login_state.waiting_for_ki = false;
+        -- Only trust the baseline if a full set of blocks actually arrived. A
+        -- partial one would let a later scan write "not held" across every key
+        -- item in the missing blocks.
+        if tracker.login_state.blocks_this_zone ~= nil
+           and tracker.login_state.blocks_this_zone >= 7
+           and next(tracker.kis) ~= nil then
+            tracker.kis_initialized = true;
+        end
+    end
     if tracker.next_check_time > 0 and current_time >= tracker.next_check_time then
         reset_tracker();
     end
@@ -2916,10 +4436,27 @@ ashita.events.register('command', 'command_cb', function(e)
     local args = command:args();
     if (#args == 0 or (args[1] ~= '/hw' and args[1] ~= '/homework' and args[1] ~= '/homeworks')) then return; end
     e.blocked = true;
+    -- Dispatch on a lowered copy so /hw Weeklys works. args[3] keeps its case,
+    -- since character names are matched separately.
+    if args[2] ~= nil then args[2] = args[2]:lower(); end
+    -- These need no character data, so let them run before the guard rather than
+    -- answering "not loaded yet" at the login screen. Bare /hw is #args == 1, so
+    -- args[2] is nil: the comment used to claim the toggle was exempt while the
+    -- test only ever matched named subcommands.
+    local no_char_needed = (#args == 1)
+        or args[2] == 'help' or args[2] == 'task' or args[2] == 'tasks'
+        or args[2] == 'show' or args[2] == 'hide';
+    if no_char_needed then
+        -- fall through to the handlers below with no character required
+    else
+        local probe = get_char_data();
+        if probe == nil then print_error('Character not loaded yet. Please wait...'); return; end
+    end
     local char_data = get_char_data();
-    if char_data == nil then print_error('Character not loaded yet. Please wait...'); return; end
     local current_time = os.time();
-    if char_data.last_reset > 0 and current_time >= calculate_next_reset(char_data.last_reset) then
+    if char_data == nil then char_data = { last_reset = 0 }; end
+    local reset_anchor = math.max(tonumber(char_data.last_reset) or 0, newest_last_reset());
+    if reset_anchor > 0 and current_time >= calculate_next_reset(reset_anchor) then
         reset_tracker();
     end
     if (#args == 1) then
@@ -2928,6 +4465,7 @@ ashita.events.register('command', 'command_cb', function(e)
             ui.is_open[1] = false;
         else
             update_char_list();
+            ui.render_failed = false;   -- retry after a display error
             ui.is_open[1] = true;
         end
         return;
@@ -2947,10 +4485,13 @@ ashita.events.register('command', 'command_cb', function(e)
         help_line('/hw <task>',       'Toggle a task complete');
         help_line('/hw task',         'List every task and its short forms');
         help_line('/hw eco',          'Toggle EcoWarrior done / undone');
-        help_line('/hw eco <nation>', 'Start EcoWarrior (sandy / basty / windy)');
+        help_line('/hw eco <nation>', 'Toggle a nation done (sandy / basty / windy)');
         print('');
+        help_line('/hw show',         'Open the window');
+        help_line('/hw hide',         'Close the window');
         help_line('/hw scan',         'Scan key items for this character');
         help_line('/hw reset',        'Factory reset (deletes everything)');
+        help_line('/hw yes / no',     'Confirm or cancel a pending reset');
         help_line('/hw help',         'Show this help');
         print('');
         print_msg('Also answers to \30\110/homework\30\106 and \30\110/homeworks\30\106.');
@@ -2958,6 +4499,7 @@ ashita.events.register('command', 'command_cb', function(e)
     end
     if (args[2] == 'show') then
         update_char_list();
+        ui.render_failed = false;   -- give a failed render another go
         ui.is_open[1] = true;
         return;
     end
@@ -3058,6 +4600,7 @@ ashita.events.register('command', 'command_cb', function(e)
         if nation == nil then print_error('Invalid nation. Use: sandy, basty, or windy'); return; end
         local is_locked = false;
         local lock_index = nil;
+        if type(eco_data.locked_nations) ~= 'table' then eco_data.locked_nations = {}; end
         for i, n in ipairs(eco_data.locked_nations) do if n == nation then is_locked = true; lock_index = i; break; end end
         if is_locked then table.remove(eco_data.locked_nations, lock_index); print_success('Unlocked ' .. nation .. ' for EcoWarrior');
         else table.insert(eco_data.locked_nations, nation); print_success('Marked ' .. nation .. ' as completed for EcoWarrior'); end
