@@ -5,7 +5,7 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-addon.version   = '3.6';
+addon.version   = '3.7';
 addon.desc      = 'Weekly homework tracker for FFXI';
 addon.link      = '';
 
@@ -391,6 +391,7 @@ local tracker = {
     -- 3 states: nil = unknown, true = has KI, false = doesn't have KI
     kis = {},  -- [ki_id] = true/false/nil, populated from packets or memory
     kis_initialized = false,  -- Don't trigger gain/loss on initial population
+    isnm_observed_since = nil, -- When continuous KI observation of this login began
     -- Frame throttle for render
     -- These throttle the periodic reset/suppression checks, NOT rendering -
     -- render_ui runs every frame regardless.
@@ -446,6 +447,11 @@ local ENM_KEY_ITEMS = {
     { name = 'Boneyard Gully', ki_id = 678, ki_name = 'Miasma Filter', cooldown = 120 * 3600 },
     { name = 'Bearclaw Pinnacle', ki_id = 677, ki_name = 'Zephyr Fan', cooldown = 120 * 3600 },
     { name = 'Mine Shaft #2716', ki_id = 676, ki_name = 'Shaft #2716 Operating Lever', cooldown = 120 * 3600 },
+    -- Same zone, SEPARATE key item and separate cooldown (LSB: charVar
+    -- [ENM]GateDial vs [ENM]OperatingLever, both from Twinkbrix). The Lever
+    -- opens Bionic Bug; the Dial opens BOTH Pulling the Strings and
+    -- Automaton Assault - one timer, two possible fights.
+    { name = 'Mine Shaft (Dial)', ki_id = 707, ki_name = 'Shaft Gate Operating Dial', cooldown = 120 * 3600 },
     { name = 'Spire of Vahzl', ki_id = 673, ki_name = 'Censer of Acrimony', cooldown = 120 * 3600 },
     { name = 'Monarch Linn', ki_id = 674, ki_name = 'Monarch Beard', cooldown = 120 * 3600 },
     { name = 'The Shrouded Maw', ki_id = 675, ki_name = 'Astral Covenant', cooldown = 120 * 3600 },
@@ -516,15 +522,171 @@ local MENU_PARAM_TAG_TIME  = 0x18;   -- u32, restock anchor
 local ASSAULT_TAG_PERIOD = 24 * 3600;
 
 -- allTagsTimeCS + this = unix time of the next tag.
--- PROVISIONAL: calibrated from a single capture (allTagsTimeCS 776652833 against
--- Rytaal saying 2026-08-13 18:53:53 local). That is LandSandBoat's
--- VANADIEL_EPOCH plus exactly 2 days and the offset is not yet explained, so the
--- countdown is the least trustworthy part of this feature.
+-- Calibrated against live behaviour on THIS server (2026-08-24): a tag drawn
+-- Aug 20 22:03:42 regenerated on the same clock time days later, and the
+-- countdown built from this constant matched to the minute. This is
+-- LandSandBoat's VANADIEL_EPOCH plus exactly 2 days; this server's custom
+-- account pool evidently reports its anchor differently than stock LSB, so
+-- the live calibration wins over the source reading. Do not "correct" this
+-- from LSB again without a live capture proving it wrong.
 local ASSAULT_TAG_EPOCH = 1009983600;
 
--- Rytaal stocks 3, or 4 for a Second Lieutenant who has cleared every assault.
+-- Rytaal stocks 3, or 4 for a Second Lieutenant who has cleared every assault
+-- (LandSandBoat getMaxTagStock: rank plus every mission complete, with a
+-- one-time bonus tag on first qualifying).
 -- The packet never states the cap, so start at 3 and raise it if we see more.
 local ASSAULT_DEFAULT_MAX_STOCK = 3;
+
+-- ===== ISNM =====
+-- Imperial Standing NM battlefields. Two key items sold by Shajaf in Whitegate
+-- (LandSandBoat scripts/zones/Aht_Urhgan_Whitegate/npcs/Shajaf.lua):
+--   807 CONFIDENTIAL_IMPERIAL_ORDER - 2000 credits, the level 60 fights
+--   808 SECRET_IMPERIAL_ORDER      - 3000 credits, the uncapped fights
+-- Buying either sets charVar [ISNM]Accepted until JST midnight, so the daily
+-- lock is shared between the two tiers and sits on BUYING, never on using.
+-- The key item itself never expires (the script's own TODO admits expiry is
+-- unimplemented), so holding an order across the reset and fighting twice back
+-- to back is legal. Only the player who opens the battlefield loses the order
+-- (requiredKeyItems onlyInitiator = true in the battlefield scripts).
+local ISNM_CONFIDENTIAL_KI = 807;
+local ISNM_SECRET_KI       = 808;
+
+-- Shajaf's menus, verified against a live capture (menu 160 carrying the
+-- player's standing as its first param). Which menu OPENS is the state:
+--   160 can buy   161 already holding   162 no Wildcat Badge   163 locked today
+-- Small menu ids repeat across zones, so these are gated on the zone id that
+-- rides in the same packet.
+local ISNM_SHAJAF_ZONE   = 50;    -- Aht Urhgan Whitegate
+local ISNM_MENU_CAN_BUY  = 160;
+local ISNM_MENU_HOLDING  = 161;
+local ISNM_MENU_NO_BADGE = 162;
+local ISNM_MENU_LOCKED   = 163;
+local MENU_OFFSET_ZONE   = 0x2A;  -- u16 zone id inside the 0x034 packet
+
+-- Shajaf's lock expires at Japanese midnight: JST is UTC+9 with no daylight
+-- saving, so the reset is a fixed 15:00 UTC every day.
+local function next_jst_midnight(now)
+    local into_day = (now + 9 * 3600) % 86400;
+    return now + (86400 - into_day);
+end
+
+local function isnm_data_for(cd)
+    if cd == nil then return nil; end
+    if type(cd.isnm_data) ~= 'table' then cd.isnm_data = {}; end
+    return cd.isnm_data;
+end
+
+-- ===== Ashu Talif weekly chain =====
+-- Three quests from Halshaob in Nashmau, fought aboard The Ashu Talif
+-- (zone 60): 101 Scouting, 102 Royal Painter Escort, 103 Targeting the
+-- Captain. Everything here reads the client quest log (packet 0x056):
+-- chunk 0x0080 carries the ToAU ACTIVE bits, chunk 0x00C0 the COMPLETED
+-- bits, and the bit index IS the quest id - verified live 2026-08-24/25,
+-- three wins captured to the second. Server rules, all observed:
+--   pay -> active bit on. Board -> Cutter menu, zone 60.
+--   Win -> completed bit on (while still aboard). Fail -> week is burned.
+--   The Ephramadian gold coin (KI 786) is a ONE-TIME first-clear grant:
+--   repeat weeks hand out no key item at all, so nothing here may ever
+--   depend on it.
+--   Weekly tally clears COMPLETED bits but a paid, unfought stage stays
+--   active across the reset (a party member banked one and used it).
+-- One table, not seven locals: render_ui lives at the 60-upvalue limit.
+local ASHU = {
+    SHIP_ZONE = 60,
+    FIRST = 101,
+    LAST  = 103,
+    NAMES = { [101] = 'Scouting', [102] = 'Painter', [103] = 'Captain' },
+    ROW_LABEL = 'Ashu Talif',
+};
+
+function ASHU.data_for(cd)
+    if cd == nil then return nil; end
+    if type(cd.ashu_data) ~= 'table' then cd.ashu_data = {}; end
+    local a = cd.ashu_data;
+    if type(a.active) ~= 'table' then a.active = {}; end
+    if type(a.completed) ~= 'table' then a.completed = {}; end
+    return a;
+end
+
+-- The chain's state for display. Returns fights_left (nil = never seen a
+-- quest-log packet), the stage to act on, and the data table.
+--
+-- CONFIRMED 2026-08-25: the COMPLETED bits are permanent - they never
+-- clear at the tally. A completion has no date, so those bits can never
+-- prove anything about THIS week and are deliberately not counted at
+-- all (they stay mirrored only as a redundant win signal while aboard).
+-- What counts is only what the addon observed:
+--   1. a.wins - the ACTIVE bit dropping while aboard. Works every week.
+--   2. the active stage id - Painter active means Scouting fell first.
+-- A character with no observations this week is UNSYNCED, shown [?],
+-- until a payment appears or a weekly reset passes. Witnessing a reset
+-- sets the explicit a.anchored flag - an explicit flag, NOT "does some
+-- table exist", because the sanitizer creates empty tables and made
+-- every character look anchored.
+function ASHU.state(cd)
+    local a = cd and cd.ashu_data or nil;
+    if a == nil or a.known ~= true then return nil; end
+    local stage = nil;
+    for q = ASHU.FIRST, ASHU.LAST do
+        if a.active[tostring(q)] then stage = q; break; end
+    end
+    local anchored = a.anchored == true
+        or (a.wins or 0) > 0 or stage ~= nil or a.failed == true;
+    if not anchored then return nil, nil, a; end
+    local done = a.wins or 0;
+    if stage ~= nil and (stage - ASHU.FIRST) > done then
+        done = stage - ASHU.FIRST;
+    end
+    if done > 3 then done = 3; end
+    return 3 - done, stage, a;
+end
+
+-- An unknown buy lock resolves itself at the reset IF the addon provably
+-- watched the reset pass: a purchase cannot happen without the key item event
+-- firing, so continuous observation from before JST midnight to after it is
+-- proof the character is unlocked. A character who logs in after the reset
+-- stays unknown - they may have bought earlier today with the addon off.
+local function resolve_isnm_unknown(cd, char_name)
+    if cd == nil or char_name ~= tracker.current_char then return; end
+    local isnm = cd.isnm_data;
+    if isnm == nil then return; end
+    local now = os.time();
+    if isnm.next_buy_time == nil then
+        local last_midnight = next_jst_midnight(now) - 86400;
+        -- A character who was last seen BEFORE the most recent reset is open:
+        -- offline characters cannot buy, so any lock they had has expired.
+        -- Only the install day itself stays unknown (no last_observed yet) -
+        -- they may have bought earlier that day before the addon existed.
+        if isnm.last_observed ~= nil and isnm.last_observed < last_midnight then
+            isnm.next_buy_time = last_midnight;
+            save_settings();
+        -- Or we watched the reset pass live this session: provably open.
+        elseif tracker.isnm_observed_since ~= nil
+            and tracker.isnm_observed_since <= last_midnight then
+            isnm.next_buy_time = last_midnight;
+            save_settings();
+        end
+    end
+    -- Updated in memory every call; it rides along with the next normal save.
+    isnm.last_observed = now;
+end
+
+-- Which order this character holds, if any. The live key item table is the
+-- truth for the logged-in character; alts fall back to their persisted cache.
+local function isnm_held_ki(char_name)
+    if char_name == tracker.current_char and tracker.kis_initialized then
+        if tracker.kis[ISNM_SECRET_KI] then return ISNM_SECRET_KI; end
+        if tracker.kis[ISNM_CONFIDENTIAL_KI] then return ISNM_CONFIDENTIAL_KI; end
+        return nil;
+    end
+    local cd = char_name and tracker.settings.characters[char_name] or nil;
+    if cd == nil or type(cd.ki_cache) ~= 'table' then return nil; end
+    for _, id in ipairs(cd.ki_cache) do
+        if id == ISNM_SECRET_KI then return ISNM_SECRET_KI; end
+        if id == ISNM_CONFIDENTIAL_KI then return ISNM_CONFIDENTIAL_KI; end
+    end
+    return nil;
+end
 
 -- Picking a mission makes key item 787 flicker off/on/off inside a single
 -- second, so a withdrawal is only believed if the previous one was longer ago
@@ -598,6 +760,7 @@ local MERCENARY_RANKS_SHORT = {
 
 -- Row labels, also the keys used by the show/hide checkboxes.
 local ASSAULT_ROW_LABEL = 'Assault Tags';   -- settings key and checkbox text
+local ISNM_ROW_LABEL    = 'ISNM';           -- settings key and checkbox text
 local ASSAULT_ROW_SHORT = 'Assault';        -- what the row itself shows
 local DYNAMIS_ROW_LABEL = 'Dynamis';
 local LIMBUS_ROW_LABEL  = 'Limbus';
@@ -683,16 +846,53 @@ local KI_SUPPRESS_TIMEOUT = 15;
 
 -- How long before the weekly reset a Dynamis claim still counts against the
 -- upcoming week's allowance.
--- A charged hourglass expires an hour after it is broken, so only a run
--- genuinely straddling the reset can spill into the new week. This was 24h,
--- which docked the new week an entry for any glass broken across the whole of
--- Sunday - an arbitrary overreach, not a server rule. Two hours is the glass
--- lifetime plus slack.
-local DYNAMIS_CLAIM_CARRY_WINDOW = 2 * 3600;
+-- Only a run genuinely straddling the reset can spill into the new week. This
+-- was 24h, which docked the new week an entry for any glass broken across the
+-- whole of Sunday - an arbitrary overreach, not a server rule. The glass
+-- lifetime (210 minutes with every extension) plus slack.
+local DYNAMIS_CLAIM_CARRY_WINDOW = 4 * 3600;
 
--- A charged hourglass expires an hour after it is broken, so a break older than
--- this cannot be the run you are now walking into.
-local DYNAMIS_GLASS_LIFETIME = 60 * 60;
+-- A charged hourglass starts with one hour, but kills inside the zone extend
+-- the run to a maximum of 210 minutes. The old value of one hour treated the
+-- back half of any extended run as a brand new one, so a job change or DC late
+-- in a run counted a second entry. A glass older than 210 minutes cannot
+-- belong to a live run no matter how many extensions it earned.
+local DYNAMIS_GLASS_LIFETIME = 210 * 60;
+
+-- The bag API is unreliable on this client (the same failure as HasKeyItem),
+-- so the 0x020 packet is the record of what we hold: every charged glass that
+-- lands in the bag - broken or traded - is remembered here, one per zone,
+-- newest wins. Stored on the character, not the account: the glass is a
+-- physical item in one character's bag.
+-- Defined after DYNAMIS_GLASS_LIFETIME on purpose - these close over the
+-- local, and this file has shipped a use-before-declaration twice already.
+local function remember_held_glass(cd, serial, zone_id)
+    if cd == nil or serial == nil or zone_id == nil then return; end
+    if cd.dynamis_data == nil then return; end
+    if type(cd.dynamis_data.held_glasses) ~= 'table' then
+        cd.dynamis_data.held_glasses = {};
+    end
+    -- The serial embeds the time the run was registered. Use that for the
+    -- lifetime test, not the packet arrival time: a traded copy can land in
+    -- the bag well into the run.
+    local born = tonumber(tostring(serial):match('%-(%d+)$')) or os.time();
+    -- Newest-born wins regardless of arrival order, so someone handing over a
+    -- dead spare later cannot shadow the live glass.
+    local prev = cd.dynamis_data.held_glasses[tostring(zone_id)];
+    if prev ~= nil and (prev.born or 0) > born then return; end
+    cd.dynamis_data.held_glasses[tostring(zone_id)] = { serial = serial, born = born };
+end
+
+-- The glass we hold for this zone, if it can still belong to a live run.
+-- Returns nil for a zone we hold nothing for, or only a dead glass for.
+local function held_glass_serial(cd, zone_id)
+    if cd == nil or cd.dynamis_data == nil or zone_id == nil then return nil; end
+    local hg = cd.dynamis_data.held_glasses;
+    local rec = hg ~= nil and hg[tostring(zone_id)] or nil;
+    if rec == nil or type(rec.serial) ~= 'string' then return nil; end
+    if (os.time() - (rec.born or 0)) > DYNAMIS_GLASS_LIFETIME then return nil; end
+    return rec.serial;
+end
 
 -- How long after the "time and destination recorded" message the glass may take
 -- to reach the bag and still be treated as your own break. Live captures show a
@@ -789,7 +989,9 @@ local function get_char_tracking(char_name)
         -- Dynamis and Assault are not entries in tracker.settings.tasks /
         -- ENM_KEY_ITEMS, but they get show/hide toggles of their own.
         display_settings.tracked[char_name].tasks[DYNAMIS_ROW_LABEL] = true;
+        display_settings.tracked[char_name].tasks[ASHU.ROW_LABEL] = true;
         display_settings.tracked[char_name].timers[ASSAULT_ROW_LABEL] = true;
+        display_settings.tracked[char_name].timers[ISNM_ROW_LABEL] = true;
         display_settings.tracked[char_name].tasks[LIMBUS_ROW_LABEL] = true;
     else
         -- For existing characters, only add NEW tasks/timers that don't exist yet
@@ -829,6 +1031,13 @@ local function get_char_tracking(char_name)
             end
         end
         tracking.tasks[ASSAULT_ROW_LABEL] = nil;
+
+        if tracking.timers[ISNM_ROW_LABEL] == nil then
+            tracking.timers[ISNM_ROW_LABEL] = true;
+        end
+        if tracking.tasks[ASHU.ROW_LABEL] == nil then
+            tracking.tasks[ASHU.ROW_LABEL] = true;
+        end
     end
 
     return display_settings.tracked[char_name];
@@ -947,6 +1156,53 @@ function sanitize_loaded_settings(st)
             if type(cd.dynamis_data.last_break_serial) ~= 'string' then
                 cd.dynamis_data.last_break_serial = nil;
             end
+            -- Glasses remembered from 0x020 packets, keyed by zone id as a
+            -- string. Drop anything malformed, and anything too old to belong
+            -- to a live run - 12 hours is generous without growing the file.
+            local hg = cd.dynamis_data.held_glasses;
+            local cleaned = {};
+            if type(hg) == 'table' then
+                for k, v in pairs(hg) do
+                    if type(k) == 'string' and type(v) == 'table'
+                       and type(v.serial) == 'string' then
+                        local born = num(v.born, 0, 0);
+                        if born > 0 and (os.time() - born) <= 12 * 3600 then
+                            cleaned[k] = { serial = v.serial, born = born };
+                        end
+                    end
+                end
+            end
+            cd.dynamis_data.held_glasses = cleaned;
+
+            cd.isnm_data = tbl(cd.isnm_data);
+            if cd.isnm_data.next_buy_time ~= nil then
+                cd.isnm_data.next_buy_time = num(cd.isnm_data.next_buy_time, nil, 0);
+            end
+            if cd.isnm_data.no_badge ~= true then cd.isnm_data.no_badge = nil; end
+            if cd.isnm_data.last_observed ~= nil then
+                cd.isnm_data.last_observed = num(cd.isnm_data.last_observed, nil, 0);
+            end
+            -- Ashu Talif chain: booleans keyed by quest id as a string.
+            cd.ashu_data = tbl(cd.ashu_data);
+            local ash = cd.ashu_data;
+            ash.known = ash.known == true;
+            ash.failed = ash.failed == true or nil;
+            ash.aboard = ash.aboard == true or nil;
+            if ash.aboard_stage ~= nil then ash.aboard_stage = num(ash.aboard_stage, nil, 101, 103); end
+            local function boolmap(t)
+                local out = {};
+                if type(t) == 'table' then
+                    for q = ASHU.FIRST, ASHU.LAST do
+                        if t[tostring(q)] == true then out[tostring(q)] = true; end
+                    end
+                end
+                return out;
+            end
+            ash.active = boolmap(ash.active);
+            ash.completed = boolmap(ash.completed);
+            ash.anchored = ash.anchored == true or nil;
+            ash.hist = nil;   -- retired field; also cleans polluted saves
+            if ash.wins ~= nil then ash.wins = num(ash.wins, nil, 0, 3); end
 
             cd.limbus_data = tbl(cd.limbus_data);
             cd.limbus_data.runs_remaining =
@@ -958,7 +1214,7 @@ function sanitize_loaded_settings(st)
             cd.assault_data = tbl(cd.assault_data);
             cd.assault_data.points = tbl(cd.assault_data.points);
             if cd.assault_data.tags_stored ~= nil then
-                cd.assault_data.tags_stored = num(cd.assault_data.tags_stored, nil, 0, 16);
+                cd.assault_data.tags_stored = num(cd.assault_data.tags_stored, nil, 0, 4);
             end
             if cd.assault_data.rank ~= nil then
                 cd.assault_data.rank = num(cd.assault_data.rank, nil, 1, 11);
@@ -973,7 +1229,7 @@ function sanitize_loaded_settings(st)
             cd.assault_data.orders_lost_seq = nil;
             cd.assault_data.orders_lost_at = nil;
             cd.assault_data.rank_seen_at   = num(cd.assault_data.rank_seen_at, 0, 0);
-            cd.assault_data.max_stock      = num(cd.assault_data.max_stock, ASSAULT_DEFAULT_MAX_STOCK, 1, 16);
+            cd.assault_data.max_stock      = num(cd.assault_data.max_stock, ASSAULT_DEFAULT_MAX_STOCK, 1, 4);
             for k, v in pairs(cd.assault_data.points) do
                 if type(k) ~= 'string' then cd.assault_data.points[k] = nil;
                 else cd.assault_data.points[k] = num(v, 0, 0); end
@@ -1007,6 +1263,17 @@ function sanitize_loaded_settings(st)
             acct.limbus_remaining = num(acct.limbus_remaining, LIMBUS_ACCOUNT_LIMIT, 0, LIMBUS_ACCOUNT_LIMIT);
             -- limbus_seen sat directly beside limbus_remaining and was missed.
             acct.limbus_seen = num(acct.limbus_seen, 0, 0);
+            -- Shared assault stock. No weekly component, so it is never reset;
+            -- only Rytaal's menu is authoritative for it.
+            if acct.assault_pool ~= nil then
+                local ap = tbl(acct.assault_pool);
+                if ap.tags_stored ~= nil then ap.tags_stored = num(ap.tags_stored, nil, 0, 4); end
+                ap.next_tag_time = num(ap.next_tag_time, 0, 0);
+                ap.checked_at    = num(ap.checked_at, 0, 0);
+                ap.last_withdraw = num(ap.last_withdraw, 0, 0);
+                ap.max_stock     = num(ap.max_stock, ASSAULT_DEFAULT_MAX_STOCK, 1, 4);
+                acct.assault_pool = ap;
+            end
             acct.limbus_known = acct.limbus_known == true;
             acct.is_account = true;
             acct.manual_override = acct.manual_override == true;
@@ -1076,6 +1343,43 @@ end
 
 -- Mirrors get_dynamis_store: the table holding this character's Limbus counters,
 -- plus true when it is an account-wide pool.
+-- Rytaal's stock and its restock clock belong to the ACCOUNT, not the
+-- character: a tag drawn on any member drops the count everyone sees. The tag
+-- in hand, the current mission and the mercenary rank stay personal, so those
+-- keep living on the character record.
+-- Defined further down; get_assault_store and unassign_char both reach it from
+-- above. Without this it compiled to a nil global read.
+local new_assault_data;
+-- unassign_char reaches this from above its definition.
+local inherit_assault_from_pool;
+
+local function ensure_assault_account(acct)
+    if acct.assault_pool == nil then
+        acct.assault_pool = {
+            tags_stored = nil,          -- nil until a Rytaal menu is seen
+            next_tag_time = 0,
+            checked_at = 0,
+            last_withdraw = 0,
+            max_stock = ASSAULT_DEFAULT_MAX_STOCK,
+        };
+    end
+    return acct.assault_pool;
+end
+
+-- Returns the table holding the shared stock, plus true when it is an account
+-- pool. Unlike Dynamis and Limbus this has no weekly component - the restock
+-- clock is a rolling 24h and must survive the weekly reset untouched.
+local function get_assault_store(char_name)
+    if tracker.settings.dynamis_account_wide then
+        local acct = find_dynamis_account(char_name);
+        if acct ~= nil then return ensure_assault_account(acct), true; end
+    end
+    local cd = char_name and tracker.settings.characters[char_name] or nil;
+    if cd == nil then return nil, false; end
+    if cd.assault_data == nil then cd.assault_data = new_assault_data(); end
+    return cd.assault_data, false;
+end
+
 local function get_limbus_store(char_name)
     if tracker.settings.dynamis_account_wide then
         local acct = find_dynamis_account(char_name);
@@ -1138,36 +1442,110 @@ end
 -- ticking a name somewhere else silently moves it rather than warning.
 local recalc_account_from_members;
 
-local function unassign_char(char_name)
+-- skip_inherit is set when the character is moving to ANOTHER account rather
+-- than leaving grouping entirely. Inheriting on a move re-armed the personal
+-- reading with account 1's figure, which the destination account then seeded
+-- from - so moving a character out of a depleted account dragged a full account
+-- down to it. A character joining another account needs no personal count at
+-- all; they read the destination pool.
+local function unassign_char(char_name, skip_inherit)
     for _, acct in ipairs(dynamis_accounts()) do
         if type(acct.chars) == 'table' then
             local removed = false;
             for i = #acct.chars, 1, -1 do
                 if acct.chars[i] == char_name then table.remove(acct.chars, i); removed = true; end
             end
-            if removed then recalc_account_from_members(acct, true); end
+            if removed then
+                -- Leave with whatever the pool last said, rather than a stale
+                -- personal number from before the character was grouped.
+                if not skip_inherit then
+                    inherit_assault_from_pool(acct, char_name);
+                end
+                recalc_account_from_members(acct, true);
+            end
         end
     end
 end
 
--- An account inherits the LOWEST remaining count among its members, so grouping
--- characters never hands back an entry somebody already spent. Clamped against
--- the account's own value as well, so adding a fresh character to an account that
--- has already been used cannot top it back up. Membership changes can therefore
--- only lower the count - delete the account to start it over.
--- Member glass serials are merged in too, otherwise a glass one character already
--- counted would count a second time once the pool took over.
+-- Copies the pool's figures onto a character leaving an account. Grouped members'
+-- personal counts are guaranteed stale (all writes went to the pool), so every
+-- exit path has to do this - not just the per-character untick.
+--
+-- NOT called when a character is moving to another account: see unassign_char's
+-- skip_inherit.
+function inherit_assault_from_pool(acct, char_name)
+    local pool = acct and acct.assault_pool or nil;
+    local cd = char_name and tracker.settings.characters[char_name] or nil;
+    if pool == nil or cd == nil or pool.tags_stored == nil then return; end
+    if cd.assault_data == nil then cd.assault_data = new_assault_data(); end
+    cd.assault_data.tags_stored   = pool.tags_stored;
+    cd.assault_data.next_tag_time = pool.next_tag_time or 0;
+    cd.assault_data.checked_at    = pool.checked_at or 0;
+    cd.assault_data.max_stock     = pool.max_stock or ASSAULT_DEFAULT_MAX_STOCK;
+end
+
+-- Absorbs each member's personal reading into the pool ONCE, then clears it.
+--
+-- Nothing refreshes a grouped member's personal tags_stored - while grouped, all
+-- writes go to the pool - so those copies freeze at whatever they said when the
+-- character joined. This runs on every membership change AND at load, taking the
+-- lowest of pool-vs-members. Without consuming the readings, every load
+-- re-applied the stalest, lowest number on file: Rytaal raises the pool to 3,
+-- you reload, and a member's frozen 1 drags it back down, forever.
+local function seed_assault_pool(acct)
+    local pool = ensure_assault_account(acct);
+    local lowest, newest = pool.tags_stored, pool.checked_at or 0;
+    local absorbed = {};
+    for _, cname in ipairs(acct.chars or {}) do
+        local cd = tracker.settings.characters[cname];
+        local ad = cd and cd.assault_data or nil;
+        if ad ~= nil and ad.tags_stored ~= nil then
+            if lowest == nil or ad.tags_stored < lowest then lowest = ad.tags_stored; end
+            -- Latest reading wins for the clock, per the same reasoning.
+            if (ad.checked_at or 0) > newest then
+                newest = ad.checked_at or 0;
+                pool.next_tag_time = ad.next_tag_time or 0;
+            end
+            table.insert(absorbed, ad);
+        end
+    end
+    if lowest ~= nil then
+        pool.tags_stored = lowest;
+        pool.checked_at = newest;
+        -- Consumed: a later seed must not see these again.
+        for _, ad in ipairs(absorbed) do ad.tags_stored = nil; end
+    end
+    -- Report the consumption rather than leaving callers to infer it from field
+    -- comparisons: when a member's frozen reading already equalled the pool,
+    -- tags_stored looked unchanged before and after even though records were
+    -- cleared, so the save gate missed it and the write floated.
+    return #absorbed > 0;
+end
+
+-- An account inherits the LOWEST remaining Dynamis count among its members, so
+-- grouping characters never hands back an entry somebody already spent. Clamped
+-- against the account's own value as well, so adding a fresh character to an
+-- account that has already been used cannot top it back up. Membership changes
+-- can therefore only lower the count - delete the account to start it over.
+-- Member glass serials are merged in too, otherwise a glass one character
+-- already counted would count a second time once the pool took over.
+--
 -- `from_membership` marks the call as triggered by ticking a character in or out
 -- of an account, as opposed to deriving the pool from scratch (load, or turning
 -- sharing on). Only membership changes are clamped: unticking a member who spent
--- two runs would otherwise hand those entries back, which is a way to top the
--- pool up from the settings tab. A genuine re-derivation has to be free to raise,
--- or a stale 0 from a previous session could never recover.
+-- two runs would otherwise hand those entries back. A genuine re-derivation has
+-- to be free to raise, or a stale 0 from a previous session could never recover.
+--
+-- Returns true when anything was written, so callers can decide to save without
+-- diffing individual fields.
 function recalc_account_from_members(acct, from_membership)
-    if acct == nil or type(acct.chars) ~= 'table' or #acct.chars == 0 then return; end
+    if acct == nil or type(acct.chars) ~= 'table' or #acct.chars == 0 then return false; end
+    -- Assault first: manual_override is a Dynamis concept, and letting it return
+    -- early here silently disabled assault seeding for the whole account.
+    local consumed = seed_assault_pool(acct);
     -- A number the player typed in beats anything derived. Cleared at the weekly
     -- reset, when the addon's own count becomes trustworthy again.
-    if acct.manual_override then return; end
+    if acct.manual_override then return consumed; end
 
     -- Work from what the members have actually USED, not from whoever has the
     -- fewest left. Taking the lowest threw away an alt's unused entries: a
@@ -1200,8 +1578,10 @@ function recalc_account_from_members(acct, from_membership)
         remaining = previous;
     end
     if remaining < 0 then remaining = 0; end
+    local before = acct.entries_remaining;
     acct.entries_remaining = remaining;
     acct.counted_glasses = merged;
+    return consumed or (remaining ~= before);
 end
 
 -- Returns false when the target account is already full.
@@ -1213,7 +1593,7 @@ local function assign_char_to_account(char_name, acct_index)
     local already = false;
     for _, c in ipairs(acct.chars) do if c == char_name then already = true; break; end end
     if not already and #acct.chars >= chars_per_account() then return false; end
-    unassign_char(char_name);
+    unassign_char(char_name, true);   -- moving, not leaving: do not inherit
     if not already then table.insert(acct.chars, char_name); end
     recalc_account_from_members(acct, true);
     return true;
@@ -1222,6 +1602,11 @@ end
 local function remove_dynamis_account(acct_index)
     local accts = dynamis_accounts();
     if accts[acct_index] == nil then return; end
+    -- Everyone leaving at once still has to inherit, or they all revert to
+    -- frozen pre-grouping counts.
+    for _, cname in ipairs(accts[acct_index].chars or {}) do
+        inherit_assault_from_pool(accts[acct_index], cname);
+    end
     table.remove(accts, acct_index);
     -- Renumber the default names so they stay 1..n
     for i, acct in ipairs(accts) do
@@ -1231,7 +1616,7 @@ local function remove_dynamis_account(acct_index)
     end
 end
 
-local function new_assault_data()
+function new_assault_data()
     return { tags_stored = nil, checked_at = 0, next_tag_time = 0,
              max_stock = ASSAULT_DEFAULT_MAX_STOCK, current_assault = 0,
              rank = nil, rank_seen_at = 0, points = {}, last_withdraw = 0,
@@ -1281,8 +1666,14 @@ end
 -- withdrawal handler in on_ki_gained DOES materialise the result into
 -- assault_data before spending, because it has to decrement the projected stock
 -- rather than the stale stored one.
-local function assault_state(char_data)
-    local ad = char_data and char_data.assault_data or nil;
+-- char_data is accepted for call-site compatibility, but the stock is read from
+-- whichever store owns it - the account pool when grouped.
+local function assault_state(char_data, char_name)
+    -- No `or tracker.current_char` default: a legacy-shaped call with an alt's
+    -- char_data and no name would have resolved the LOGGED-IN character's store
+    -- while reading the alt's record. Fall through to char_data instead.
+    local ad = char_name ~= nil and get_assault_store(char_name) or nil;
+    if ad == nil then ad = char_data and char_data.assault_data or nil; end
     if ad == nil or ad.tags_stored == nil then return nil; end
     local maxs   = ad.max_stock or ASSAULT_DEFAULT_MAX_STOCK;
     local stored = ad.tags_stored;
@@ -1414,6 +1805,7 @@ do
     for _, card in ipairs(LIMBUS_CARDS) do add(card.ki_id); end
     add(XSKNIFE_KI_ID_FIRST); add(XSKNIFE_KI_ID_REPEAT);
     add(IMPERIAL_ARMY_ID_TAG); add(ASSAULT_ARMBAND);
+    add(ISNM_CONFIDENTIAL_KI); add(ISNM_SECRET_KI);
     for id in pairs(ASSAULT_ORDERS) do add(id); end
     add(COOKBOOK_KI_ID); add(SPICEGALS_KI_ID); add(UNINVITED_KI_ID);
     for _, id in pairs(ECOWARRIOR_KI_IDS) do add(id); end
@@ -1509,7 +1901,9 @@ local function get_char_data()
             ecowarrior_data = { step = 'unknown', current_nation = nil, locked_nations = {}, knows_status = false },
             dynamis_data = new_dynamis_data(),
             assault_data = new_assault_data(),
-            limbus_data = new_limbus_data()
+            limbus_data = new_limbus_data(),
+            isnm_data = {},
+            ashu_data = {}
         };
         save_settings();
         print_success('Created new tracker for character: ' .. tracker.current_char);
@@ -1609,6 +2003,7 @@ local function populate_kis_from_memory()
         return false;
     end
     tracker.kis_initialized = true;
+    if tracker.isnm_observed_since == nil then tracker.isnm_observed_since = os.time(); end
     return true;
 end
 
@@ -1630,6 +2025,7 @@ local function restore_ki_cache()
         tracker.kis[id] = (held[id] == true);
     end
     tracker.kis_initialized = true;
+    if tracker.isnm_observed_since == nil then tracker.isnm_observed_since = os.time(); end
     return true;
 end
 
@@ -1763,6 +2159,20 @@ end
 local function on_ki_gained(ki_id)
     local char_data = get_char_data();
     if char_data == nil then return; end
+    -- An Imperial order landing in the bag is the ISNM purchase; Shajaf's lock
+    -- runs from now until JST midnight. If the addon was off at purchase time,
+    -- this instead fires on the next baseline and stamps the lock late - the
+    -- next Shajaf visit or the midnight itself corrects it.
+    if ki_id == ISNM_CONFIDENTIAL_KI or ki_id == ISNM_SECRET_KI then
+        local isnm = isnm_data_for(char_data);
+        isnm.next_buy_time = next_jst_midnight(os.time());
+        isnm.no_badge = nil;
+        save_settings();
+        print_success(string.format('%s Imperial order taken! Next purchase after %s.',
+            ki_id == ISNM_SECRET_KI and 'Secret (3000)' or 'Confidential (2000)',
+            os.date('%H:%M', isnm.next_buy_time)));
+        return;
+    end
     -- Taking a tag moves it from Rytaal's stock into your hands. The menu packet
     -- is sent when the menu OPENS, before the option is picked, so it always
     -- reports the count from before the withdrawal - there is no second packet
@@ -1803,7 +2213,9 @@ local function on_ki_gained(ki_id)
     end
 
     if ki_id == IMPERIAL_ARMY_ID_TAG then
-        local ad = char_data.assault_data;
+        -- Decrement the shared pool when grouped, so an alt's withdrawal is
+        -- visible on every character.
+        local ad = get_assault_store(tracker.current_char) or char_data.assault_data;
         if ad ~= nil and ad.tags_stored ~= nil then
             local now = os.time();
             -- Materialise the projection first. assault_state ticks the stock
@@ -1812,15 +2224,23 @@ local function on_ki_gained(ki_id)
             -- the display correctly showed 3 while `tags_stored > 0` was false,
             -- so the withdrawal was skipped and the restock clock never
             -- restarted.
-            local projected, proj_next = assault_state(char_data);
+            local projected, proj_next = assault_state(char_data, tracker.current_char);
             if projected ~= nil then
                 ad.tags_stored = projected;
                 ad.next_tag_time = proj_next or 0;
             end
             -- Same packet as the orders vanishing means this is a cancellation
             -- refund, not a withdrawal from Rytaal.
-            if ad.orders_lost_seq ~= nil and ad.orders_lost_seq == ASSAULT_KI_PACKET_SEQ then
-                ad.orders_lost_seq = nil;
+            -- Orders are personal, so this flag stays on the character record
+            -- even when the stock it protects is shared.
+            local own = char_data.assault_data;
+            if own ~= nil and own.orders_lost_seq ~= nil
+               and own.orders_lost_seq == ASSAULT_KI_PACKET_SEQ then
+                own.orders_lost_seq = nil;
+                -- The projection above was already written into the store, so
+                -- persist it rather than leaving it floating until some other
+                -- save happens to fire.
+                save_settings();
                 return;
             end
             if (now - (ad.last_withdraw or 0)) > ASSAULT_TAG_DEBOUNCE then
@@ -1915,6 +2335,13 @@ end
 local function on_ki_lost(ki_id)
     local char_data = get_char_data();
     if char_data == nil then return; end
+    -- The order breaks when its holder opens the battlefield. Nothing to store:
+    -- the key item table is the record of what is held, and the buy lock keeps
+    -- running regardless.
+    if ki_id == ISNM_CONFIDENTIAL_KI or ki_id == ISNM_SECRET_KI then
+        print_success('Imperial order used - ISNM underway!');
+        return;
+    end
     -- Losing Assault Orders means the run ended one way or another. Note the
     -- moment: if a tag turns up immediately afterwards it was a cancellation.
     if ASSAULT_ORDERS[ki_id] ~= nil then
@@ -2128,6 +2555,20 @@ end
 local function reset_character_data(char_data)
     local current_time = os.time();
     char_data.last_reset = current_time;
+    -- Ashu Talif: the tally zeroes OUR win count and any fail, but a paid,
+    -- unfought stage SURVIVES the reset - observed live: a member banked the
+    -- first quest across a tally and fought it after. Witnessing this reset
+    -- anchors the character: from here on, "nothing observed" provably means
+    -- a fresh 3/3 rather than an unknown.
+    if type(char_data.ashu_data) == 'table' then
+        local ash = char_data.ashu_data;
+        ash.anchored = true;
+        ash.hist = nil;   -- retired field from the completed-bit era
+        ash.wins = nil;
+        ash.failed = nil;
+        ash.aboard = nil;
+        ash.aboard_stage = nil;
+    end
     -- UnInvited: only reset if done, otherwise keep current step
     local uninvited_step = char_data.quest_steps and char_data.quest_steps.uninvited or 'unknown';
     if uninvited_step == 'done' or uninvited_step == 'unknown' or uninvited_step == 'scanned' then
@@ -2284,6 +2725,7 @@ local function on_character_change(new_char_name)
         tracker.current_char = new_char_name;
         tracker.kis = {};
         tracker.kis_initialized = false;
+    tracker.isnm_observed_since = nil;
         local char_data = get_char_data();
         if not tracker.kis_initialized then restore_ki_cache(); end
         local needs_scan = char_data.quest_steps.uninvited == 'unknown' or
@@ -2321,44 +2763,47 @@ local function format_task_line(task, char_data)
     local normalized = normalize_task(task);
     if normalized == 'xsknife' then
         local step = (char_data.xsknife_data or {}).step or 'unknown';
-        if step == 'unknown' then return HDR .. '\30\104[ ? ]\30\106 ' .. task;
-        elseif step == 'scanned_no_ki' then return HDR .. '\30\104[   ]\30\106 ' .. task;
-        elseif step == 'scanned_has_ki' then return HDR .. '\30\104[Boneyard Gully - Requiem of Sin]\30\106 ' .. task;
-        elseif step == 'scanned_has_ki_used' then return HDR .. '\30\104[Despachiaire]\30\106 ' .. task;
-        elseif step == 'despachiaire' then return HDR .. '\30\110[Despachiaire]\30\106 ' .. task;
-        elseif step == 'boneyard' then return HDR .. '\30\110[Boneyard Gully - Requiem of Sin]\30\106 ' .. task;
-        elseif step == 'boneyard_2x' then return HDR .. '\30\110[2x Boneyard Gully - Requiem of Sin]\30\106 ' .. task;
-        elseif step == 'done' then return HDR .. '\30\076[X]\30\106 ' .. task;
-        else return HDR .. '\30\104[   ]\30\106 ' .. task; end
+        -- The count answers "how many fights are left this week" (2 per week);
+        -- the bracket answers "where do I go". '2x' used to read like part of
+        -- the place name.
+        if step == 'unknown' then return HDR .. '\30\104[?]\30\106 ' .. task;
+        elseif step == 'scanned_no_ki' then return HDR .. '\30\104?/2\30\106 ' .. task;
+        elseif step == 'scanned_has_ki' then return HDR .. '\30\104?/2 [Boneyard Gully - Requiem of Sin]\30\106 ' .. task;
+        elseif step == 'scanned_has_ki_used' then return HDR .. '\30\104?/2 [Despachiaire]\30\106 ' .. task;
+        elseif step == 'despachiaire' then return HDR .. '\30\1101/2 [Despachiaire]\30\106 ' .. task;
+        elseif step == 'boneyard' then return HDR .. '\30\1101/2 [Boneyard Gully - Requiem of Sin]\30\106 ' .. task;
+        elseif step == 'boneyard_2x' then return HDR .. '\30\1102/2 [Boneyard Gully - Requiem of Sin]\30\106 ' .. task;
+        elseif step == 'done' then return HDR .. '\30\068[x]\30\106 ' .. task;
+        else return HDR .. '\30\104?/2\30\106 ' .. task; end
     elseif normalized == 'highwind' then
         local step = char_data.quest_steps.highwind or 'scanned';
         if step == 'start' then return HDR .. '\30\110[NM]\30\106 ' .. task;
-        elseif step == 'done' then return HDR .. '\30\076[X]\30\106 ' .. task;
-        else return HDR .. '\30\104[   ]\30\106 ' .. task; end
+        elseif step == 'done' then return HDR .. '\30\068[x]\30\106 ' .. task;
+        else return HDR .. '\30\104[ ]\30\106 ' .. task; end
     elseif normalized == 'uninvited' then
         local step = char_data.quest_steps.uninvited or 'unknown';
-        if step == 'scanned' then return HDR .. '\30\104[   ]\30\106 ' .. task;
+        if step == 'scanned' then return HDR .. '\30\104[ ]\30\106 ' .. task;
         elseif step == 'justinius' then return HDR .. '\30\110[Justinius - Start]\30\106 ' .. task;
         elseif step == 'bcnm' then return HDR .. '\30\110[BCNM Monarch]\30\106 ' .. task;
         elseif step == 'justinius_return' then return HDR .. '\30\110[Justinius - Reward]\30\106 ' .. task;
-        elseif step == 'done' then return HDR .. '\30\076[X]\30\106 ' .. task;
-        else return HDR .. '\30\104[ ? ]\30\106 ' .. task; end
+        elseif step == 'done' then return HDR .. '\30\068[x]\30\106 ' .. task;
+        else return HDR .. '\30\104[?]\30\106 ' .. task; end
     elseif normalized == 'spicegals' then
         local step = char_data.quest_steps.spicegals or 'unknown';
-        if step == 'scanned' then return HDR .. '\30\104[   ]\30\106 ' .. task;
+        if step == 'scanned' then return HDR .. '\30\104[ ]\30\106 ' .. task;
         elseif step == 'rouva' then return HDR .. '\30\110[Rouva - Start]\30\106 ' .. task;
         elseif step == 'riverne' then return HDR .. '\30\110[Riverne B]\30\106 ' .. task;
         elseif step == 'rouva_return' then return HDR .. '\30\110[Rouva - Reward]\30\106 ' .. task;
-        elseif step == 'done' then return HDR .. '\30\076[X]\30\106 ' .. task;
-        else return HDR .. '\30\104[ ? ]\30\106 ' .. task; end
+        elseif step == 'done' then return HDR .. '\30\068[x]\30\106 ' .. task;
+        else return HDR .. '\30\104[?]\30\106 ' .. task; end
     elseif normalized == 'cookbook' then
         local step = char_data.quest_steps.cookbook or 'unknown';
-        if step == 'scanned' then return HDR .. '\30\104[   ]\30\106 ' .. task;
+        if step == 'scanned' then return HDR .. '\30\104[ ]\30\106 ' .. task;
         elseif step == 'jonette' then return HDR .. '\30\110[Jonette - Start]\30\106 ' .. task;
         elseif step == 'sacrarium' then return HDR .. '\30\110[??? Sacrarium]\30\106 ' .. task;
         elseif step == 'jonette_return' then return HDR .. '\30\110[Jonette - Reward]\30\106 ' .. task;
-        elseif step == 'done' then return HDR .. '\30\076[X]\30\106 ' .. task;
-        else return HDR .. '\30\104[ ? ]\30\106 ' .. task; end
+        elseif step == 'done' then return HDR .. '\30\068[x]\30\106 ' .. task;
+        else return HDR .. '\30\104[?]\30\106 ' .. task; end
     elseif normalized == 'ecowarrior' then
         local eco_data = char_data.ecowarrior_data or {};
         local step = eco_data.step or 'unknown';
@@ -2369,7 +2814,7 @@ local function format_task_line(task, char_data)
         local color = eco_data.knows_status and '\30\110' or '\30\104';
         if step == 'scanned' then return HDR .. '\30\104[' .. available_text .. ']\30\106 ' .. task;
         elseif step == 'ready' then return HDR .. '\30\110[' .. available_text .. ']\30\106 ' .. task;
-        elseif step == 'done' then return HDR .. '\30\076[' .. available_text .. ']\30\106 ' .. task;
+        elseif step == 'done' then return HDR .. '\30\068[x]\30\106 ' .. task;
         elseif step == 'scanned_has_ki' and zone_info then
             return HDR .. '\30\104[' .. zone_info.zone_name .. ' - ' .. zone_info.field_agent .. ']\30\106 ' .. task;
         elseif step == 'field_agent' and zone_info then
@@ -2380,8 +2825,8 @@ local function format_task_line(task, char_data)
             return HDR .. color .. '[' .. zone_info.zone_name .. ' - ' .. zone_info.field_agent .. ']\30\106 ' .. task;
         elseif step == 'reward' and zone_info then
             return HDR .. color .. '[' .. zone_info.city_name .. ' - ' .. zone_info.quest_npc .. ']\30\106 ' .. task;
-        elseif step == 'unknown' then return HDR .. '\30\104[ ? ]\30\106 ' .. task;
-        else return HDR .. '\30\104[   ]\30\106 ' .. task; end
+        elseif step == 'unknown' then return HDR .. '\30\104[?]\30\106 ' .. task;
+        else return HDR .. '\30\104[ ]\30\106 ' .. task; end
     end
     return nil;
 end
@@ -2391,7 +2836,7 @@ end
 local function format_dynamis_line(char_name, char_data)
     local store, shared = get_dynamis_store(char_name);
     if store == nil then store = char_data.dynamis_data; end
-    if store == nil then return HDR .. '\30\104[ ? ]\30\106 Dynamis'; end
+    if store == nil then return HDR .. '\30\104[?]\30\106 Dynamis'; end
     -- Show what actually limits this character: the lower of their own cap and
     -- the account pool. Saying "1 left" when the character is capped would lie.
     local entries, char_left, acct_left = dynamis_effective_remaining(char_name);
@@ -2442,7 +2887,7 @@ local function format_limbus_line(char_name)
     if #cards > 0 then suffix = ' \30\071(' .. table.concat(cards, ', ') .. ')\30\106'; end
 
     local icon;
-    if eff == nil then icon = '\30\104 ? \30\106';
+    if eff == nil then icon = '\30\104[?]\30\106';
     elseif not known then icon = string.format('\30\104?/%d\30\106', LIMBUS_CHARACTER_LIMIT);
     elseif eff <= 0 then icon = string.format('\30\076%d/%d\30\106', eff, LIMBUS_CHARACTER_LIMIT);
     else icon = string.format('\30\110%d/%d\30\106', eff, LIMBUS_CHARACTER_LIMIT); end
@@ -2458,11 +2903,11 @@ end
 
 -- Assault tags in chat: Rytaal's stock, plus what is in hand.
 local function format_assault_line(char_data, char_name)
-    local stored, next_tag, max_stock = assault_state(char_data);
+    local stored, next_tag, max_stock = assault_state(char_data, char_name);
     local carried = assault_holding_tag(char_name);
     local area = assault_active_area(char_name);
     if stored == nil then
-        return HDR .. '\30\104[ ? ]\30\106 Assault \30\071(talk to Rytaal)\30\106';
+        return HDR .. '\30\104[?]\30\106 Assault \30\071(talk to Rytaal)\30\106';
     end
     local colour = (stored == 0) and '\30\076'
                 or (stored == 1) and '\30\104'
@@ -2475,23 +2920,82 @@ local function format_assault_line(char_data, char_name)
     return HDR .. icon .. ' Assault \30\071(' .. table.concat(bits, ', ') .. ')\30\106';
 end
 
+-- The Ashu Talif chain in chat: fights left and the next action.
+local function format_ashu_line(char_data)
+    local left, stage, a = ASHU.state(char_data);
+    if left == nil then
+        local why = (a ~= nil) and 'pay to sync' or 'zone once to sync';
+        return HDR .. '\30\104[?]\30\106 Ashu Talif \30\071(' .. why .. ')\30\106';
+    end
+    if a.failed then
+        return HDR .. '\30\068[ x ]\30\106 Ashu Talif \30\071(failed - wait for reset)\30\106';
+    end
+    if left <= 0 then
+        return HDR .. '\30\068[ x ]\30\106 Ashu Talif \30\071(done!)\30\106';
+    end
+    local what;
+    if stage ~= nil then
+        what = (ASHU.NAMES[stage] or '?') .. ' - fight!';
+    else
+        what = 'pay for ' .. (ASHU.NAMES[ASHU.FIRST + (3 - left)] or '?');
+    end
+    return HDR .. string.format('\30\110%d/3\30\106 Ashu Talif \30\071(%s)\30\106', left, what);
+end
+
+-- ISNM in chat: what is held, and when Shajaf sells again.
+local function format_isnm_line(char_name)
+    local cd = char_name and tracker.settings.characters[char_name] or nil;
+    resolve_isnm_unknown(cd, char_name);
+    local isnm = cd and cd.isnm_data or nil;
+    if isnm ~= nil and isnm.no_badge then
+        return HDR .. '\30\068[ ]\30\106 ISNM \30\071(need the Wildcat Badge)\30\106';
+    end
+    local held = isnm_held_ki(char_name);
+    local nbt = isnm and isnm.next_buy_time or nil;
+    local buy;
+    if nbt == nil then buy = 'see Shajaf';
+    elseif os.time() >= nbt then buy = 'buy ready';
+    else buy = 'buy in ' .. format_time_short(nbt - os.time()); end
+    if held ~= nil then
+        local tier = held == ISNM_SECRET_KI and '3000' or '2000';
+        return HDR .. '\30\110[KI]\30\106 ISNM \30\071(' .. tier .. ' held, ' .. buy .. ')\30\106';
+    end
+    if nbt == nil then
+        return HDR .. '\30\104[ ? ]\30\106 ISNM \30\071(see Shajaf)\30\106';
+    end
+    local icon = (os.time() >= nbt) and '\30\110[  ]' or '\30\068[ x ]';
+    return HDR .. icon .. '\30\106 ISNM \30\071(' .. buy .. ')\30\106';
+end
+
 -- One chat line for one ENM/Limbus timer.
 local function format_timer_line(enm, timer_data, current_time)
     local status_icon = '\30\104[ ? ]\30\106';
     local status_text = '\30\071(Unknown)\30\106';
+    -- [KI] green = in the bag (fight open), [    ] = ready but KI not taken,
+    -- [ x ] = waiting, [ ? ] = unknown. Same vocabulary as the window.
     if timer_data ~= nil then
         if timer_data.next_ki_time == nil or timer_data.next_ki_time == 0 then
-            if timer_data.has_ki then status_icon = '\30\104[KI]\30\106'; else status_icon = '\30\104[   ]\30\106'; end
+            if timer_data.has_ki then
+                status_icon = '\30\110[KI]\30\106';
+                status_text = '\30\071(Ready)\30\106';
+            end
         elseif current_time >= timer_data.next_ki_time then
-            if timer_data.has_ki then status_icon = '\30\110[KI]\30\106'; else status_icon = '\30\110[   ]\30\106'; end
+            if timer_data.has_ki then
+                status_icon = '\30\110[KI]\30\106';
+            else
+                status_icon = '\30\110[    ]\30\106';
+            end
             status_text = '\30\071(Ready)\30\106';
         elseif timer_data.timer_source == 'scan' then
-            if timer_data.has_ki then status_icon = '\30\104[KI]\30\106'; else status_icon = '\30\104[   ]\30\106'; end
+            if timer_data.has_ki then
+                status_icon = '\30\110[KI]\30\106';
+                status_text = '\30\071(Ready)\30\106';
+            end
         else
             local time_left = timer_data.next_ki_time - current_time;
             local days = math.floor(time_left / 86400);
             local hours = math.floor((time_left % 86400) / 3600);
-            if timer_data.has_ki then status_icon = '\30\076[KI]\30\106'; else status_icon = '\30\068[   ]\30\106'; end
+            if timer_data.has_ki then status_icon = '\30\110[KI]\30\106'; else status_icon = '\30\068[ x ]\30\106'; end
             if days > 0 then status_text = string.format('\30\071(%dd %dh)\30\106', days, hours);
             else status_text = string.format('\30\071(%dh)\30\106', hours); end
         end
@@ -2533,15 +3037,15 @@ local function print_task_legend(char_data)
             elseif step == 'scanned_has_ki' then flags.eco_scanned_ki = true; end
         end
     end
-    if flags.question then print('\30\104[ ? ]\30\067 = Use /hw scan to detect progress.'); end
-    if flags.yellow_empty then print('\30\104[   ]\30\067 = Unknown progress. Resolves at next tally or use /hw <task>.'); end
-    if flags.eco_unknown then print('\30\104[ ? ]\30\067 (EcoWarrior) = Use /hw eco <nation> or talk to Eeko-Weeko.'); end
+    if flags.question then print('\30\104[?]\30\067 = Use /hw scan to detect progress.'); end
+    if flags.yellow_empty then print('\30\104[ ]\30\067 = Unknown progress. Resolves at next tally or use /hw <task>.'); end
+    if flags.eco_unknown then print('\30\104[?]\30\067 (EcoWarrior) = Use /hw eco <nation> or talk to Eeko-Weeko.'); end
     if flags.eco_nation then print('\30\104[Nation]\30\067 (EcoWarrior) = Unknown if completed. Resolves at next tally or quest interaction.'); end
     if flags.eco_scanned_ki then print('\30\104[Zone - Agent]\30\067 (EcoWarrior) = Has KI but locked nations unknown. Use /hw eco or talk to Eeko-Weeko.'); end
-    if flags.knife_unknown then print('\30\104[ ? ]\30\067 (X\'sKnife) = Use /hw scan or talk to Despachiaire.'); end
-    if flags.knife_empty then print('\30\104[   ]\30\067 (X\'sKnife) = Unknown if Despachiaire has KI. Resolves at next tally or when KI obtained.'); end
-    if flags.knife_des then print('\30\104[Despachiaire]\30\067 (X\'sKnife) = Unknown if Despachiaire has KI. Resolves at next tally or when KI obtained.'); end
-    if flags.knife_boneyard then print('\30\104[Boneyard Gully]\30\067 (X\'sKnife) = Unknown if Despachiaire has another KI. Resolves at next tally or when KI obtained.'); end
+    if flags.knife_unknown then print('\30\104[?]\30\067 (X\'sKnife) = Use /hw scan or talk to Despachiaire.'); end
+    if flags.knife_empty then print('\30\104?/2\30\067 (X\'sKnife) = Fights left unknown. Resolves at next tally or when KI obtained.'); end
+    if flags.knife_des then print('\30\104?/2 [Despachiaire]\30\067 (X\'sKnife) = Unknown if Despachiaire has KI. Resolves at next tally or when KI obtained.'); end
+    if flags.knife_boneyard then print('\30\104?/2 [Boneyard Gully]\30\067 (X\'sKnife) = KI in hand; unknown if another follows. Resolves at next tally or when KI obtained.'); end
 end
 
 local function print_weekly_block(char_name, char_data, current_time)
@@ -2550,9 +3054,15 @@ local function print_weekly_block(char_name, char_data, current_time)
     print_msg('=================');
     print(format_dynamis_line(char_name, char_data));
     print(format_limbus_line(char_name));
+    print(format_task_line("X'sKnife", char_data));
+    print(format_ashu_line(char_data));
     print(format_assault_line(char_data, char_name));
+    print(format_isnm_line(char_name));
     for _, task in ipairs(tracker.settings.tasks) do
-        local line = format_task_line(task, char_data);
+        local line = nil;
+        if normalize_task(task) ~= 'xsknife' then
+            line = format_task_line(task, char_data);
+        end
         if line then print(line); end
     end
     print('');
@@ -2562,6 +3072,9 @@ end
 local function print_timer_block(char_name, char_data, current_time)
     print_msg('ENM Timers for \30\110' .. char_name .. '\30\106:');
     print_msg('====================');
+    -- Assault and ISNM head the Timers panel, so they head this print too.
+    print(format_assault_line(char_data, char_name));
+    print(format_isnm_line(char_name));
     for _, enm in ipairs(ENM_KEY_ITEMS) do
         print(format_timer_line(enm, char_data.enm_timers[enm.name], current_time));
     end
@@ -2596,7 +3109,7 @@ local function show_timers()
     end
     print_msg('ENM Timers for \30\110' .. tracker.current_char .. '\30\106:');
     if not has_any_timers then print('\30\081[\30\082Homework\30\081]\30\106 Please use \30\110/hw scan\30\106 to scan for your current KIs'); end
-    if has_unknown_question then print('\30\104[ ? ]\30\067 = Unknown status. Use /hw scan to update.'); end
+    if has_unknown_question then print('\30\104[?]\30\067 = Unknown status. Use /hw scan to update.'); end
     if has_unknown_no_ki then
         local time_left = longest_no_ki_timer - current_time;
         local days = math.floor(time_left / 86400);
@@ -2604,7 +3117,7 @@ local function show_timers()
         local time_str = '';
         if days > 0 then time_str = tostring(days) .. ' days, ' .. tostring(hours) .. ' hours';
         else time_str = tostring(hours) .. ' hours'; end
-        print('\30\104[   ]\30\067 = No KI. Unknown if ready. Resolves after ' .. time_str .. ' or when KI obtained.');
+        print('\30\104[?]\30\067 = No KI. Unknown if ready. Resolves after ' .. time_str .. ' or when KI obtained.');
     end
     if has_unknown_ki then
         local longest_ki_timer = 0;
@@ -2625,9 +3138,9 @@ local function show_timers()
             local time_str = '';
             if days > 0 then time_str = tostring(days) .. ' days, ' .. tostring(hours) .. ' hours';
             else time_str = tostring(hours) .. ' hours'; end
-            print('\30\104[KI]\30\067 = Have KI. Timer unknown. Resolves after ' .. time_str .. ' or when KI obtained.');
+            print('\30\110[o]\30\067 = KI in hand, fight open. Timer resolves after ' .. time_str .. ' or when KI obtained.');
         else
-            print('\30\104[KI]\30\067 = Have KI. Timer unknown. Updates when KI obtained.');
+            print('\30\110[o]\30\067 = KI in hand, fight open. Timer updates when KI obtained.');
         end
     end
     print_msg('====================');
@@ -2710,6 +3223,7 @@ local function factory_reset()
     ui.pending_account_add = nil;
     tracker.kis = {};
     tracker.kis_initialized = false;
+    tracker.isnm_observed_since = nil;
     tracker.login_state.waiting_for_login = false;
     tracker.login_state.waiting_for_ki = false;
     tracker.login_state.ki_packets_received = 0;
@@ -2790,6 +3304,50 @@ local function draw_gradient_header(text, width, help_text)
     imgui.Spacing();
 end
 
+-- Fixed-bracket icons: '[' and ']' land on the same pixel columns in every
+-- row and the symbol is centered between them, so alignment never depends on
+-- how wide the font draws a space. Chat keeps plain strings - pixel
+-- positioning only exists in imgui.
+local function icon_text_w(s)
+    if imgui.CalcTextSize == nil then return #tostring(s) * 7; end
+    local a = imgui.CalcTextSize(tostring(s));
+    if type(a) == 'table' then return a.x or (#tostring(s) * 7); end
+    return a or (#tostring(s) * 7);
+end
+
+local icon_box_inner = nil;   -- computed once, from 'KI' (the widest symbol)
+
+local function draw_icon_box(sym, color)
+    if icon_box_inner == nil then icon_box_inner = icon_text_w('KI') + 4; end
+    local x0 = imgui.GetCursorPosX();
+    imgui.TextColored(color, '[');
+    imgui.SameLine(0, 0);
+    if sym ~= nil and sym ~= '' then
+        imgui.SetCursorPosX(x0 + icon_text_w('[') + (icon_box_inner - icon_text_w(sym)) / 2);
+        imgui.TextColored(color, sym);
+        imgui.SameLine(0, 0);
+    end
+    imgui.SetCursorPosX(x0 + icon_text_w('[') + icon_box_inner);
+    imgui.TextColored(color, ']');
+end
+
+-- Route any row icon: bracketed strings become fixed boxes ('[ x ]' -> box
+-- with centered x). Counts and other bare strings are centered under the same
+-- footprint, so 2/3 sits under the box symbols instead of hugging the left.
+local function draw_row_icon(icon, color)
+    local inner = tostring(icon):match('^%[(.-)%]$');
+    if inner ~= nil then
+        draw_icon_box((inner:gsub('%s+', '')), color);
+        return;
+    end
+    if icon_box_inner == nil then icon_box_inner = icon_text_w('KI') + 4; end
+    local total = icon_text_w('[') * 2 + icon_box_inner;
+    local x0 = imgui.GetCursorPosX();
+    local w = icon_text_w(icon);
+    if w < total then imgui.SetCursorPosX(x0 + (total - w) / 2); end
+    imgui.TextColored(color, icon);
+end
+
 local function render_ui()
     if not ui.is_open[1] then return; end
     
@@ -2824,6 +3382,16 @@ local function render_ui()
     ui.began = true;
     if ui.window_flags == nil then
         ui.window_flags = ImGuiWindowFlags_NoCollapse or 0;
+    end
+    -- The resize grip (bottom-right triangle) is near-invisible on the dark
+    -- theme; tint it the header orange so new users can find it. Guarded, in
+    -- case this Ashita build lacks the style constants.
+    local grip_pushed = 0;
+    if imgui.PushStyleColor ~= nil and ImGuiCol_ResizeGrip ~= nil then
+        imgui.PushStyleColor(ImGuiCol_ResizeGrip,        { 0.90, 0.45, 0.20, 0.80 });
+        imgui.PushStyleColor(ImGuiCol_ResizeGripHovered, { 1.00, 0.60, 0.30, 1.00 });
+        imgui.PushStyleColor(ImGuiCol_ResizeGripActive,  { 1.00, 0.72, 0.40, 1.00 });
+        grip_pushed = 3;
     end
     if imgui.Begin('Homework v' .. addon.version, ui.is_open, ui.window_flags) then
         -- Only WindowBg/TitleBg/TitleBgActive are consumed by Begin itself, so
@@ -2870,11 +3438,18 @@ local function render_ui()
             imgui.Spacing();
 
         -- Weeklies header
-        draw_gradient_header('Weeklies', imgui.GetContentRegionAvail(), '[?] = Use /hw scan to detect progress\n[  ] = Unknown progress. Resolves at next tally or use /hw <task>');
+        draw_gradient_header('Weeklies', imgui.GetContentRegionAvail(), '[o] ready / go here    [x] done this week\n[ ] still to do        [?] unknown - /hw scan\nCounts are remaining/max. Status shows a place or what to do next.');
 
         -- Column positions scaled with font
-        local col_task = 40 * ui.font_scale;
-        local col_location = 130 * ui.font_scale;
+        -- Columns derive from the font's own measurements, so every
+        -- resolution and font size lands the same layout: the name column
+        -- always clears the icon box by one letter-width, whatever the box
+        -- measures on this machine. Hardcoded pixels broke on other screens.
+        if icon_box_inner == nil then icon_box_inner = icon_text_w('KI') + 4; end
+        local em = icon_text_w('M');
+        local box_total = icon_text_w('[') * 2 + icon_box_inner;
+        local col_task = box_total + em;
+        local col_location = col_task + 13 * em;
 
         -- Get tracking settings for current character
         local tracking = get_char_tracking(char_name);
@@ -2885,7 +3460,7 @@ local function render_ui()
             local entries, dyn_char_left, dyn_acct_left = dynamis_effective_remaining(char_name);
             if not dyn_shared then entries = dyn_store.entries_remaining or CHARACTER_ENTRY_LIMIT; end
             -- Counts render as n/max WITHOUT brackets. Bracketed digits were
-            -- indistinguishable from the [O] used for a ready task in the game's
+            -- indistinguishable from the [o] used for a ready task in the game's
             -- font, so square brackets now always mean status and a bare
             -- fraction always means a count. The cap comes along for free.
             -- Always the character's own cap. `entries` is the LOWER of the
@@ -2902,7 +3477,7 @@ local function render_ui()
             else
                 dyn_color = { 0.0, 1.0, 0.0, 1.0 };  -- Green
             end
-            imgui.TextColored(dyn_color, dyn_icon);
+            draw_row_icon(dyn_icon, dyn_color);
             imgui.SameLine();
             imgui.SetCursorPosX(col_task);
             imgui.Text('Dynamis');
@@ -2934,7 +3509,7 @@ local function render_ui()
 
             local l_max = LIMBUS_CHARACTER_LIMIT;
             if eff == nil then
-                l_icon = ' ? '; l_color = { 1.0, 1.0, 0.0, 1.0 };
+                l_icon = '[?]'; l_color = { 1.0, 1.0, 0.0, 1.0 };
             elseif not known then
                 -- Counting, but the addon never saw the start of this week.
                 l_icon = string.format('?/%d', l_max); l_color = { 1.0, 1.0, 0.0, 1.0 };
@@ -2971,7 +3546,7 @@ local function render_ui()
                 l_where = '(' .. l_dest .. ')';
             end
 
-            imgui.TextColored(l_color, l_icon);
+            draw_row_icon(l_icon, l_color);
             imgui.SameLine();
             imgui.SetCursorPosX(col_task);
             imgui.Text(LIMBUS_ROW_LABEL);
@@ -3018,10 +3593,9 @@ local function render_ui()
             if #held_short > 0 then
                 imgui.TextColored({ 0.0, 1.0, 0.0, 1.0 }, '[KI]');
             else
-                imgui.TextColored({ 0.5, 0.5, 0.5, 1.0 }, '[  ]');
+                imgui.TextColored({ 0.55, 0.55, 0.55, 1.0 }, '[  ]');
             end
             imgui.SameLine();
-            imgui.SetCursorPosX(card_col_name);
             imgui.TextColored({ 1.0, 1.0, 1.0, 1.0 },
                 string.format('Cards %d/%d', #held_short, #LIMBUS_CARDS));
             if #held_short > 0 then
@@ -3050,6 +3624,90 @@ local function render_ui()
             help_marker(card_help);
         end
 
+        -- X'sKnife lives under Limbus (both are the week's battlefields), out
+        -- of the generic task loop so its position is fixed.
+        if tracking.tasks["X'sKnife"] ~= false and tracker.settings.tasks ~= nil then
+            local k_in_list = false;
+            for _, t in ipairs(tracker.settings.tasks) do
+                if normalize_task(t) == 'xsknife' then k_in_list = true; break; end
+            end
+            if k_in_list then
+                local step = char_data.xsknife_data and char_data.xsknife_data.step or 'unknown';
+                local icon, color, location = '[?]', { 1.0, 1.0, 0.0, 1.0 }, '';
+                local help_text = nil;
+                if step == 'done' then icon = '[x]'; color = { 0.55, 0.55, 0.55, 1.0 };
+                elseif step == 'boneyard' then icon = '1/2'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Boneyard Gully';
+                elseif step == 'boneyard_2x' then icon = '2/2'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Boneyard Gully';
+                elseif step == 'despachiaire' then icon = '1/2'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Despachiaire';
+                elseif step == 'scanned_no_ki' then
+                    icon = '?/2'; color = { 1.0, 1.0, 0.0, 1.0 };
+                    help_text = "Fights left this week unknown. Resolves at next tally or when KI obtained.\n/hw knife to toggle.";
+                elseif step == 'scanned_has_ki' then
+                    icon = '?/2'; color = { 1.0, 1.0, 0.0, 1.0 }; location = 'Boneyard Gully';
+                    help_text = "KI in hand; unknown if Despachiaire has another. Resolves at next tally or when KI obtained.\n/hw knife to toggle.";
+                elseif step == 'scanned_has_ki_used' then
+                    icon = '?/2'; color = { 1.0, 1.0, 0.0, 1.0 }; location = 'Despachiaire';
+                    help_text = "Unknown if Despachiaire has KI. Resolves at next tally or when KI obtained.\n/hw knife to toggle.";
+                else
+                    help_text = "Use /hw scan or talk to Despachiaire.\n/hw knife to toggle.";
+                end
+                imgui.BeginGroup();
+                draw_row_icon(icon, color);
+                imgui.SameLine();
+                imgui.SetCursorPosX(col_task);
+                imgui.Text("X'sKnife");
+                if location ~= '' then
+                    imgui.SameLine();
+                    imgui.SetCursorPosX(col_location);
+                    imgui.TextColored({ 0.0, 1.0, 0.0, 1.0 }, '(' .. location .. ')');
+                end
+                imgui.EndGroup();
+                if help_text then help_marker(help_text); end
+            end
+        end
+
+        -- The Ashu Talif chain: count = fights left this week, the status is
+        -- always the one thing to do next. A stage paid before the tally
+        -- survives it, so a fresh week can open already at "fight!".
+        if tracking.tasks[ASHU.ROW_LABEL] ~= false then
+            local a_left, a_stage, a_data = ASHU.state(char_data);
+            local aa_icon, aa_color, aa_status;
+            if a_left == nil then
+                aa_icon = '[?]'; aa_color = { 1.0, 1.0, 0.0, 1.0 };
+                aa_status = (a_data ~= nil) and 'pay to sync' or 'zone once to sync';
+            elseif a_data.failed then
+                aa_icon = '[x]'; aa_color = { 0.55, 0.55, 0.55, 1.0 };
+                aa_status = 'failed - wait for reset';
+            elseif a_left <= 0 then
+                aa_icon = '[x]'; aa_color = { 0.55, 0.55, 0.55, 1.0 };
+                aa_status = 'done!';
+            else
+                aa_icon = string.format('%d/3', a_left);
+                aa_color = { 0.0, 1.0, 0.0, 1.0 };
+                if a_stage ~= nil then
+                    aa_status = (ASHU.NAMES[a_stage] or '?') .. ' - fight!';
+                else
+                    aa_status = 'pay for ' .. (ASHU.NAMES[ASHU.FIRST + (3 - a_left)] or '?');
+                end
+            end
+            imgui.BeginGroup();
+            draw_row_icon(aa_icon, aa_color);
+            imgui.SameLine();
+            imgui.SetCursorPosX(col_task);
+            imgui.Text('Ashu Talif');
+            imgui.SameLine();
+            imgui.SetCursorPosX(col_location);
+            imgui.TextColored({ 0.0, 1.0, 0.0, 1.0 }, '(' .. aa_status .. ')');
+            imgui.EndGroup();
+            help_marker('Three weekly fights from Halshaob in Nashmau, in order:\n'
+                .. 'Scouting (3 bronze) > Painter (1 silver) > Captain (1 mythril).\n'
+                .. 'Win to unlock the next. Losing or crashing burns the chain\n'
+                .. 'until the weekly reset. A stage paid before the reset is not\n'
+                .. 'lost - it can be fought after.\n\n'
+                .. 'Fresh install shows [?] until the addon sees a real event:\n'
+                .. 'paying Halshaob syncs it instantly, and after one weekly\n'
+                .. 'reset it is always known.');
+        end
 
         for _, task in ipairs(tracker.settings.tasks) do
             -- Skip if not tracked for this character
@@ -3058,43 +3716,28 @@ local function render_ui()
             end
 
             local normalized = normalize_task(task);
+            -- X'sKnife renders in its own block under Limbus, not here.
+            if normalized == 'xsknife' then goto continue_task; end
             local icon, color, location = '[?]', { 1.0, 1.0, 0.0, 1.0 }, '';
             local help_text = nil;  -- Help marker text for this specific task
 
-            if normalized == 'xsknife' then
-                local step = char_data.xsknife_data and char_data.xsknife_data.step or 'unknown';
-                if step == 'done' then icon = '[X]'; color = { 1.0, 0.3, 0.3, 1.0 };
-                elseif step == 'boneyard' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Boneyard Gully';
-                elseif step == 'boneyard_2x' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = '2x Boneyard';
-                elseif step == 'despachiaire' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Despachiaire';
-                elseif step == 'scanned_no_ki' then
-                    icon = '[  ]'; color = { 1.0, 1.0, 0.0, 1.0 };
-                    help_text = "Unknown if Despachiaire has KI. Resolves at next tally or when KI obtained.\n/hw knife to toggle.";
-                elseif step == 'scanned_has_ki' then
-                    icon = '[  ]'; color = { 1.0, 1.0, 0.0, 1.0 }; location = 'Boneyard Gully';
-                    help_text = "Unknown if Despachiaire has another KI. Resolves at next tally or when KI obtained.\n/hw knife to toggle.";
-                elseif step == 'scanned_has_ki_used' then
-                    icon = '[  ]'; color = { 1.0, 1.0, 0.0, 1.0 }; location = 'Despachiaire';
-                    help_text = "Unknown if Despachiaire has KI. Resolves at next tally or when KI obtained.\n/hw knife to toggle.";
-                else
-                    help_text = "Use /hw scan or talk to Despachiaire.\n/hw knife to toggle.";
-                end
+            if false then -- (X'sKnife moved to its own block under Limbus)
             elseif normalized == 'highwind' then
                 local step = char_data.quest_steps and char_data.quest_steps.highwind or 'scanned';
-                if step == 'done' then icon = '[X]'; color = { 1.0, 0.3, 0.3, 1.0 };
-                elseif step == 'start' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Airship NM';
+                if step == 'done' then icon = '[x]'; color = { 0.55, 0.55, 0.55, 1.0 };
+                elseif step == 'start' then icon = '[o]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Airship NM';
                 else
-                    icon = '[  ]'; color = { 1.0, 1.0, 0.0, 1.0 };
+                    icon = '[ ]'; color = { 1.0, 1.0, 0.0, 1.0 };
                     help_text = "Unknown progress. Resolves at next tally.\n/hw high to toggle.";
                 end
             elseif normalized == 'uninvited' then
                 local step = char_data.quest_steps and char_data.quest_steps.uninvited or 'unknown';
-                if step == 'done' then icon = '[X]'; color = { 1.0, 0.3, 0.3, 1.0 };
-                elseif step == 'justinius' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Justinius - Start';
-                elseif step == 'bcnm' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'BCNM Monarch';
-                elseif step == 'justinius_return' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Justinius - Reward';
+                if step == 'done' then icon = '[x]'; color = { 0.55, 0.55, 0.55, 1.0 };
+                elseif step == 'justinius' then icon = '[o]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Justinius - Start';
+                elseif step == 'bcnm' then icon = '[o]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'BCNM Monarch';
+                elseif step == 'justinius_return' then icon = '[o]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Justinius - Reward';
                 elseif step == 'scanned' then
-                    icon = '[  ]'; color = { 1.0, 1.0, 0.0, 1.0 };
+                    icon = '[ ]'; color = { 1.0, 1.0, 0.0, 1.0 };
                     help_text = "Unknown progress. Resolves at next tally.\n/hw uninvited to toggle.";
                 else
                     icon = '[?]'; color = { 1.0, 1.0, 0.0, 1.0 };
@@ -3102,12 +3745,12 @@ local function render_ui()
                 end
             elseif normalized == 'spicegals' then
                 local step = char_data.quest_steps and char_data.quest_steps.spicegals or 'unknown';
-                if step == 'done' then icon = '[X]'; color = { 1.0, 0.3, 0.3, 1.0 };
-                elseif step == 'rouva' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Rouva - Start';
-                elseif step == 'riverne' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Riverne B';
-                elseif step == 'rouva_return' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Rouva - Reward';
+                if step == 'done' then icon = '[x]'; color = { 0.55, 0.55, 0.55, 1.0 };
+                elseif step == 'rouva' then icon = '[o]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Rouva - Start';
+                elseif step == 'riverne' then icon = '[o]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Riverne B';
+                elseif step == 'rouva_return' then icon = '[o]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Rouva - Reward';
                 elseif step == 'scanned' then
-                    icon = '[  ]'; color = { 1.0, 1.0, 0.0, 1.0 };
+                    icon = '[ ]'; color = { 1.0, 1.0, 0.0, 1.0 };
                     help_text = "Unknown progress. Resolves at next tally.\n/hw spice to toggle.";
                 else
                     icon = '[?]'; color = { 1.0, 1.0, 0.0, 1.0 };
@@ -3115,12 +3758,12 @@ local function render_ui()
                 end
             elseif normalized == 'cookbook' then
                 local step = char_data.quest_steps and char_data.quest_steps.cookbook or 'unknown';
-                if step == 'done' then icon = '[X]'; color = { 1.0, 0.3, 0.3, 1.0 };
-                elseif step == 'jonette' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Jonette - Start';
-                elseif step == 'sacrarium' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Sacrarium';
-                elseif step == 'jonette_return' then icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Jonette - Reward';
+                if step == 'done' then icon = '[x]'; color = { 0.55, 0.55, 0.55, 1.0 };
+                elseif step == 'jonette' then icon = '[o]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Jonette - Start';
+                elseif step == 'sacrarium' then icon = '[o]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Sacrarium';
+                elseif step == 'jonette_return' then icon = '[o]'; color = { 0.0, 1.0, 0.0, 1.0 }; location = 'Jonette - Reward';
                 elseif step == 'scanned' then
-                    icon = '[  ]'; color = { 1.0, 1.0, 0.0, 1.0 };
+                    icon = '[ ]'; color = { 1.0, 1.0, 0.0, 1.0 };
                     help_text = "Unknown progress. Resolves at next tally or use /hw cookbook.";
                 else
                     icon = '[?]'; color = { 1.0, 1.0, 0.0, 1.0 };
@@ -3133,20 +3776,20 @@ local function render_ui()
                 local available_text = eco_available_text(eco_data.locked_nations);
 
                 if step == 'done' then
-                    icon = '[X]'; color = { 1.0, 0.3, 0.3, 1.0 };
+                    icon = '[x]'; color = { 0.55, 0.55, 0.55, 1.0 };
                     location = available_text;
                 elseif step == 'ready' then
                     -- Known ready state
-                    icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 };
+                    icon = '[o]'; color = { 0.0, 1.0, 0.0, 1.0 };
                     location = available_text;
                 elseif step == 'scanned' then
                     -- Scanned but uncertain if done - YELLOW
-                    icon = '[  ]'; color = { 1.0, 1.0, 0.0, 1.0 };
+                    icon = '[ ]'; color = { 1.0, 1.0, 0.0, 1.0 };
                     location = available_text;
                     help_text = "Unknown if completed. Resolves at next tally or quest interaction.";
                 elseif step == 'scanned_has_ki' then
                     -- Has KI but locked nations unknown - YELLOW
-                    icon = '[  ]'; color = { 1.0, 1.0, 0.0, 1.0 };
+                    icon = '[ ]'; color = { 1.0, 1.0, 0.0, 1.0 };
                     local nation = eco_data.current_nation;
                     if nation then
                         local zone_info = ECOWARRIOR_ZONES[nation];
@@ -3156,9 +3799,9 @@ local function render_ui()
                 elseif step == 'field_agent' or step == 'nm' or step == 'field_agent_return' or step == 'reward' then
                     -- In progress - color depends on knows_status
                     if knows then
-                        icon = '[O]'; color = { 0.0, 1.0, 0.0, 1.0 };
+                        icon = '[o]'; color = { 0.0, 1.0, 0.0, 1.0 };
                     else
-                        icon = '[  ]'; color = { 1.0, 1.0, 0.0, 1.0 };
+                        icon = '[ ]'; color = { 1.0, 1.0, 0.0, 1.0 };
                         help_text = "Status uncertain. Resolves at quest interaction.";
                     end
                     local nation = eco_data.current_nation;
@@ -3180,7 +3823,7 @@ local function render_ui()
             
             -- Render with column alignment (grouped for hover detection)
             imgui.BeginGroup();
-            imgui.TextColored(color, icon);
+            draw_row_icon(icon, color);
             imgui.SameLine();
             imgui.SetCursorPosX(col_task);
             imgui.Text(task);
@@ -3202,23 +3845,29 @@ local function render_ui()
         imgui.Spacing();
 
         -- Timers header
-        draw_gradient_header('Timers', imgui.GetContentRegionAvail(), '[?] = Use /hw scan to detect timers\n[KI]/[  ] = Timer unknown. Updates when KI obtained.');
+        draw_gradient_header('Timers', imgui.GetContentRegionAvail(), '[KI] in your bag - fight open    [    ] ready, KI not taken\n[ x ] on cooldown    [ ? ] unknown - /hw scan\nCounts are remaining/max. Status shows a time or what to do next.');
 
         -- Timer column positions scaled with font
-        local timer_col_name = 40 * ui.font_scale;
-        local timer_col_status = 200 * ui.font_scale;
+        if icon_box_inner == nil then icon_box_inner = icon_text_w('KI') + 4; end
+        local em = icon_text_w('M');
+        local box_total = icon_text_w('[') * 2 + icon_box_inner;
+        local timer_col_name = box_total + em;
+        local timer_col_status = timer_col_name + 23 * em;
 
         -- Assault tags belong here, not in Weeklies: they refill on a rolling
         -- 24 hour clock rather than resetting with the week.
         if tracking.timers[ASSAULT_ROW_LABEL] ~= false then
             local carried = assault_holding_tag(char_name);
-            local stored, next_tag, max_stock = assault_state(char_data);
+            local stored, next_tag, max_stock = assault_state(char_data, char_name);
+            -- Rank, points and the current mission stay personal; only the stock
+            -- and its clock come from the pool.
             local ad_r = char_data.assault_data or {};
+            local a_pool = get_assault_store(char_name) or ad_r;
             local a_icon, a_color, a_status, a_help;
 
             if stored == nil then
-                a_icon = ' ? '; a_color = { 1.0, 1.0, 0.0, 1.0 };
-                a_status = 'Unknown';
+                a_icon = '[?]'; a_color = { 1.0, 1.0, 0.0, 1.0 };
+                a_status = 'see Rytaal';
                 a_help = 'Talk to Rytaal once and the tag count will appear.\n'
                       .. 'Carrying a tag: ' .. (carried and 'yes' or 'no');
             else
@@ -3226,16 +3875,26 @@ local function render_ui()
                 if stored == 0 then a_color = { 1.0, 0.3, 0.3, 1.0 };
                 elseif stored == 1 then a_color = { 1.0, 1.0, 0.0, 1.0 };
                 else a_color = { 0.0, 1.0, 0.0, 1.0 }; end
-                a_status = (next_tag > 0) and format_time_short(next_tag - current_time) or 'full';
-                local ago = current_time - (ad_r.checked_at or 0);
+                -- Key off the stock. Reading "full" from next_tag == 0 showed a
+                -- partly-filled pool as full whenever the clock was missing.
+                if stored >= max_stock then
+                    a_status = nil;   -- 3/3 already says full
+                elseif next_tag > 0 then
+                    a_status = format_time_short(next_tag - current_time);
+                else
+                    a_status = 'see Rytaal';   -- partial stock, no clock on record
+                end
+                local ago = current_time - (a_pool.checked_at or 0);
                 a_help = string.format(
                     'Waiting at Rytaal: %d / %d\nCarrying: %d      Total usable: %d\n%s\n'
                  .. 'Last checked with Rytaal %s ago.\n'
                  .. 'Counts refresh whenever you open Rytaal\'s menu.',
                     stored, max_stock, carried and 1 or 0, stored + (carried and 1 or 0),
-                    next_tag > 0
-                        and ('Next tag in ' .. format_time_short(next_tag - current_time))
-                        or  'Stock is full - no clock running.',
+                    (stored >= max_stock)
+                        and 'Stock is full - no clock running.'
+                        or (next_tag > 0
+                            and ('Next tag in ' .. format_time_short(next_tag - current_time))
+                            or  'No restock clock recorded - open Rytaal\'s menu to set it.'),
                     format_elapsed_short(ago));
             end
             if ad_r.rank then
@@ -3250,13 +3909,15 @@ local function render_ui()
                 if #plist > 0 then a_help = a_help .. '\nPoints: ' .. table.concat(plist, ', '); end
             end
 
-            imgui.TextColored(a_color, a_icon);
+            draw_row_icon(a_icon, a_color);
             imgui.SameLine();
             imgui.SetCursorPosX(timer_col_name);
             imgui.Text(ASSAULT_ROW_SHORT);
-            imgui.SameLine();
-            imgui.SetCursorPosX(timer_col_status);
-            imgui.TextColored({ 0.4, 0.7, 0.9, 1.0 }, '(' .. a_status .. ')');
+            if a_status ~= nil then
+                imgui.SameLine();
+                imgui.SetCursorPosX(timer_col_status);
+                imgui.TextColored({ 0.4, 0.7, 0.9, 1.0 }, '(' .. a_status .. ')');
+            end
             if a_help then help_marker(a_help); end
 
             -- One sub-row, not two. A tag becomes orders the moment you pick a
@@ -3267,14 +3928,15 @@ local function render_ui()
             local sub_col_name = timer_col_name + sub_indent;
             local rank_name = ad_r.rank and MERCENARY_RANKS[ad_r.rank] or nil;
 
+            -- Sub-rows flow inline: plain [KI] and one normal space, no fixed
+            -- columns - they are annotations, not table rows.
             imgui.SetCursorPosX(sub_indent);
             if area ~= nil or carried then
                 imgui.TextColored({ 0.0, 1.0, 0.0, 1.0 }, '[KI]');
             else
-                imgui.TextColored({ 0.5, 0.5, 0.5, 1.0 }, '[  ]');
+                imgui.TextColored({ 0.55, 0.55, 0.55, 1.0 }, '[  ]');
             end
             imgui.SameLine();
-            imgui.SetCursorPosX(sub_col_name);
             imgui.TextColored({ 1.0, 1.0, 1.0, 1.0 },
                 area or (carried and 'Carrying Tag' or 'No Tag'));
             if area ~= nil and rank_name ~= nil then
@@ -3295,6 +3957,50 @@ local function render_ui()
                 .. (pts and ('\nAssault points here: ' .. pts) or ''));
         end
 
+        -- ISNM: one line. Icon answers "am I holding an order" (ready to
+        -- fight); the status is Shajaf's buy clock. Personal and daily - the
+        -- weekly reset never touches it.
+        if tracking.timers[ISNM_ROW_LABEL] ~= false then
+            local cd_i = tracker.settings.characters[char_name];
+            resolve_isnm_unknown(cd_i, char_name);
+            local isnm = cd_i and cd_i.isnm_data or nil;
+            local held = isnm_held_ki(char_name);
+            local now = os.time();
+            local nbt = isnm and isnm.next_buy_time or nil;
+            local name = (held == ISNM_SECRET_KI and 'ISNM: 3000 held')
+                      or (held == ISNM_CONFIDENTIAL_KI and 'ISNM: 2000 held')
+                      or 'ISNM';
+            local icon, icolor, status;
+            if isnm ~= nil and isnm.no_badge then
+                icon, icolor, status = '[ ]', { 0.55, 0.55, 0.55, 1.0 }, 'need badge';
+            else
+                if nbt == nil then status = 'see Shajaf';
+                elseif now >= nbt then status = 'buy ready';
+                else status = 'buy ' .. format_time_short(nbt - now); end
+                if held ~= nil then
+                    icon, icolor = '[KI]', { 0.0, 1.0, 0.0, 1.0 };     -- order in the bag
+                elseif nbt == nil then
+                    icon, icolor = '[?]', { 1.0, 1.0, 0.0, 1.0 };      -- first launch: unknown
+                elseif now >= nbt then
+                    icon, icolor = '[ ]', { 0.0, 1.0, 0.0, 1.0 };      -- shop open: go get it
+                else
+                    icon, icolor = '[x]', { 0.55, 0.55, 0.55, 1.0 };
+                end
+            end
+            draw_row_icon(icon, icolor);
+            imgui.SameLine();
+            imgui.SetCursorPosX(timer_col_name);
+            imgui.Text(name);
+            imgui.SameLine();
+            imgui.SetCursorPosX(timer_col_status);
+            imgui.TextColored({ 0.4, 0.7, 0.9, 1.0 }, '(' .. status .. ')');
+            help_marker('Imperial Standing NM. Buy an order from Shajaf in Whitegate:'
+                .. '\nConfidential (2000) for the level 60 fights, Secret (3000)'
+                .. '\nfor the uncapped ones. One purchase per day, resetting at'
+                .. '\nJapanese midnight. The order never expires: hold it across'
+                .. '\nthe reset and you can fight twice back to back. Only the'
+                .. '\nplayer who opens the fight spends their order.');
+        end
 
         for _, enm in ipairs(ENM_KEY_ITEMS) do
             -- Skip if not tracked for this character
@@ -3306,55 +4012,63 @@ local function render_ui()
             local icon, icon_color, status_text;
             local timer_help_text = nil;
             
+            -- Icons: [KI] green = the key item is in the bag (fight open),
+            -- [    ] green = fight open but the KI not taken yet,
+            -- [ x ] grey = waiting on the clock, [ ? ] yellow = unknown.
+            -- [KI] is always green and only ever means "in the bag" - color
+            -- never changes its meaning.
             if timer_data == nil then
-                -- No data at all
-                icon = '[?]'; icon_color = { 1.0, 1.0, 0.0, 1.0 };
-                status_text = 'Unknown';
+                icon = '[ ? ]'; icon_color = { 1.0, 1.0, 0.0, 1.0 };
+                status_text = '/hw scan';
                 timer_help_text = "Use /hw scan to detect timers.";
             elseif timer_data.next_ki_time == nil or timer_data.next_ki_time == 0 then
                 -- Have timer_data but no time set
                 if timer_data.has_ki then
-                    icon = '[KI]'; icon_color = { 1.0, 1.0, 0.0, 1.0 };
-                    timer_help_text = "Have KI. Timer unknown. Updates when KI obtained.";
+                    icon = '[KI]'; icon_color = { 0.0, 1.0, 0.0, 1.0 };
+                    status_text = 'Ready';
+                    timer_help_text = "KI in hand - fight open. Next-KI timer unknown; updates when KI obtained.";
                 else
-                    icon = '[  ]'; icon_color = { 1.0, 1.0, 0.0, 1.0 };
+                    icon = '[ ? ]'; icon_color = { 1.0, 1.0, 0.0, 1.0 };
+                    status_text = 'Unknown';
                     timer_help_text = "No KI. Timer unknown. Updates when KI obtained.";
                 end
-                status_text = 'Unknown';
             else
                 local remaining = timer_data.next_ki_time - current_time;
-                
+
                 if remaining <= 0 then
                     -- Timer expired = Ready
                     if timer_data.has_ki then
                         icon = '[KI]'; icon_color = { 0.0, 1.0, 0.0, 1.0 };
+                        timer_help_text = "KI in hand - fight open.";
                     else
-                        icon = '[  ]'; icon_color = { 0.0, 1.0, 0.0, 1.0 };
+                        icon = '[    ]'; icon_color = { 0.0, 1.0, 0.0, 1.0 };
                     end
                     status_text = 'Ready';
                 elseif timer_data.timer_source == 'scan' then
-                    -- Scan-based timer = Unknown status
+                    -- Scan-based timer: the clock is an estimate
                     if timer_data.has_ki then
-                        icon = '[KI]'; icon_color = { 1.0, 1.0, 0.0, 1.0 };
-                        timer_help_text = "Have KI. Timer unknown. Updates when KI obtained.";
+                        icon = '[KI]'; icon_color = { 0.0, 1.0, 0.0, 1.0 };
+                        status_text = 'Ready';
+                        timer_help_text = "KI in hand - fight open. Next-KI timer unknown; updates when KI obtained.";
                     else
-                        icon = '[  ]'; icon_color = { 1.0, 1.0, 0.0, 1.0 };
+                        icon = '[ ? ]'; icon_color = { 1.0, 1.0, 0.0, 1.0 };
+                        status_text = 'Unknown';
                         timer_help_text = "No KI. Timer unknown. Updates when KI obtained.";
                     end
-                    status_text = 'Unknown';
                 else
                     -- Real timer counting down
                     if timer_data.has_ki then
                         icon = '[KI]'; icon_color = { 0.0, 1.0, 0.0, 1.0 };
+                        timer_help_text = "KI in hand - fight open. The countdown is for the NEXT KI.";
                     else
-                        icon = '[  ]'; icon_color = { 1.0, 0.0, 0.0, 1.0 };
+                        icon = '[ x ]'; icon_color = { 0.55, 0.55, 0.55, 1.0 };
                     end
                     status_text = format_time_short(remaining);
                 end
             end
             
             -- Render with column alignment
-            imgui.TextColored(icon_color, icon);
+            draw_row_icon(icon, icon_color);
             imgui.SameLine();
             imgui.SetCursorPosX(timer_col_name);
             imgui.Text(enm.name);
@@ -3393,13 +4107,21 @@ local function render_ui()
                 imgui.Spacing();
                 imgui.Spacing();
 
-                draw_gradient_header('Dynamis Sharing', imgui.GetContentRegionAvail(),
-                    'Horizon counts Dynamis per account: 3 entries per account, 2 per character.\nGroup the characters that share one account. Characters left out of every account just get their own 2.');
+                draw_gradient_header('Account Sharing', imgui.GetContentRegionAvail(),
+                    'Horizon counts some things per account, not per character:\nDynamis entries, Limbus runs, and Rytaal\'s assault tag stock.\nGroup the characters that share one account. Characters left\nout of every account just keep their own private counts.');
 
                 local aw = { tracker.settings.dynamis_account_wide == true };
-                if imgui.Checkbox('Horizon: account-wide Dynamis entries', aw) then
+                if imgui.Checkbox('Horizon: account-wide counters (Dynamis / Limbus / Assault)', aw) then
                     tracker.settings.dynamis_account_wide = aw[1];
                     ui.pending_account_add = nil;
+                    -- Turning sharing off is an exit path too.
+                    if not aw[1] then
+                        for _, acct in ipairs(dynamis_accounts()) do
+                            for _, cname in ipairs(acct.chars or {}) do
+                                inherit_assault_from_pool(acct, cname);
+                            end
+                        end
+                    end
                     -- Pools can be stale from a previous session; turning sharing
                     -- back on has to re-derive them rather than trust old numbers.
                     if aw[1] then
@@ -3510,7 +4232,7 @@ local function render_ui()
                     -- Dynamis is not one of tracker.settings.tasks, but it has a
                     -- row in the Weeklies list so it gets its own toggle.
                     imgui.Indent(2);
-                    for _, label in ipairs({ DYNAMIS_ROW_LABEL, LIMBUS_ROW_LABEL }) do
+                    for _, label in ipairs({ DYNAMIS_ROW_LABEL, LIMBUS_ROW_LABEL, ASHU.ROW_LABEL }) do
                         local box = { tracking.tasks[label] ~= false };
                         if imgui.Checkbox(label, box) then
                             tracking.tasks[label] = box[1];
@@ -3633,6 +4355,11 @@ local function render_ui()
                         tracking.timers[ASSAULT_ROW_LABEL] = asl_box[1];
                         save_display_settings();
                     end
+                    local isnm_box = { tracking.timers[ISNM_ROW_LABEL] ~= false };
+                    if imgui.Checkbox(ISNM_ROW_LABEL, isnm_box) then
+                        tracking.timers[ISNM_ROW_LABEL] = isnm_box[1];
+                        save_display_settings();
+                    end
                     imgui.Unindent(2);
 
                     -- Timer checkboxes (indented). Limbus is a weekly now, so it
@@ -3668,6 +4395,7 @@ local function render_ui()
         ui.style_colors = 0; ui.style_vars = 0;
     end
     imgui.End();
+    if grip_pushed > 0 then imgui.PopStyleColor(grip_pushed); end
     ui.began = false;
 end
 
@@ -3853,9 +4581,10 @@ ashita.events.register('load', 'load_cb', function()
     if tracker.settings.dynamis_account_wide then
         local changed = false;
         for _, acct in ipairs(tracker.settings.dynamis_accounts or {}) do
-            local before = acct.entries_remaining;
-            recalc_account_from_members(acct);
-            if acct.entries_remaining ~= before then changed = true; end
+            -- Ask the function what it did. Comparing fields missed the case
+            -- where a member's frozen reading already matched the pool: records
+            -- were cleared but nothing looked different.
+            if recalc_account_from_members(acct) then changed = true; end
         end
         if changed then save_settings(); end
     end
@@ -4088,6 +4817,7 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
             tracker.login_state.waiting_for_login = true;
             tracker.kis = {};
             tracker.kis_initialized = false;
+    tracker.isnm_observed_since = nil;
             print_msg('Logout detected.');
         end
         return;
@@ -4118,6 +4848,11 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
                     -- five second window used to eat the flag, so the real break
                     -- that followed was misread as a trade.
                     if serial == nil then return; end
+                    -- Remember every charged glass that lands in the bag,
+                    -- break OR trade, before any early return below. This is
+                    -- what identifies the glass at zone-in: the bag read there
+                    -- has proven unreliable, the packet has not.
+                    remember_held_glass(get_char_data(), serial, glass_zone);
                     local store = get_dynamis_store(tracker.current_char);
                     -- Race, documented rather than papered over: a glass traded
                     -- to you inside the five second window is just as parsable
@@ -4159,6 +4894,33 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
                 if #data < MENU_OFFSET_MENU_ID + 2 then return; end
                 local menu_id = struct.unpack('H', data, MENU_OFFSET_MENU_ID + 1);
 
+                -- Shajaf in Whitegate: which of his four menus opens IS the
+                -- ISNM state, so talking to him is a free truth-check - the
+                -- same trick as Rytaal's stock counter. Gated on the zone id
+                -- because small menu numbers repeat across zones.
+                if menu_id >= ISNM_MENU_CAN_BUY and menu_id <= ISNM_MENU_LOCKED then
+                    if #data < MENU_OFFSET_ZONE + 2 then return; end
+                    local mzone = struct.unpack('H', data, MENU_OFFSET_ZONE + 1);
+                    if mzone ~= ISNM_SHAJAF_ZONE then return; end
+                    local cd = get_char_data();
+                    if cd == nil then return; end
+                    local isnm = isnm_data_for(cd);
+                    if menu_id == ISNM_MENU_CAN_BUY then
+                        isnm.next_buy_time = os.time();   -- purchasable right now
+                        isnm.no_badge = nil;
+                    elseif menu_id == ISNM_MENU_LOCKED then
+                        isnm.next_buy_time = next_jst_midnight(os.time());
+                        isnm.no_badge = nil;
+                    elseif menu_id == ISNM_MENU_NO_BADGE then
+                        isnm.no_badge = true;
+                    end
+                    -- 161 (already holding) changes nothing: the key item table
+                    -- already knows what is held, and the menu does not reveal
+                    -- whether the daily lock is also running.
+                    save_settings();
+                    return;
+                end
+
                 -- One of the five mission givers: their menu carries the
                 -- mercenary rank and that area's assault points.
                 local giver_area = MISSION_GIVER_MENUS[menu_id];
@@ -4193,19 +4955,40 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
                 local stock  = struct.unpack('L', data, MENU_PARAM_TAG_STOCK + 1);
                 local mission = struct.unpack('L', data, MENU_PARAM_ASSAULT + 1);
                 local anchor = struct.unpack('L', data, MENU_PARAM_TAG_TIME + 1);
-                if stock == nil or stock > 16 then return; end   -- sanity guard
+                -- Anything above the known maximum is a bad read, not a bigger
+                -- stock. Previously admitted up to 16 and rendered as "7/3".
+                -- Say so once per session: if the server ever raises the cap this
+                -- turns a silently stale display into something reportable.
+                if stock == nil then return; end
+                if stock > 4 then
+                    if not tracker.warned_tag_stock then
+                        tracker.warned_tag_stock = true;
+                        print_msg(string.format(
+                            'Rytaal reported %d tags, above the expected maximum - ignoring.', stock));
+                    end
+                    return;
+                end
 
                 local char_data = get_char_data();
                 if char_data == nil then return; end
                 if char_data.assault_data == nil then char_data.assault_data = new_assault_data(); end
-                local ad = char_data.assault_data;
+                -- Rytaal reports the account's stock, so it lands in the pool.
+                -- currentAssault is personal and stays on the character.
+                local ad = get_assault_store(tracker.current_char) or char_data.assault_data;
+                char_data.assault_data.current_assault = mission or 0;
 
                 ad.tags_stored     = stock;
                 ad.checked_at      = os.time();
-                ad.current_assault = mission or 0;
                 -- The cap is never sent, so infer it upward if we ever see more
                 -- than the default. It can legitimately be 4.
-                if stock > (ad.max_stock or ASSAULT_DEFAULT_MAX_STOCK) then ad.max_stock = stock; end
+                -- Retail allows 4 for a Second Lieutenant who has cleared every
+                -- assault; Horizon is a flat 3. The inference used to ratchet up
+                -- permanently with no way down, so one garbage packet reading of
+                -- 7 would have shown n/7 on every character forever - and now on
+                -- a pool everyone shares.
+                if stock > (ad.max_stock or ASSAULT_DEFAULT_MAX_STOCK) and stock <= 4 then
+                    ad.max_stock = stock;
+                end
                 -- anchor == 0 means the stock is full and no timer is running.
                 -- The anchor field can hold a stale value while the stock is
                 -- full - seen in a live capture where Rytaal had all 3 and still
@@ -4224,11 +5007,91 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
         return;
     end
 
+    -- Quest log update. The ToAU chunks carry the Ashu Talif chain: chunk
+    -- 0x0080 = active bits, 0x00C0 = completed bits, bit index = quest id.
+    -- Sent on every zone-in and whenever a flag changes, so a mid-chain
+    -- install picks up the true state on the first zoning.
+    if id == 0x056 then
+        if data == nil or #data < 0x26 then return; end
+        local chunk = struct.unpack('H', data, 0x24 + 1);
+        if chunk ~= 0x0080 and chunk ~= 0x00C0 then return; end
+        local char_data = get_char_data();
+        if char_data == nil then return; end
+        local ash = ASHU.data_for(char_data);
+        -- quests 101..103 all live in byte 12 (0-based) of the 32-byte body
+        local b = data:byte(4 + 12 + 1) or 0;
+        local changed = false;
+        for q = ASHU.FIRST, ASHU.LAST do
+            local set = math.floor(b / 2 ^ (q % 8)) % 2 == 1;
+            local key = tostring(q);
+            local map = (chunk == 0x0080) and ash.active or ash.completed;
+            if (map[key] == true) ~= set then
+                map[key] = set or nil;
+                changed = true;
+                -- The win signal that works EVERY week: the active bit drops
+                -- while we are aboard for that stage. (The completed bit also
+                -- flips on a first-ever clear; both funnel through wins, so
+                -- neither can double-count.)
+                local won_stage = nil;
+                if chunk == 0x0080 and not set and ash.aboard == true
+                   and ash.aboard_stage == q then
+                    won_stage = q;
+                elseif chunk == 0x00C0 and set and ash.aboard == true then
+                    won_stage = ash.aboard_stage or q;
+                end
+                if won_stage ~= nil then
+                    local w = won_stage - ASHU.FIRST + 1;
+                    if (ash.wins or 0) < w then
+                        ash.wins = w;
+                        print_success(string.format('Ashu Talif: %s cleared!',
+                            ASHU.NAMES[won_stage] or tostring(won_stage)));
+                    end
+                    ash.aboard = nil;
+                    ash.aboard_stage = nil;
+                end
+            end
+        end
+        if ash.known ~= true then ash.known = true; changed = true; end
+        if changed then save_settings(); end
+        return;
+    end
+
     if id == 0x000A then
         if data == nil or #data < 0x94 then return; end
         -- Get zone ID from packet
         local zone_id = struct.unpack('H', data, 0x30 + 1) or 0;
         
+        -- The Ashu Talif: boarding starts a fight, leaving ends one. Any way
+        -- off the ship counts - homepoint, warp, eject, or a relog straight to
+        -- land - because the judgment is simply "left without the win flag".
+        -- The win flag itself arrives while still aboard, so a won fight can
+        -- never be mistaken for a fail here.
+        if tracker.current_char ~= 'Unknown' then
+            local cd_ashu = tracker.settings.characters[tracker.current_char];
+            if cd_ashu ~= nil and type(cd_ashu.ashu_data) == 'table' then
+                local ash = cd_ashu.ashu_data;
+                if zone_id == ASHU.SHIP_ZONE then
+                    -- The same ship hosts the Black Coffin story mission and
+                    -- the COR job fight. Only a boarding WITH a chain quest
+                    -- active is ours to judge.
+                    local _, stage = ASHU.state(cd_ashu);
+                    if ash.aboard ~= true and stage ~= nil then
+                        ash.aboard = true;
+                        ash.aboard_stage = stage;
+                        save_settings();
+                    end
+                elseif ash.aboard == true then
+                    -- Off the ship. Won fights already cleared aboard when the
+                    -- completed bit arrived; still aboard here means no win.
+                    ash.aboard = nil;
+                    ash.aboard_stage = nil;
+                    ash.failed = true;
+                    save_settings();
+                    print_error('Ashu Talif: the run was lost. The chain waits for the weekly reset.');
+                end
+            end
+        end
+
         -- Check if this is a Dynamis zone.
         -- ORDERING IS LOAD-BEARING: on a fresh login current_char is still
         -- 'Unknown' here, because the waiting_for_login branch further down is
@@ -4245,14 +5108,19 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
                 -- glass someone else broke - same zone or not - is a new serial and
                 -- counts here.
                 -- Arriving in the zone we just broke a glass for is that run
-                -- starting, so it must not count again. An hourglass is only good
-                -- for an hour, so anything older than that is a genuinely new run
-                -- into the same zone.
+                -- starting, so it must not count again. A glass is dead 210
+                -- minutes after the break at the outside, so anything older is
+                -- a genuinely new run into the same zone.
                 local since_break = os.time() - (store.last_break_time or 0);
                 if store.last_break_zone == zone_id and since_break <= DYNAMIS_GLASS_LIFETIME then
                     -- already counted when the glass was broken
                 else
-                    local serial = find_glass_serial(zone_id);
+                    -- The glass remembered from its 0x020 packet first; the
+                    -- bag read stays only as a second chance, since on this
+                    -- client it usually returns nothing.
+                    local cd = tracker.settings.characters[tracker.current_char];
+                    local serial = held_glass_serial(cd, zone_id)
+                        or find_glass_serial(zone_id);
                     if serial == nil then
                         -- No readable glass. A bare 'zone-N' key swallowed a
                         -- second legitimate run into the same zone; a fixed hour
@@ -4262,8 +5130,12 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
                         -- inside the hourglass lifetime.
                         local now = os.time();
                         local prefix = 'zone-' .. tostring(zone_id) .. '-';
+                        -- '-' is a pattern quantifier in Lua, not a literal
+                        -- dash. Unescaped, this guard searched for keys it can
+                        -- never match - its own - and so had never fired once.
+                        local pat = '^' .. prefix:gsub('%-', '%%-') .. '(%d+)$';
                         for _, sn in ipairs(store.counted_glasses or {}) do
-                            local stamp = tostring(sn):match('^' .. prefix .. '(%d+)$');
+                            local stamp = tostring(sn):match(pat);
                             if stamp ~= nil and (now - tonumber(stamp)) <= DYNAMIS_GLASS_LIFETIME then
                                 serial = sn;
                                 break;
@@ -4283,6 +5155,7 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
             tracker.login_state.waiting_for_login = false;
             tracker.kis = {};
             tracker.kis_initialized = false;
+    tracker.isnm_observed_since = nil;
             local name_offset = 0x84 + 1;
             local raw_name = data:sub(name_offset, name_offset + 15);
             local current_char = raw_name:match("^[%w]+") or 'Unknown';
@@ -4351,6 +5224,7 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
             tracker.login_state.suppress_ki_events = false;
             tracker.login_state.ki_packets_received = 0;
             tracker.kis_initialized = true;
+    if tracker.isnm_observed_since == nil then tracker.isnm_observed_since = os.time(); end
             tracker.login_state.waiting_for_ki = false;
             -- Reconcile after EVERY rebaseline, not just the first. Key items
             -- consumed as part of zoning never fire on_ki_lost, because events
@@ -4424,6 +5298,7 @@ ashita.events.register('d3d_present', 'd3d_present_cb', function()
            and tracker.login_state.blocks_this_zone >= 7
            and next(tracker.kis) ~= nil then
             tracker.kis_initialized = true;
+    if tracker.isnm_observed_since == nil then tracker.isnm_observed_since = os.time(); end
         end
     end
     if tracker.next_check_time > 0 and current_time >= tracker.next_check_time then
