@@ -5,7 +5,33 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-ad
+addon.version   = '3.8';
+addon.desc      = 'Weekly homework tracker for FFXI';
+addon.link      = '';
+
+require('common');
+local imgui = require('imgui');
+
+-- UI State
+local ui = {
+    is_open = { false },
+    selected_char = { 0 },  -- Shared character selection for both tabs
+    selected_name = nil,    -- Name behind that index, so a rebuild keeps the choice
+    char_list = {},
+    font_scale = 1.2,
+    -- Resolved lazily in render_ui: read at file-load time this could capture
+    -- nil if the ImGui globals are not populated yet, leaving the window
+    -- permanently collapsible with no way back short of a reload.
+    window_flags = nil,
+    -- Set when render_ui throws, so a broken frame does not repeat 60x a second.
+    -- Cleared by /hw show and by a factory reset, both of which change the state
+    -- that caused it.
+    render_failed = false,
+    char_list_combo = nil,   -- cached '\0'-joined dropdown string
+    -- Push depths, so a throw inside render_ui can be unwound cleanly
+    style_colors = 0,
+    style_vars = 0,
+    fonts_pushed = 0,
     began = false,
     -- Set when a tick lands on a full account: { char = name, from = index }
     pending_account_add = nil,
