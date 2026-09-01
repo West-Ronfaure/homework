@@ -5,7 +5,7 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-addon.version   = '3.7';
+addon.version   = '3.8';
 addon.desc      = 'Weekly homework tracker for FFXI';
 addon.link      = '';
 
@@ -608,37 +608,106 @@ function ASHU.data_for(cd)
     return a;
 end
 
--- The chain's state for display. Returns fights_left (nil = never seen a
--- quest-log packet), the stage to act on, and the data table.
+-- ===== The chain as a state machine =====
+-- Built from a full REPEAT-week capture (2026-08-31): on repeat weeks the
+-- quest book never moves, so every signal here is a menu number or a system
+-- line, all observed three times each:
+--   pay   : Halshaob menu 302 (zone 53) carrying the quest id in its params
+--   board : zone 60 (after the Cutter's menu 222 in Arrapago)
+--   win   : "Objective complete. You may return on the lifeboat."
+--   loss  : "The mission has failed." - or leaving the ship with no win
+-- The quest-book bits are kept only as a first-ever-week bonus that funnels
+-- into the same functions.
 --
--- CONFIRMED 2026-08-25: the COMPLETED bits are permanent - they never
--- clear at the tally. A completion has no date, so those bits can never
--- prove anything about THIS week and are deliberately not counted at
--- all (they stay mirrored only as a redundant win signal while aboard).
--- What counts is only what the addon observed:
---   1. a.wins - the ACTIVE bit dropping while aboard. Works every week.
---   2. the active stage id - Painter active means Scouting fell first.
--- A character with no observations this week is UNSYNCED, shown [?],
--- until a payment appears or a weekly reset passes. Witnessing a reset
--- sets the explicit a.anchored flag - an explicit flag, NOT "does some
--- table exist", because the sanitizer creates empty tables and made
--- every character look anchored.
+-- ashu_data: stage (1..3, chain position), paid, aboard, done, failed,
+-- anchored (a weekly reset was witnessed), known (quest book seen once).
+ASHU.NAMES_BY_STAGE = { [1] = 'Scouting', [2] = 'Painter', [3] = 'Captain' };
+
+local function ashu_synced(a)
+    return a.anchored == true or a.paid == true or a.aboard == true
+        or a.done == true or a.failed == true or (a.stage or 1) > 1;
+end
+
+function ASHU.mark_paid(cd, quest_id)
+    local a = ASHU.data_for(cd);
+    if a == nil then return; end
+    local st = quest_id - ASHU.FIRST + 1;
+    if st < 1 or st > 3 then return; end
+    a.stage = st;
+    a.paid = true;
+    a.aboard = nil;
+    a.failed = nil;
+    a.done = nil;
+    save_settings();
+    print_success(string.format('Ashu Talif: paid for %s - board the ship at the Cutter!',
+        ASHU.NAMES_BY_STAGE[st]));
+end
+
+function ASHU.mark_aboard(cd)
+    local a = ASHU.data_for(cd);
+    if a == nil or a.aboard == true then return; end
+    -- Only a PAID chain stage is ours to judge: the same ship hosts the Black
+    -- Coffin story mission and the COR job fight, and a stage number alone
+    -- (e.g. 1 after a reset) must not turn those into a "failed" chain.
+    if a.paid ~= true then return; end
+    a.aboard = true;
+    save_settings();
+end
+
+function ASHU.mark_won(cd)
+    local a = ASHU.data_for(cd);
+    if a == nil or a.aboard ~= true then return; end
+    local st = a.stage or 1;
+    a.aboard = nil;
+    a.paid = nil;
+    if st >= 3 then
+        a.done = true;
+        print_success('Ashu Talif: Captain down - chain complete for the week!');
+    else
+        a.stage = st + 1;
+        print_success(string.format('Ashu Talif: %s cleared! Pay Halshaob for %s.',
+            ASHU.NAMES_BY_STAGE[st], ASHU.NAMES_BY_STAGE[st + 1]));
+    end
+    save_settings();
+end
+
+function ASHU.mark_failed(cd)
+    local a = ASHU.data_for(cd);
+    if a == nil or a.aboard ~= true then return; end
+    a.aboard = nil;
+    a.paid = nil;
+    a.failed = true;
+    save_settings();
+    print_error('Ashu Talif: the run was lost. The chain waits for the weekly reset.');
+end
+
+-- Display state. Returns nil when never synced (fresh install, nothing
+-- observed), else the data table.
 function ASHU.state(cd)
     local a = cd and cd.ashu_data or nil;
-    if a == nil or a.known ~= true then return nil; end
-    local stage = nil;
-    for q = ASHU.FIRST, ASHU.LAST do
-        if a.active[tostring(q)] then stage = q; break; end
+    if a == nil then return nil; end
+    if not ashu_synced(a) then return nil, a; end
+    return a;
+end
+
+-- Icon / color-key / status for both the window and the chat line, so the
+-- two can never drift. Icon is the stage number in a box: a chain is a
+-- position, not a stock, so it must not look like Dynamis' 2/3.
+-- color_key: 'green' | 'grey' | 'yellow'.
+function ASHU.describe(cd)
+    local a, raw = ASHU.state(cd);
+    if a == nil then
+        return '[?]', 'yellow', (raw ~= nil) and 'pay to sync' or 'zone once to sync';
     end
-    local anchored = a.anchored == true
-        or (a.wins or 0) > 0 or stage ~= nil or a.failed == true;
-    if not anchored then return nil, nil, a; end
-    local done = a.wins or 0;
-    if stage ~= nil and (stage - ASHU.FIRST) > done then
-        done = stage - ASHU.FIRST;
-    end
-    if done > 3 then done = 3; end
-    return 3 - done, stage, a;
+    if a.failed then return '[x]', 'grey', 'failed - wait for reset'; end
+    if a.done   then return '[x]', 'grey', 'done!'; end
+    local st = a.stage or 1;
+    local name = ASHU.NAMES_BY_STAGE[st] or '?';
+    local status;
+    if a.aboard then status = name .. ' - aboard';
+    elseif a.paid then status = name .. ' - fight!';
+    else status = 'pay for ' .. name; end
+    return string.format('[%d]', st), 'green', status;
 end
 
 -- An unknown buy lock resolves itself at the reset IF the addon provably
@@ -1140,6 +1209,9 @@ function sanitize_loaded_settings(st)
             cd.dynamis_data.entries_remaining =
                 num(cd.dynamis_data.entries_remaining, CHARACTER_ENTRY_LIMIT, 0, CHARACTER_ENTRY_LIMIT);
             cd.dynamis_data.counted_glasses = strlist(cd.dynamis_data.counted_glasses);
+            -- Saves from before the flag existed were tracking all along:
+            -- missing = known. Only a freshly created record starts unknown.
+            if cd.dynamis_data.known == nil then cd.dynamis_data.known = true; end
             -- These reach arithmetic and comparisons directly. A string
             -- claimed_at throws inside reset_dynamis_store, which aborts
             -- reset_tracker partway and leaves some characters reset and some
@@ -1188,7 +1260,10 @@ function sanitize_loaded_settings(st)
             ash.known = ash.known == true;
             ash.failed = ash.failed == true or nil;
             ash.aboard = ash.aboard == true or nil;
-            if ash.aboard_stage ~= nil then ash.aboard_stage = num(ash.aboard_stage, nil, 101, 103); end
+            ash.paid = ash.paid == true or nil;
+            ash.done = ash.done == true or nil;
+            if ash.stage ~= nil then ash.stage = num(ash.stage, nil, 1, 3); end
+            ash.aboard_stage = nil; ash.wins = nil; ash.hist = nil;   -- retired
             local function boolmap(t)
                 local out = {};
                 if type(t) == 'table' then
@@ -1306,8 +1381,11 @@ local function ensure_limbus_account(acct)
     return acct;
 end
 
+-- known=false until a weekly reset is witnessed or an entry is counted. A
+-- fresh install used to assume 2/2, which lied to anyone installing mid-week
+-- after a run. There is no NPC to sync Dynamis from, so [?] is the truth.
 local function new_dynamis_data()
-    return { entries_remaining = CHARACTER_ENTRY_LIMIT, counted_glasses = {} };
+    return { entries_remaining = CHARACTER_ENTRY_LIMIT, counted_glasses = {}, known = false };
 end
 
 -- Which account (if any) a character belongs to. Returns the account table.
@@ -1330,6 +1408,7 @@ local function get_dynamis_store(char_name)
         if acct ~= nil then
             acct.is_account = true;
             if acct.entries_remaining == nil then acct.entries_remaining = ACCOUNT_ENTRY_LIMIT; end
+            if acct.known == nil then acct.known = true; end   -- pre-flag saves were tracking
             if type(acct.counted_glasses) ~= 'table' then acct.counted_glasses = {}; end
             return acct, true;
         end
@@ -1432,6 +1511,7 @@ local function add_dynamis_account()
         name = 'Account ' .. tostring(#accts + 1),
         chars = {},
         is_account = true,
+        known = false,   -- unknown until a member knows, a reset, or a counted entry
         entries_remaining = ACCOUNT_ENTRY_LIMIT,
         counted_glasses = {}
     });
@@ -1543,6 +1623,13 @@ function recalc_account_from_members(acct, from_membership)
     -- Assault first: manual_override is a Dynamis concept, and letting it return
     -- early here silently disabled assault seeding for the whole account.
     local consumed = seed_assault_pool(acct);
+    -- The pool is known as soon as any member is: their usage is real data.
+    for _, cname in ipairs(acct.chars) do
+        local mcd = tracker.settings.characters[cname];
+        if mcd and mcd.dynamis_data and mcd.dynamis_data.known == true then
+            acct.known = true; break;
+        end
+    end
     -- A number the player typed in beats anything derived. Cleared at the weekly
     -- reset, when the addon's own count becomes trustworthy again.
     if acct.manual_override then return consumed; end
@@ -1722,6 +1809,7 @@ end
 local function count_dynamis_entry(store, serial, label, char_name)
     if store == nil then return false; end
     if serial ~= nil and glass_already_counted(store, serial) then return false; end
+    store.known = true;
 
     char_name = char_name or tracker.current_char;
     local _, shared = get_dynamis_store(char_name);
@@ -2156,6 +2244,141 @@ local function cd_limbus_debounce_ok(char_data, now)
     return (now - (char_data.limbus_data.last_gain or 0)) > LIMBUS_DEBOUNCE;
 end
 
+-- ===== Quest starts =====
+-- One implementation per quest, reached from TWO triggers: the NPC's menu
+-- number (exact, wording-proof - the primary path) and the old dialogue
+-- sentence (kept as a fallback for menu numbers we have not captured yet,
+-- e.g. a first-time accept). Both funnel here, so there are no sibling
+-- copies to drift apart.
+local function accept_spicegals(char_data)
+    local s = char_data.quest_steps.spicegals;
+    if s == 'rouva' or s == 'unknown' or s == 'scanned' then
+        char_data.quest_steps.spicegals = 'riverne';
+        save_settings();
+        print_success('SpiceGals started - Head to Riverne B for Rivernewort!');
+    end
+end
+
+local function accept_cookbook(char_data)
+    local s = char_data.quest_steps.cookbook;
+    if s == 'jonette' or s == 'unknown' or s == 'scanned' then
+        char_data.quest_steps.cookbook = 'sacrarium';
+        save_settings();
+        print_success('CookBook started - Head to ??? in Sacrarium!');
+    end
+end
+
+-- NPC menus that mean "quest accepted", captured live 2026-08-30/31 with the
+-- 0x032 short menu packet (idx 0x08, zone 0x0A, menu 0x0C):
+--   Rouva     zone 230  menu 728 (accept)   727 (reward)
+--   Jonette   zone  26  menu 507 (repeat accept) 508 (reward) 365 (idle)
+--             LSB numbers the first-ever accept 506, so both are listened to.
+--   Justinius zone  26  menu 573 (accept)   572 (reward)
+-- Rewards are deliberately NOT menu-triggered: Jonette opened 508 on a
+-- turn-in that FAILED (bag full), so "she tried" is all a menu proves. The
+-- key item leaving the bag remains the completion signal. UnInvited's start
+-- is already covered by the permit key item arriving, so it needs no menu.
+local QUEST_START_MENUS = {
+    [230] = { [728] = 'spicegals' },
+    [26]  = { [507] = 'cookbook', [506] = 'cookbook' },
+};
+
+-- ===== EcoWarrior transitions (one implementation, menu + text triggers) =====
+local ECO_FIELD_HINT = {
+    sandoria = "Head to Ordelle's Caves.",
+    windurst = 'Head to Maze of Shakhrami.',
+    bastok   = 'Head to Gusgen Mines.',
+};
+local ECO_REWARD_HINT = {
+    sandoria = "Go to Norejaie in Southern San d'Oria for reward!",
+    windurst = 'Go to Lumomo in Windurst Waters for reward!',
+    bastok   = 'Go to Raifa in Port Bastok for reward!',
+};
+local ECO_NATION_LABEL = { sandoria = "San d'Oria", windurst = 'Windurst', bastok = 'Bastok' };
+
+local function eco_accept(char_data, nation)
+    local eco = char_data.ecowarrior_data;
+    if eco.step == 'ready' or eco.step == 'scanned' or eco.step == 'unknown' then
+        eco.step = 'field_agent'; eco.current_nation = nation;
+        eco.knows_status = true;
+        save_settings();
+        print_success('EcoWarrior: ' .. ECO_NATION_LABEL[nation] .. ' quest accepted! ' .. ECO_FIELD_HINT[nation]);
+    end
+end
+
+local function eco_nm(char_data, nation)
+    local eco = char_data.ecowarrior_data;
+    if eco.step == 'field_agent' and eco.current_nation == nation then
+        eco.step = 'nm';
+        save_settings();
+        print_success('EcoWarrior: Kill the NM!');
+    end
+end
+
+local function eco_return(char_data, nation)
+    local eco = char_data.ecowarrior_data;
+    if eco.step == 'field_agent_return' and eco.current_nation == nation then
+        eco.step = 'reward';
+        save_settings();
+        print_success('EcoWarrior: ' .. ECO_REWARD_HINT[nation]);
+    end
+end
+
+-- EcoWarrior menu numbers. Source: LandSandBoat scripts/quests/<nation>/
+-- Eco_Warrior.lua, and the Bastok set was verified live 2026-08-31 (Degga
+-- 13 and 16, Raifa 282 all matched the packets exactly), so the server kept
+-- LSB's numbering. Layout: [zone] = { [menu] = { kind, nation } }.
+--   kind 'return' = the field agent sends you back to the city (no choice)
+-- Yes/no menus are NOT here: the city offer AND the field agent's ointment
+-- both open whether you accept or decline (LSB applies the ointment only on
+-- option 1), so those are read from your reply packet (ECO_REPLY_MENUS).
+local ECO_MENUS = {
+    [193] = { [54] = { 'return', 'sandoria' } },  -- Rojaireaut, Ordelle's
+    [198] = { [65] = { 'return', 'windurst' } },  -- Ahko Mhalijikhari, Shakhrami
+    [196] = { [16] = { 'return', 'bastok' } },    -- Degga, Gusgen
+};
+-- Menus that mean something only when the reply carries option 1.
+local ECO_REPLY_MENUS = {
+    [230] = { [677] = { 'accept', 'sandoria' } },   -- Norejaie
+    [238] = { [818] = { 'accept', 'windurst' } },   -- Lumomo
+    [236] = { [278] = { 'accept', 'bastok' } },     -- Raifa
+    [193] = { [51]  = { 'nm', 'sandoria' } },       -- Rojaireaut's ointment
+    [198] = { [62]  = { 'nm', 'windurst' } },       -- Ahko's ointment
+    [196] = { [13]  = { 'nm', 'bastok' } },         -- Degga's ointment
+};
+
+local function on_quest_menu(zone_id, menu_id)
+    local char_data = nil;
+    local zone_map = QUEST_START_MENUS[zone_id];
+    local which = zone_map and zone_map[menu_id] or nil;
+    if which ~= nil then
+        char_data = get_char_data();
+        if char_data == nil then return; end
+        if which == 'spicegals' then accept_spicegals(char_data);
+        elseif which == 'cookbook' then accept_cookbook(char_data); end
+        return;
+    end
+    local eco_map = ECO_MENUS[zone_id];
+    local eco = eco_map and eco_map[menu_id] or nil;
+    if eco ~= nil then
+        char_data = get_char_data();
+        if char_data == nil then return; end
+        if eco[1] == 'return' then eco_return(char_data, eco[2]); end
+    end
+end
+
+-- Your reply to a menu (outgoing 0x05B): option at 0x08, zone at 0x10,
+-- menu at 0x12 - verified against captured replies (Halshaob, Rytaal).
+local function on_menu_reply(zone_id, menu_id, option)
+    local zmap = ECO_REPLY_MENUS[zone_id];
+    local entry = zmap and zmap[menu_id] or nil;
+    if entry == nil or option ~= 1 then return; end   -- declined = nothing
+    local char_data = get_char_data();
+    if char_data == nil then return; end
+    if entry[1] == 'accept' then eco_accept(char_data, entry[2]);
+    elseif entry[1] == 'nm' then eco_nm(char_data, entry[2]); end
+end
+
 local function on_ki_gained(ki_id)
     local char_data = get_char_data();
     if char_data == nil then return; end
@@ -2517,6 +2740,7 @@ end
 -- Shared by per-character stores and account stores.
 function reset_dynamis_store(store, current_time)
     if store == nil then return; end
+    store.known = true;   -- a witnessed reset: the count is authoritative from here
     -- Legacy fields from before serial tracking.
     store.glass_used = nil;
     store.dynamis_zone = nil;
@@ -2563,11 +2787,13 @@ local function reset_character_data(char_data)
     if type(char_data.ashu_data) == 'table' then
         local ash = char_data.ashu_data;
         ash.anchored = true;
-        ash.hist = nil;   -- retired field from the completed-bit era
-        ash.wins = nil;
+        ash.done = nil;
         ash.failed = nil;
         ash.aboard = nil;
-        ash.aboard_stage = nil;
+        -- A paid, unfought stage survives the tally (observed); otherwise the
+        -- chain restarts at stage 1.
+        if ash.paid ~= true then ash.stage = 1; end
+        ash.hist = nil; ash.wins = nil; ash.aboard_stage = nil;   -- retired fields
     end
     -- UnInvited: only reset if done, otherwise keep current step
     local uninvited_step = char_data.quest_steps and char_data.quest_steps.uninvited or 'unknown';
@@ -2733,7 +2959,12 @@ local function on_character_change(new_char_name)
                           char_data.quest_steps.cookbook == 'unknown';
         if needs_scan then print_msg('Use /hw scan to check key items for this character'); end
         initialize_timer();
-        update_char_list();  -- keep the window dropdown in sync if it is already open
+        -- A relog is the player saying "I'm someone else now": clear the
+        -- sticky selection so the dropdown follows them. Window rebuilds
+        -- (list changes, settings toggles) still keep whatever was viewed -
+        -- that rule lives in update_char_list and is untouched.
+        ui.selected_name = nil;
+        update_char_list();
     end
 end
 
@@ -2839,6 +3070,9 @@ local function format_dynamis_line(char_name, char_data)
     if store == nil then return HDR .. '\30\104[?]\30\106 Dynamis'; end
     -- Show what actually limits this character: the lower of their own cap and
     -- the account pool. Saying "1 left" when the character is capped would lie.
+    if store.known == false then
+        return HDR .. '\30\104[ ? ]\30\106 Dynamis \30\071(unknown until reset)\30\106';
+    end
     local entries, char_left, acct_left = dynamis_effective_remaining(char_name);
     if not shared then entries = store.entries_remaining or CHARACTER_ENTRY_LIMIT; end
     local suffix = '';
@@ -2922,24 +3156,10 @@ end
 
 -- The Ashu Talif chain in chat: fights left and the next action.
 local function format_ashu_line(char_data)
-    local left, stage, a = ASHU.state(char_data);
-    if left == nil then
-        local why = (a ~= nil) and 'pay to sync' or 'zone once to sync';
-        return HDR .. '\30\104[?]\30\106 Ashu Talif \30\071(' .. why .. ')\30\106';
-    end
-    if a.failed then
-        return HDR .. '\30\068[ x ]\30\106 Ashu Talif \30\071(failed - wait for reset)\30\106';
-    end
-    if left <= 0 then
-        return HDR .. '\30\068[ x ]\30\106 Ashu Talif \30\071(done!)\30\106';
-    end
-    local what;
-    if stage ~= nil then
-        what = (ASHU.NAMES[stage] or '?') .. ' - fight!';
-    else
-        what = 'pay for ' .. (ASHU.NAMES[ASHU.FIRST + (3 - left)] or '?');
-    end
-    return HDR .. string.format('\30\110%d/3\30\106 Ashu Talif \30\071(%s)\30\106', left, what);
+    local icon, key, status = ASHU.describe(char_data);
+    local col = (key == 'green') and '\30\110' or (key == 'grey') and '\30\068' or '\30\104';
+    if icon == '[x]' then icon = '[ x ]'; elseif icon == '[?]' then icon = '[ ? ]'; end
+    return HDR .. col .. icon .. '\30\106 Ashu Talif \30\071(' .. status .. ')\30\106';
 end
 
 -- ISNM in chat: what is held, and when Shajaf sells again.
@@ -2954,8 +3174,8 @@ local function format_isnm_line(char_name)
     local nbt = isnm and isnm.next_buy_time or nil;
     local buy;
     if nbt == nil then buy = 'see Shajaf';
-    elseif os.time() >= nbt then buy = 'buy ready';
-    else buy = 'buy in ' .. format_time_short(nbt - os.time()); end
+    elseif os.time() >= nbt then buy = 'Ready';
+    else buy = format_time_short(nbt - os.time()); end
     if held ~= nil then
         local tier = held == ISNM_SECRET_KI and '3000' or '2000';
         return HDR .. '\30\110[KI]\30\106 ISNM \30\071(' .. tier .. ' held, ' .. buy .. ')\30\106';
@@ -3304,21 +3524,55 @@ local function draw_gradient_header(text, width, help_text)
     imgui.Spacing();
 end
 
+-- The tree connector in front of sub-rows (Carrying Tag, Cards): marks them
+-- as belonging to the row above. If this renders as a broken box on some
+-- client font, change it to '\\-' here and nowhere else.
+local SUB_MARK = '\226\148\148\226\148\128';   -- corner + horizontal run, ends at the bracket
+
 -- Fixed-bracket icons: '[' and ']' land on the same pixel columns in every
 -- row and the symbol is centered between them, so alignment never depends on
 -- how wide the font draws a space. Chat keeps plain strings - pixel
 -- positioning only exists in imgui.
+-- Text width on THIS client's font. CalcTextSize is documented by Ashita as
+-- optionally not implemented, and users can override the ImGui font family
+-- and size entirely - so when the function is missing, the width is taken by
+-- MEASURING WITH THE RENDERER ITSELF: an invisible calibration pass draws the
+-- string in fully transparent ink and reads how far the cursor moved. That is
+-- the same engine that draws the visible text, so it cannot disagree with it.
+-- Re-measured every frame - fonts can load a few frames after startup, and a
+-- cached width from the wrong font was exactly the bug this replaces.
+local MEASURE = { want = {}, w = {} };
+
 local function icon_text_w(s)
-    if imgui.CalcTextSize == nil then return #tostring(s) * 7; end
-    local a = imgui.CalcTextSize(tostring(s));
-    if type(a) == 'table' then return a.x or (#tostring(s) * 7); end
-    return a or (#tostring(s) * 7);
+    s = tostring(s);
+    if imgui.CalcTextSize ~= nil then
+        local a = imgui.CalcTextSize(s);
+        if type(a) == 'table' and a.x ~= nil then return a.x; end
+        if type(a) == 'number' then return a; end
+    end
+    MEASURE.want[s] = true;
+    return MEASURE.w[s] or (#s * 9);   -- one-frame stand-in until measured
 end
 
-local icon_box_inner = nil;   -- computed once, from 'KI' (the widest symbol)
+-- Runs at the top of the window each frame, only when CalcTextSize is absent.
+local function run_measurements()
+    if imgui.CalcTextSize ~= nil then return; end
+    if imgui.GetCursorPosY == nil or imgui.SetCursorPosY == nil then return; end
+    local sx, sy = imgui.GetCursorPosX(), imgui.GetCursorPosY();
+    for s, _ in pairs(MEASURE.want) do
+        imgui.SetCursorPosX(sx);
+        imgui.SetCursorPosY(sy);
+        local x0 = imgui.GetCursorPosX();
+        imgui.TextColored({ 0.0, 0.0, 0.0, 0.0 }, s);
+        imgui.SameLine(0, 0);
+        MEASURE.w[s] = imgui.GetCursorPosX() - x0;
+    end
+    imgui.SetCursorPosX(sx);
+    imgui.SetCursorPosY(sy);
+end
 
 local function draw_icon_box(sym, color)
-    if icon_box_inner == nil then icon_box_inner = icon_text_w('KI') + 4; end
+    local icon_box_inner = icon_text_w('KI') + 4;
     local x0 = imgui.GetCursorPosX();
     imgui.TextColored(color, '[');
     imgui.SameLine(0, 0);
@@ -3340,7 +3594,7 @@ local function draw_row_icon(icon, color)
         draw_icon_box((inner:gsub('%s+', '')), color);
         return;
     end
-    if icon_box_inner == nil then icon_box_inner = icon_text_w('KI') + 4; end
+    local icon_box_inner = icon_text_w('KI') + 4;
     local total = icon_text_w('[') * 2 + icon_box_inner;
     local x0 = imgui.GetCursorPosX();
     local w = icon_text_w(icon);
@@ -3394,6 +3648,7 @@ local function render_ui()
         grip_pushed = 3;
     end
     if imgui.Begin('Homework v' .. addon.version, ui.is_open, ui.window_flags) then
+        run_measurements();
         -- Only WindowBg/TitleBg/TitleBgActive are consumed by Begin itself, so
         -- FrameBg and Border must stay pushed to reach the combos and checkboxes
         -- inside. Popping all five here made two of them no-ops.
@@ -3445,10 +3700,13 @@ local function render_ui()
         -- resolution and font size lands the same layout: the name column
         -- always clears the icon box by one letter-width, whatever the box
         -- measures on this machine. Hardcoded pixels broke on other screens.
-        if icon_box_inner == nil then icon_box_inner = icon_text_w('KI') + 4; end
         local em = icon_text_w('M');
-        local box_total = icon_text_w('[') * 2 + icon_box_inner;
-        local col_task = box_total + em;
+        local box_total = icon_text_w('[') * 2 + icon_text_w('KI') + 4;
+        -- The icons start at the window's left padding, not at zero. Columns
+        -- must include it, or the one-letter gap silently shrinks by the
+        -- padding - which at small font scales meant NO gap at all.
+        local base = imgui.GetCursorPosX();
+        local col_task = base + box_total + em;
         local col_location = col_task + 13 * em;
 
         -- Get tracking settings for current character
@@ -3468,14 +3726,19 @@ local function render_ui()
             -- read as "1/3" for someone who can only ever do 2. The account
             -- total is already shown in the column beside this.
             local dyn_max = CHARACTER_ENTRY_LIMIT;
-            local dyn_icon = string.format('%d/%d', entries, dyn_max);
-            local dyn_color;
-            if entries == 0 then
-                dyn_color = { 1.0, 0.3, 0.3, 1.0 };  -- Red
-            elseif entries == 1 then
-                dyn_color = { 1.0, 1.0, 0.0, 1.0 };  -- Yellow
+            local dyn_known = (dyn_store.known ~= false);
+            local dyn_icon, dyn_color;
+            if not dyn_known then
+                dyn_icon = '[?]'; dyn_color = { 1.0, 1.0, 0.0, 1.0 };
             else
-                dyn_color = { 0.0, 1.0, 0.0, 1.0 };  -- Green
+                dyn_icon = string.format('%d/%d', entries, dyn_max);
+                if entries == 0 then
+                    dyn_color = { 1.0, 0.3, 0.3, 1.0 };  -- Red
+                elseif entries == 1 then
+                    dyn_color = { 1.0, 1.0, 0.0, 1.0 };  -- Yellow
+                else
+                    dyn_color = { 0.0, 1.0, 0.0, 1.0 };  -- Green
+                end
             end
             draw_row_icon(dyn_icon, dyn_color);
             imgui.SameLine();
@@ -3486,7 +3749,9 @@ local function render_ui()
             -- on one character and vanished on another for no visible reason,
             -- which reads as the addon failing to track the account.
             local dyn_note = '';
-            if dyn_shared and dyn_acct_left ~= nil then
+            if not dyn_known then
+                dyn_note = '(unknown until reset)';
+            elseif dyn_shared and dyn_acct_left ~= nil then
                 dyn_note = string.format('(account: %d/%d)', dyn_acct_left, ACCOUNT_ENTRY_LIMIT);
             end
             -- SameLine only when something actually follows. Calling it and then
@@ -3589,13 +3854,19 @@ local function render_ui()
                 end
             end
 
-            imgui.SetCursorPosX(card_indent);
+            -- Column system, same as the mains (see the assault sub-row).
+            local card_icon_x = card_indent + icon_text_w(SUB_MARK) + em;
+            imgui.SetCursorPosX(card_icon_x - icon_text_w(SUB_MARK));
+            imgui.TextColored({ 0.55, 0.55, 0.55, 1.0 }, SUB_MARK);
+            imgui.SameLine();
+            imgui.SetCursorPosX(card_icon_x);
             if #held_short > 0 then
-                imgui.TextColored({ 0.0, 1.0, 0.0, 1.0 }, '[KI]');
+                draw_icon_box('KI', { 0.0, 1.0, 0.0, 1.0 });
             else
-                imgui.TextColored({ 0.55, 0.55, 0.55, 1.0 }, '[  ]');
+                draw_icon_box('', { 0.55, 0.55, 0.55, 1.0 });
             end
             imgui.SameLine();
+            imgui.SetCursorPosX(card_icon_x + box_total + em);
             imgui.TextColored({ 1.0, 1.0, 1.0, 1.0 },
                 string.format('Cards %d/%d', #held_short, #LIMBUS_CARDS));
             if #held_short > 0 then
@@ -3670,26 +3941,10 @@ local function render_ui()
         -- always the one thing to do next. A stage paid before the tally
         -- survives it, so a fresh week can open already at "fight!".
         if tracking.tasks[ASHU.ROW_LABEL] ~= false then
-            local a_left, a_stage, a_data = ASHU.state(char_data);
-            local aa_icon, aa_color, aa_status;
-            if a_left == nil then
-                aa_icon = '[?]'; aa_color = { 1.0, 1.0, 0.0, 1.0 };
-                aa_status = (a_data ~= nil) and 'pay to sync' or 'zone once to sync';
-            elseif a_data.failed then
-                aa_icon = '[x]'; aa_color = { 0.55, 0.55, 0.55, 1.0 };
-                aa_status = 'failed - wait for reset';
-            elseif a_left <= 0 then
-                aa_icon = '[x]'; aa_color = { 0.55, 0.55, 0.55, 1.0 };
-                aa_status = 'done!';
-            else
-                aa_icon = string.format('%d/3', a_left);
-                aa_color = { 0.0, 1.0, 0.0, 1.0 };
-                if a_stage ~= nil then
-                    aa_status = (ASHU.NAMES[a_stage] or '?') .. ' - fight!';
-                else
-                    aa_status = 'pay for ' .. (ASHU.NAMES[ASHU.FIRST + (3 - a_left)] or '?');
-                end
-            end
+            local aa_icon, aa_key, aa_status = ASHU.describe(char_data);
+            local aa_color = (aa_key == 'green') and { 0.0, 1.0, 0.0, 1.0 }
+                          or (aa_key == 'grey') and { 0.55, 0.55, 0.55, 1.0 }
+                          or { 1.0, 1.0, 0.0, 1.0 };
             imgui.BeginGroup();
             draw_row_icon(aa_icon, aa_color);
             imgui.SameLine();
@@ -3848,10 +4103,10 @@ local function render_ui()
         draw_gradient_header('Timers', imgui.GetContentRegionAvail(), '[KI] in your bag - fight open    [    ] ready, KI not taken\n[ x ] on cooldown    [ ? ] unknown - /hw scan\nCounts are remaining/max. Status shows a time or what to do next.');
 
         -- Timer column positions scaled with font
-        if icon_box_inner == nil then icon_box_inner = icon_text_w('KI') + 4; end
         local em = icon_text_w('M');
-        local box_total = icon_text_w('[') * 2 + icon_box_inner;
-        local timer_col_name = box_total + em;
+        local box_total = icon_text_w('[') * 2 + icon_text_w('KI') + 4;
+        local base = imgui.GetCursorPosX();   -- window padding: see Weeklies
+        local timer_col_name = base + box_total + em;
         local timer_col_status = timer_col_name + 23 * em;
 
         -- Assault tags belong here, not in Weeklies: they refill on a rolling
@@ -3930,13 +4185,23 @@ local function render_ui()
 
             -- Sub-rows flow inline: plain [KI] and one normal space, no fixed
             -- columns - they are annotations, not table rows.
-            imgui.SetCursorPosX(sub_indent);
+            -- Column system, same as the mains: the icon sits at a fixed
+            -- position, the name sits at a fixed position one letter-width
+            -- after the icon box. Scales with the font like everything else.
+            -- The corner glyph hugs the bracket: drawn so its right edge
+            -- lands exactly where the '[' begins. The bracket itself stays put.
+            local sub_icon_x = sub_indent + icon_text_w(SUB_MARK) + em;
+            imgui.SetCursorPosX(sub_icon_x - icon_text_w(SUB_MARK));
+            imgui.TextColored({ 0.55, 0.55, 0.55, 1.0 }, SUB_MARK);
+            imgui.SameLine();
+            imgui.SetCursorPosX(sub_icon_x);
             if area ~= nil or carried then
-                imgui.TextColored({ 0.0, 1.0, 0.0, 1.0 }, '[KI]');
+                draw_icon_box('KI', { 0.0, 1.0, 0.0, 1.0 });
             else
-                imgui.TextColored({ 0.55, 0.55, 0.55, 1.0 }, '[  ]');
+                draw_icon_box('', { 0.55, 0.55, 0.55, 1.0 });
             end
             imgui.SameLine();
+            imgui.SetCursorPosX(sub_icon_x + box_total + em);
             imgui.TextColored({ 1.0, 1.0, 1.0, 1.0 },
                 area or (carried and 'Carrying Tag' or 'No Tag'));
             if area ~= nil and rank_name ~= nil then
@@ -3975,8 +4240,8 @@ local function render_ui()
                 icon, icolor, status = '[ ]', { 0.55, 0.55, 0.55, 1.0 }, 'need badge';
             else
                 if nbt == nil then status = 'see Shajaf';
-                elseif now >= nbt then status = 'buy ready';
-                else status = 'buy ' .. format_time_short(nbt - now); end
+                elseif now >= nbt then status = 'Ready';
+                else status = format_time_short(nbt - now); end
                 if held ~= nil then
                     icon, icolor = '[KI]', { 0.0, 1.0, 0.0, 1.0 };     -- order in the bag
                 elseif nbt == nil then
@@ -4269,6 +4534,11 @@ local function render_ui()
                             local lbl = (n == 1) and '1 Run' or (tostring(n) .. ' Runs');
                             if imgui.RadioButton(lbl, entries == n) then
                                 set_store.entries_remaining = n;
+                                set_store.known = true;   -- hand-set beats "unknown"
+                                -- keep the character's own record known too when
+                                -- editing a pool, so the row never falls back to [?]
+                                local cd_k = tracker.settings.characters[settings_char];
+                                if cd_k and cd_k.dynamis_data then cd_k.dynamis_data.known = true; end
                                 -- Mark it hand-set. The load handler re-derives
                                 -- pools from member usage, which silently undid
                                 -- this on the next reload.
@@ -4602,7 +4872,8 @@ ashita.events.register('text_in', 'text_in_cb', function(e)
     if e.injected then return; end
     local base_mode = bit.band(e.mode, 0xFF);
     -- Early exit for modes we don't care about (cheapest check first)
-    if base_mode ~= 150 and base_mode ~= 9 and base_mode ~= 142 then return; end
+    -- 146 = the battlefield objective/failure lines (mode 658).
+    if base_mode ~= 150 and base_mode ~= 9 and base_mode ~= 142 and base_mode ~= 146 then return; end
     
     if tracker.current_char == nil or tracker.current_char == 'Unknown' then return; end
     
@@ -4611,9 +4882,19 @@ ashita.events.register('text_in', 'text_in_cb', function(e)
     local char_data = get_char_data();
     if char_data == nil then return; end
     
+    -- Ashu Talif outcome lines (system messages, identical every fight):
+    if message:find('Objective complete', 1, true) then
+        ASHU.mark_won(char_data);
+    elseif message:find('The mission has failed', 1, true) then
+        ASHU.mark_failed(char_data);
+    end
+
     -- Base mode 142: Highwind completion & Dynamis claim
     if base_mode == 142 then
-        if is_in_highwind_zone() and message:find('Obtained 3000 gil', 1, true) then
+        -- Any gil reward on the airship is the Highwind kill (nothing else
+        -- aboard pays gil); not pinned to 3000 so a reward change can't
+        -- silently break it. Captured 2026-08-31: "Obtained 3000 gil".
+        if is_in_highwind_zone() and message:find('Obtained ', 1, true) and message:find(' gil', 1, true) then
             char_data.quest_steps.highwind = 'done';
             save_settings();
             print_success('Highwind complete!');
@@ -4666,106 +4947,36 @@ ashita.events.register('text_in', 'text_in_cb', function(e)
     
     -- Base mode 150: NPC dialogue
     -- CookBook quest start (Jonette in Tavnazian Safehold)
+    -- Text fallbacks only: the primary trigger is the NPC menu number (see
+    -- on_quest_menu). Rouva's sentence below does not even occur on this
+    -- server's accept flow (captured 2026-08-30), which is why the menu path
+    -- exists.
     if zone_id == 26 and message:find('The information you have brought me on Tavnazian cuisine') then
-        if char_data.quest_steps.cookbook == 'jonette' or char_data.quest_steps.cookbook == 'unknown'
-           or char_data.quest_steps.cookbook == 'scanned' then
-            char_data.quest_steps.cookbook = 'sacrarium';
-            save_settings();
-            print_success('CookBook started - Head to ??? in Sacrarium!');
-        end
+        accept_cookbook(char_data);
     end
     -- SpiceGals quest acceptance (Rouva in Southern San d'Oria)
     if zone_id == 230 and message:find("Forget the words I have spoken") then
-        if char_data.quest_steps.spicegals == 'rouva' or char_data.quest_steps.spicegals == 'unknown' or char_data.quest_steps.spicegals == 'scanned' then
-            char_data.quest_steps.spicegals = 'riverne';
-            save_settings();
-            print_success('SpiceGals started - Head to Riverne B for Rivernewort!');
-        end
+        accept_spicegals(char_data);
     end
     -- EcoWarrior quest acceptance San d'Oria (Norejaie in Southern San d'Oria)
-    if zone_id == 230 and (message:find("Rojaireaut, our V.E.R.M.I.N. agent", 1, true) or message:find("I knew you'd come through for us")) then
-        local eco_data = char_data.ecowarrior_data;
-        if eco_data.step == 'ready' or eco_data.step == 'scanned' or eco_data.step == 'unknown' then
-            eco_data.step = 'field_agent'; eco_data.current_nation = 'sandoria';
-            eco_data.knows_status = true;
-            save_settings();
-            print_success("EcoWarrior: San d'Oria quest accepted! Head to Ordelle's Caves.");
-        end
-    end
+    -- EcoWarrior: no text triggers. Every step runs on menu numbers and your
+    -- menu replies (ECO_MENUS / ECO_REPLY_MENUS) plus the key items.
     -- EcoWarrior quest acceptance Windurst (Lumomo in Windurst Waters)
-    if zone_id == 238 and (message:find("Ahko Mhalijikhari, will be waiting") or message:find("Ta%-taru and good luck")) then
-        local eco_data = char_data.ecowarrior_data;
-        if eco_data.step == 'ready' or eco_data.step == 'scanned' or eco_data.step == 'unknown' then
-            eco_data.step = 'field_agent'; eco_data.current_nation = 'windurst';
-            eco_data.knows_status = true;
-            save_settings();
-            print_success('EcoWarrior: Windurst quest accepted! Head to Maze of Shakhrami.');
-        end
-    end
+
     -- EcoWarrior quest acceptance Bastok (Raifa in Port Bastok)
-    if zone_id == 236 and message:find("Degga, one of our V.E.R.M.I.N.", 1, true) then
-        local eco_data = char_data.ecowarrior_data;
-        if eco_data.step == 'ready' or eco_data.step == 'scanned' or eco_data.step == 'unknown' then
-            eco_data.step = 'field_agent'; eco_data.current_nation = 'bastok';
-            eco_data.knows_status = true;
-            save_settings();
-            print_success('EcoWarrior: Bastok quest accepted! Head to Gusgen Mines.');
-        end
-    end
+
     -- EcoWarrior NM spawn San d'Oria (Rojaireaut in Ordelle's Caves)
-    if zone_id == 193 and message:find("Now, close your eyes for a moment") then
-        local eco_data = char_data.ecowarrior_data;
-        if eco_data.step == 'field_agent' and eco_data.current_nation == 'sandoria' then
-            eco_data.step = 'nm';
-            save_settings();
-            print_success('EcoWarrior: Kill the NM!');
-        end
-    end
+
     -- EcoWarrior NM spawn Windurst (Ahko Mhalijikhari in Maze of Shakhrami)
-    if zone_id == 198 and message:find("Rrright, here we go") then
-        local eco_data = char_data.ecowarrior_data;
-        if eco_data.step == 'field_agent' and eco_data.current_nation == 'windurst' then
-            eco_data.step = 'nm';
-            save_settings();
-            print_success('EcoWarrior: Kill the NM!');
-        end
-    end
+
     -- EcoWarrior NM spawn Bastok (Degga in Gusgen Mines)
-    if zone_id == 196 and message:find("just close your eyes") then
-        local eco_data = char_data.ecowarrior_data;
-        if eco_data.step == 'field_agent' and eco_data.current_nation == 'bastok' then
-            eco_data.step = 'nm';
-            save_settings();
-            print_success('EcoWarrior: Kill the NM!');
-        end
-    end
+
     -- EcoWarrior return to city NPC San d'Oria (Rojaireaut in Ordelle's Caves)
-    if zone_id == 193 and (message:find("Take it back to her in San d'Oria") or message:find("proof enough for Norejaie")) then
-        local eco_data = char_data.ecowarrior_data;
-        if eco_data.step == 'field_agent_return' and eco_data.current_nation == 'sandoria' then
-            eco_data.step = 'reward';
-            save_settings();
-            print_success("EcoWarrior: Go to Norejaie in Southern San d'Oria for reward!");
-        end
-    end
+
     -- EcoWarrior return to city NPC Windurst (Ahko Mhalijikhari in Maze of Shakhrami)
-    if zone_id == 198 and message:find("take it back to Lumomo") then
-        local eco_data = char_data.ecowarrior_data;
-        if eco_data.step == 'field_agent_return' and eco_data.current_nation == 'windurst' then
-            eco_data.step = 'reward';
-            save_settings();
-            print_success('EcoWarrior: Go to Lumomo in Windurst Waters for reward!');
-        end
-    end
+
     -- EcoWarrior return to city NPC Bastok (Degga in Gusgen Mines)
-    if zone_id == 196 and message:find("waiting for you in Bastok") then
-        local eco_data = char_data.ecowarrior_data;
-        if eco_data.step == 'field_agent_return' and eco_data.current_nation == 'bastok' then
-            eco_data.step = 'reward';
-            save_settings();
-            print_success('EcoWarrior: Go to Raifa in Port Bastok for reward!');
-        end
-    end
+
     -- UnInvited win (Justinius in Tavnazian Safehold)
     if zone_id == 26 and message:find("intruders are gone for good") then
         if char_data.quest_steps.uninvited == 'justinius_return' then
@@ -4794,6 +5005,19 @@ ashita.events.register('text_in', 'text_in_cb', function(e)
             end
         end
     end
+end);
+
+-- Outgoing menu replies (0x05B). The only consumer so far is EcoWarrior's
+-- accept: the city offer menu opens whether you accept or decline, and the
+-- reply's option value is the one thing that says which.
+ashita.events.register('packet_out', 'packet_out_cb', function(e)
+    if e.id ~= 0x005B then return; end
+    if e.data == nil or #e.data < 0x14 then return; end
+    if tracker.current_char == nil or tracker.current_char == 'Unknown' then return; end
+    local option = struct.unpack('I', e.data, 0x08 + 1) or 0;
+    local zone   = struct.unpack('H', e.data, 0x10 + 1) or 0;
+    local menu   = struct.unpack('H', e.data, 0x12 + 1) or 0;
+    on_menu_reply(zone, menu, option);
 end);
 
 ashita.events.register('packet_in', 'packet_in_cb', function(e)
@@ -4888,11 +5112,39 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
 
     -- Rytaal's tag counter. Opening the menu is enough - no need to take a tag.
     -- This is the only moment the server tells us how many tags are in stock.
+    -- 0x032 is the SHORT menu packet most quest NPCs use (Jonette, Rouva,
+    -- Justinius). Its fields sit right after the npc id: idx 0x08, zone 0x0A,
+    -- menu 0x0C - verified against live captures. 0x034 (below) is the long
+    -- form with 32 bytes of event params first.
+    if id == 0x0032 then
+        if data == nil or #data < 0x0E then return; end
+        if tracker.current_char == nil or tracker.current_char == 'Unknown' then return; end
+        local mzone = struct.unpack('H', data, 0x0A + 1) or 0;
+        local mid   = struct.unpack('H', data, 0x0C + 1) or 0;
+        on_quest_menu(mzone, mid);
+        return;
+    end
+
     if id == 0x0034 then
         if tracker.current_char ~= nil and tracker.current_char ~= 'Unknown' then
             pcall(function()
                 if #data < MENU_OFFSET_MENU_ID + 2 then return; end
                 local menu_id = struct.unpack('H', data, MENU_OFFSET_MENU_ID + 1);
+
+                -- Halshaob in Nashmau: menu 302 is the payment, and its
+                -- params carry (item id, count, QUEST ID). Captured three
+                -- times: 2184x3->101, 2185x1->102, 2186x1->103.
+                if menu_id == 302 then
+                    if #data < MENU_OFFSET_ZONE + 2 then return; end
+                    local mzone = struct.unpack('H', data, MENU_OFFSET_ZONE + 1);
+                    if mzone ~= 53 then return; end
+                    local qid = struct.unpack('I', data, 0x10 + 1) or 0;
+                    if qid >= ASHU.FIRST and qid <= ASHU.LAST then
+                        local cd = get_char_data();
+                        if cd ~= nil then ASHU.mark_paid(cd, qid); end
+                    end
+                    return;
+                end
 
                 -- Shajaf in Whitegate: which of his four menus opens IS the
                 -- ISNM state, so talking to him is a free truth-check - the
@@ -5011,6 +5263,11 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
     -- 0x0080 = active bits, 0x00C0 = completed bits, bit index = quest id.
     -- Sent on every zone-in and whenever a flag changes, so a mid-chain
     -- install picks up the true state on the first zoning.
+    -- Quest log update. On repeat weeks these bits never move (captured),
+    -- so this is only a FIRST-EVER-week bonus: a chain quest turning active
+    -- means it was just paid for; its completed bit flipping while aboard
+    -- means it was just won. Both funnel into the same state functions the
+    -- menu/text signals use.
     if id == 0x056 then
         if data == nil or #data < 0x26 then return; end
         local chunk = struct.unpack('H', data, 0x24 + 1);
@@ -5018,8 +5275,7 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
         local char_data = get_char_data();
         if char_data == nil then return; end
         local ash = ASHU.data_for(char_data);
-        -- quests 101..103 all live in byte 12 (0-based) of the 32-byte body
-        local b = data:byte(4 + 12 + 1) or 0;
+        local b = data:byte(4 + 12 + 1) or 0;   -- quests 101..103 live in body byte 12
         local changed = false;
         for q = ASHU.FIRST, ASHU.LAST do
             local set = math.floor(b / 2 ^ (q % 8)) % 2 == 1;
@@ -5028,26 +5284,10 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
             if (map[key] == true) ~= set then
                 map[key] = set or nil;
                 changed = true;
-                -- The win signal that works EVERY week: the active bit drops
-                -- while we are aboard for that stage. (The completed bit also
-                -- flips on a first-ever clear; both funnel through wins, so
-                -- neither can double-count.)
-                local won_stage = nil;
-                if chunk == 0x0080 and not set and ash.aboard == true
-                   and ash.aboard_stage == q then
-                    won_stage = q;
+                if chunk == 0x0080 and set and ash.paid ~= true and ash.aboard ~= true then
+                    ASHU.mark_paid(char_data, q);
                 elseif chunk == 0x00C0 and set and ash.aboard == true then
-                    won_stage = ash.aboard_stage or q;
-                end
-                if won_stage ~= nil then
-                    local w = won_stage - ASHU.FIRST + 1;
-                    if (ash.wins or 0) < w then
-                        ash.wins = w;
-                        print_success(string.format('Ashu Talif: %s cleared!',
-                            ASHU.NAMES[won_stage] or tostring(won_stage)));
-                    end
-                    ash.aboard = nil;
-                    ash.aboard_stage = nil;
+                    ASHU.mark_won(char_data);
                 end
             end
         end
@@ -5069,25 +5309,15 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
         if tracker.current_char ~= 'Unknown' then
             local cd_ashu = tracker.settings.characters[tracker.current_char];
             if cd_ashu ~= nil and type(cd_ashu.ashu_data) == 'table' then
-                local ash = cd_ashu.ashu_data;
                 if zone_id == ASHU.SHIP_ZONE then
                     -- The same ship hosts the Black Coffin story mission and
-                    -- the COR job fight. Only a boarding WITH a chain quest
-                    -- active is ours to judge.
-                    local _, stage = ASHU.state(cd_ashu);
-                    if ash.aboard ~= true and stage ~= nil then
-                        ash.aboard = true;
-                        ash.aboard_stage = stage;
-                        save_settings();
-                    end
-                elseif ash.aboard == true then
-                    -- Off the ship. Won fights already cleared aboard when the
-                    -- completed bit arrived; still aboard here means no win.
-                    ash.aboard = nil;
-                    ash.aboard_stage = nil;
-                    ash.failed = true;
-                    save_settings();
-                    print_error('Ashu Talif: the run was lost. The chain waits for the weekly reset.');
+                    -- the COR job fight; mark_aboard ignores boardings with
+                    -- no paid chain stage.
+                    ASHU.mark_aboard(cd_ashu);
+                else
+                    -- Off the ship while still marked aboard = no "Objective
+                    -- complete" was seen = lost (homepoint, warp, eject, D/C).
+                    ASHU.mark_failed(cd_ashu);
                 end
             end
         end
