@@ -3866,12 +3866,16 @@ local function render_ui()
                 draw_icon_box('', { 0.55, 0.55, 0.55, 1.0 });
             end
             imgui.SameLine();
-            imgui.SetCursorPosX(card_icon_x + box_total + em);
-            imgui.TextColored({ 1.0, 1.0, 1.0, 1.0 },
-                string.format('Cards %d/%d', #held_short, #LIMBUS_CARDS));
+            local card_text_x = card_icon_x + box_total + em;
+            imgui.SetCursorPosX(card_text_x);
+            local card_count = string.format('Cards %d/%d', #held_short, #LIMBUS_CARDS);
+            imgui.TextColored({ 1.0, 1.0, 1.0, 1.0 }, card_count);
             if #held_short > 0 then
-                imgui.SameLine();
-                imgui.SetCursorPosX(col_location);
+                -- The held-card names sit one letter after the measured count,
+                -- never at a fixed column: the sub-row's indent had pushed the
+                -- count past that column and the names printed on top of it.
+                imgui.SameLine(0, 0);
+                imgui.SetCursorPosX(card_text_x + icon_text_w(card_count) + em);
                 imgui.TextColored({ 0.0, 1.0, 0.0, 1.0 }, table.concat(held_short, ', '));
             end
 
