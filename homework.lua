@@ -5,7 +5,7 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-addon.version   = '3.8';
+addon.version   = '3.9';
 addon.desc      = 'Weekly homework tracker for FFXI';
 addon.link      = '';
 
@@ -35,6 +35,9 @@ local ui = {
     began = false,
     -- Set when a tick lands on a full account: { char = name, from = index }
     pending_account_add = nil,
+    -- Set by the font-scale buttons: next frame re-applies the window size
+    -- scaled to the new font, so nothing gets clipped at the right edge.
+    resize_to_scale = false,
 };
 
 -- Defined once the key item constants exist; used by save_settings below.
@@ -622,6 +625,9 @@ end
 -- ashu_data: stage (1..3, chain position), paid, aboard, done, failed,
 -- anchored (a weekly reset was witnessed), known (quest book seen once).
 ASHU.NAMES_BY_STAGE = { [1] = 'Scouting', [2] = 'Painter', [3] = 'Captain' };
+-- What Halshaob charges for each fight. Shown on the row instead of the
+-- quest names, which mean nothing to someone who has not done the chain.
+ASHU.COST_BY_STAGE  = { [1] = '3 bronze', [2] = '1 silver', [3] = '1 mythril' };
 
 local function ashu_synced(a)
     return a.anchored == true or a.paid == true or a.aboard == true
@@ -702,11 +708,13 @@ function ASHU.describe(cd)
     if a.failed then return '[x]', 'grey', 'failed - wait for reset'; end
     if a.done   then return '[x]', 'grey', 'done!'; end
     local st = a.stage or 1;
-    local name = ASHU.NAMES_BY_STAGE[st] or '?';
+    local cost = ASHU.COST_BY_STAGE[st] or '?';
+    -- The ring digit on the row says which fight (1-3); the text says what
+    -- to do for it. Plain words, no quest names.
     local status;
-    if a.aboard then status = name .. ' - aboard';
-    elseif a.paid then status = name .. ' - fight!';
-    else status = 'pay for ' .. name; end
+    if a.aboard then status = 'Aboard - fight!';
+    elseif a.paid then status = 'Paid - board the ship';
+    else status = 'Pay ' .. cost .. ' for fight ' .. st; end
     return string.format('[%d]', st), 'green', status;
 end
 
@@ -2997,44 +3005,44 @@ local function format_task_line(task, char_data)
         -- The count answers "how many fights are left this week" (2 per week);
         -- the bracket answers "where do I go". '2x' used to read like part of
         -- the place name.
-        if step == 'unknown' then return HDR .. '\30\104[?]\30\106 ' .. task;
-        elseif step == 'scanned_no_ki' then return HDR .. '\30\104?/2\30\106 ' .. task;
-        elseif step == 'scanned_has_ki' then return HDR .. '\30\104?/2 [Boneyard Gully - Requiem of Sin]\30\106 ' .. task;
-        elseif step == 'scanned_has_ki_used' then return HDR .. '\30\104?/2 [Despachiaire]\30\106 ' .. task;
-        elseif step == 'despachiaire' then return HDR .. '\30\1101/2 [Despachiaire]\30\106 ' .. task;
-        elseif step == 'boneyard' then return HDR .. '\30\1101/2 [Boneyard Gully - Requiem of Sin]\30\106 ' .. task;
-        elseif step == 'boneyard_2x' then return HDR .. '\30\1102/2 [Boneyard Gully - Requiem of Sin]\30\106 ' .. task;
-        elseif step == 'done' then return HDR .. '\30\068[x]\30\106 ' .. task;
-        else return HDR .. '\30\104?/2\30\106 ' .. task; end
+        if step == 'unknown' then return HDR .. '\30\104[ ? ]\30\106 ' .. task;
+        elseif step == 'scanned_no_ki' then return HDR .. '\30\104 ?/2 \30\106 ' .. task;
+        elseif step == 'scanned_has_ki' then return HDR .. '\30\104 ?/2  [Boneyard Gully - Requiem of Sin]\30\106 ' .. task;
+        elseif step == 'scanned_has_ki_used' then return HDR .. '\30\104 ?/2  [Despachiaire]\30\106 ' .. task;
+        elseif step == 'despachiaire' then return HDR .. '\30\110 1/2  [Despachiaire]\30\106 ' .. task;
+        elseif step == 'boneyard' then return HDR .. '\30\110 1/2  [Boneyard Gully - Requiem of Sin]\30\106 ' .. task;
+        elseif step == 'boneyard_2x' then return HDR .. '\30\110 2/2  [Boneyard Gully - Requiem of Sin]\30\106 ' .. task;
+        elseif step == 'done' then return HDR .. '\30\068[ x ]\30\106 ' .. task;
+        else return HDR .. '\30\104 ?/2 \30\106 ' .. task; end
     elseif normalized == 'highwind' then
         local step = char_data.quest_steps.highwind or 'scanned';
-        if step == 'start' then return HDR .. '\30\110[NM]\30\106 ' .. task;
-        elseif step == 'done' then return HDR .. '\30\068[x]\30\106 ' .. task;
-        else return HDR .. '\30\104[ ]\30\106 ' .. task; end
+        if step == 'start' then return HDR .. '\30\110[NM] \30\106 ' .. task;
+        elseif step == 'done' then return HDR .. '\30\068[ x ]\30\106 ' .. task;
+        else return HDR .. '\30\104[   ]\30\106 ' .. task; end
     elseif normalized == 'uninvited' then
         local step = char_data.quest_steps.uninvited or 'unknown';
-        if step == 'scanned' then return HDR .. '\30\104[ ]\30\106 ' .. task;
+        if step == 'scanned' then return HDR .. '\30\104[   ]\30\106 ' .. task;
         elseif step == 'justinius' then return HDR .. '\30\110[Justinius - Start]\30\106 ' .. task;
         elseif step == 'bcnm' then return HDR .. '\30\110[BCNM Monarch]\30\106 ' .. task;
         elseif step == 'justinius_return' then return HDR .. '\30\110[Justinius - Reward]\30\106 ' .. task;
-        elseif step == 'done' then return HDR .. '\30\068[x]\30\106 ' .. task;
-        else return HDR .. '\30\104[?]\30\106 ' .. task; end
+        elseif step == 'done' then return HDR .. '\30\068[ x ]\30\106 ' .. task;
+        else return HDR .. '\30\104[ ? ]\30\106 ' .. task; end
     elseif normalized == 'spicegals' then
         local step = char_data.quest_steps.spicegals or 'unknown';
-        if step == 'scanned' then return HDR .. '\30\104[ ]\30\106 ' .. task;
+        if step == 'scanned' then return HDR .. '\30\104[   ]\30\106 ' .. task;
         elseif step == 'rouva' then return HDR .. '\30\110[Rouva - Start]\30\106 ' .. task;
         elseif step == 'riverne' then return HDR .. '\30\110[Riverne B]\30\106 ' .. task;
         elseif step == 'rouva_return' then return HDR .. '\30\110[Rouva - Reward]\30\106 ' .. task;
-        elseif step == 'done' then return HDR .. '\30\068[x]\30\106 ' .. task;
-        else return HDR .. '\30\104[?]\30\106 ' .. task; end
+        elseif step == 'done' then return HDR .. '\30\068[ x ]\30\106 ' .. task;
+        else return HDR .. '\30\104[ ? ]\30\106 ' .. task; end
     elseif normalized == 'cookbook' then
         local step = char_data.quest_steps.cookbook or 'unknown';
-        if step == 'scanned' then return HDR .. '\30\104[ ]\30\106 ' .. task;
+        if step == 'scanned' then return HDR .. '\30\104[   ]\30\106 ' .. task;
         elseif step == 'jonette' then return HDR .. '\30\110[Jonette - Start]\30\106 ' .. task;
         elseif step == 'sacrarium' then return HDR .. '\30\110[??? Sacrarium]\30\106 ' .. task;
         elseif step == 'jonette_return' then return HDR .. '\30\110[Jonette - Reward]\30\106 ' .. task;
-        elseif step == 'done' then return HDR .. '\30\068[x]\30\106 ' .. task;
-        else return HDR .. '\30\104[?]\30\106 ' .. task; end
+        elseif step == 'done' then return HDR .. '\30\068[ x ]\30\106 ' .. task;
+        else return HDR .. '\30\104[ ? ]\30\106 ' .. task; end
     elseif normalized == 'ecowarrior' then
         local eco_data = char_data.ecowarrior_data or {};
         local step = eco_data.step or 'unknown';
@@ -3045,7 +3053,7 @@ local function format_task_line(task, char_data)
         local color = eco_data.knows_status and '\30\110' or '\30\104';
         if step == 'scanned' then return HDR .. '\30\104[' .. available_text .. ']\30\106 ' .. task;
         elseif step == 'ready' then return HDR .. '\30\110[' .. available_text .. ']\30\106 ' .. task;
-        elseif step == 'done' then return HDR .. '\30\068[x]\30\106 ' .. task;
+        elseif step == 'done' then return HDR .. '\30\068[ x ]\30\106 ' .. task;
         elseif step == 'scanned_has_ki' and zone_info then
             return HDR .. '\30\104[' .. zone_info.zone_name .. ' - ' .. zone_info.field_agent .. ']\30\106 ' .. task;
         elseif step == 'field_agent' and zone_info then
@@ -3056,8 +3064,8 @@ local function format_task_line(task, char_data)
             return HDR .. color .. '[' .. zone_info.zone_name .. ' - ' .. zone_info.field_agent .. ']\30\106 ' .. task;
         elseif step == 'reward' and zone_info then
             return HDR .. color .. '[' .. zone_info.city_name .. ' - ' .. zone_info.quest_npc .. ']\30\106 ' .. task;
-        elseif step == 'unknown' then return HDR .. '\30\104[?]\30\106 ' .. task;
-        else return HDR .. '\30\104[ ]\30\106 ' .. task; end
+        elseif step == 'unknown' then return HDR .. '\30\104[ ? ]\30\106 ' .. task;
+        else return HDR .. '\30\104[   ]\30\106 ' .. task; end
     end
     return nil;
 end
@@ -3067,7 +3075,7 @@ end
 local function format_dynamis_line(char_name, char_data)
     local store, shared = get_dynamis_store(char_name);
     if store == nil then store = char_data.dynamis_data; end
-    if store == nil then return HDR .. '\30\104[?]\30\106 Dynamis'; end
+    if store == nil then return HDR .. '\30\104[ ? ]\30\106 Dynamis'; end
     -- Show what actually limits this character: the lower of their own cap and
     -- the account pool. Saying "1 left" when the character is capped would lie.
     if store.known == false then
@@ -3089,7 +3097,7 @@ local function format_dynamis_line(char_name, char_data)
     local colour = (entries <= 0) and '\30\076'
                 or (entries == 1) and '\30\104'
                 or '\30\110';
-    local count = string.format('%s%d/%d\30\106', colour, entries, dmax);
+    local count = string.format('%s %d/%d \30\106', colour, entries, dmax);
     if suffix ~= '' then
         return HDR .. count .. ' Dynamis \30\071(' .. entries .. ' left' .. suffix .. ')\30\106';
     end
@@ -3121,10 +3129,10 @@ local function format_limbus_line(char_name)
     if #cards > 0 then suffix = ' \30\071(' .. table.concat(cards, ', ') .. ')\30\106'; end
 
     local icon;
-    if eff == nil then icon = '\30\104[?]\30\106';
-    elseif not known then icon = string.format('\30\104?/%d\30\106', LIMBUS_CHARACTER_LIMIT);
-    elseif eff <= 0 then icon = string.format('\30\076%d/%d\30\106', eff, LIMBUS_CHARACTER_LIMIT);
-    else icon = string.format('\30\110%d/%d\30\106', eff, LIMBUS_CHARACTER_LIMIT); end
+    if eff == nil then icon = '\30\104[ ? ]\30\106';
+    elseif not known then icon = string.format('\30\104 ?/%d \30\106', LIMBUS_CHARACTER_LIMIT);
+    elseif eff <= 0 then icon = string.format('\30\076 %d/%d \30\106', eff, LIMBUS_CHARACTER_LIMIT);
+    else icon = string.format('\30\110 %d/%d \30\106', eff, LIMBUS_CHARACTER_LIMIT); end
 
     local where = has_cosmo and 'Apollyon/Temenos' or LIMBUS_NPC;
     local counts = '';
@@ -3141,12 +3149,12 @@ local function format_assault_line(char_data, char_name)
     local carried = assault_holding_tag(char_name);
     local area = assault_active_area(char_name);
     if stored == nil then
-        return HDR .. '\30\104[?]\30\106 Assault \30\071(talk to Rytaal)\30\106';
+        return HDR .. '\30\104[ ? ]\30\106 Assault \30\071(talk to Rytaal)\30\106';
     end
     local colour = (stored == 0) and '\30\076'
                 or (stored == 1) and '\30\104'
                 or '\30\110';
-    local icon = string.format('%s%d/%d\30\106', colour, stored, max_stock);
+    local icon = string.format('%s %d/%d \30\106', colour, stored, max_stock);
     local bits = { stored .. ' at Rytaal' };
     if carried then table.insert(bits, 'carrying 1'); end
     if next_tag > 0 then table.insert(bits, 'next in ' .. format_time_short(next_tag - os.time())); end
@@ -3158,7 +3166,9 @@ end
 local function format_ashu_line(char_data)
     local icon, key, status = ASHU.describe(char_data);
     local col = (key == 'green') and '\30\110' or (key == 'grey') and '\30\068' or '\30\104';
-    if icon == '[x]' then icon = '[ x ]'; elseif icon == '[?]' then icon = '[ ? ]'; end
+    local d = icon:match('^%[(%d)%]$');
+    if d then icon = '[ ' .. d .. ' ]';
+    elseif icon == '[x]' then icon = '[ x ]'; elseif icon == '[?]' then icon = '[ ? ]'; end
     return HDR .. col .. icon .. '\30\106 Ashu Talif \30\071(' .. status .. ')\30\106';
 end
 
@@ -3168,7 +3178,7 @@ local function format_isnm_line(char_name)
     resolve_isnm_unknown(cd, char_name);
     local isnm = cd and cd.isnm_data or nil;
     if isnm ~= nil and isnm.no_badge then
-        return HDR .. '\30\068[ ]\30\106 ISNM \30\071(need the Wildcat Badge)\30\106';
+        return HDR .. '\30\068[   ]\30\106 ISNM \30\071(need the Wildcat Badge)\30\106';
     end
     local held = isnm_held_ki(char_name);
     local nbt = isnm and isnm.next_buy_time or nil;
@@ -3178,12 +3188,12 @@ local function format_isnm_line(char_name)
     else buy = format_time_short(nbt - os.time()); end
     if held ~= nil then
         local tier = held == ISNM_SECRET_KI and '3000' or '2000';
-        return HDR .. '\30\110[KI]\30\106 ISNM \30\071(' .. tier .. ' held, ' .. buy .. ')\30\106';
+        return HDR .. '\30\110[KI] \30\106 ISNM \30\071(' .. tier .. ' held, ' .. buy .. ')\30\106';
     end
     if nbt == nil then
         return HDR .. '\30\104[ ? ]\30\106 ISNM \30\071(see Shajaf)\30\106';
     end
-    local icon = (os.time() >= nbt) and '\30\110[  ]' or '\30\068[ x ]';
+    local icon = (os.time() >= nbt) and '\30\110[   ]' or '\30\068[ x ]';
     return HDR .. icon .. '\30\106 ISNM \30\071(' .. buy .. ')\30\106';
 end
 
@@ -3191,31 +3201,32 @@ end
 local function format_timer_line(enm, timer_data, current_time)
     local status_icon = '\30\104[ ? ]\30\106';
     local status_text = '\30\071(Unknown)\30\106';
-    -- [KI] green = in the bag (fight open), [    ] = ready but KI not taken,
+    -- Icons are padded to 5 columns so names line up in the fixed-width chat
+    -- font. [KI] green = in the bag (fight open), [  ] = ready but KI not taken,
     -- [ x ] = waiting, [ ? ] = unknown. Same vocabulary as the window.
     if timer_data ~= nil then
         if timer_data.next_ki_time == nil or timer_data.next_ki_time == 0 then
             if timer_data.has_ki then
-                status_icon = '\30\110[KI]\30\106';
+                status_icon = '\30\110[KI] \30\106';
                 status_text = '\30\071(Ready)\30\106';
             end
         elseif current_time >= timer_data.next_ki_time then
             if timer_data.has_ki then
-                status_icon = '\30\110[KI]\30\106';
+                status_icon = '\30\110[KI] \30\106';
             else
-                status_icon = '\30\110[    ]\30\106';
+                status_icon = '\30\110[  ]\30\106';
             end
             status_text = '\30\071(Ready)\30\106';
         elseif timer_data.timer_source == 'scan' then
             if timer_data.has_ki then
-                status_icon = '\30\110[KI]\30\106';
+                status_icon = '\30\110[KI] \30\106';
                 status_text = '\30\071(Ready)\30\106';
             end
         else
             local time_left = timer_data.next_ki_time - current_time;
             local days = math.floor(time_left / 86400);
             local hours = math.floor((time_left % 86400) / 3600);
-            if timer_data.has_ki then status_icon = '\30\110[KI]\30\106'; else status_icon = '\30\068[ x ]\30\106'; end
+            if timer_data.has_ki then status_icon = '\30\110[KI] \30\106'; else status_icon = '\30\068[ x ]\30\106'; end
             if days > 0 then status_text = string.format('\30\071(%dd %dh)\30\106', days, hours);
             else status_text = string.format('\30\071(%dh)\30\106', hours); end
         end
@@ -3358,9 +3369,9 @@ local function show_timers()
             local time_str = '';
             if days > 0 then time_str = tostring(days) .. ' days, ' .. tostring(hours) .. ' hours';
             else time_str = tostring(hours) .. ' hours'; end
-            print('\30\110[o]\30\067 = KI in hand, fight open. Timer resolves after ' .. time_str .. ' or when KI obtained.');
+            print('\30\110[KI]\30\067 = KI in hand, fight open. Timer resolves after ' .. time_str .. ' or when KI obtained.');
         else
-            print('\30\110[o]\30\067 = KI in hand, fight open. Timer updates when KI obtained.');
+            print('\30\110[KI]\30\067 = KI in hand, fight open. Timer updates when KI obtained.');
         end
     end
     print_msg('====================');
@@ -3483,51 +3494,192 @@ local function help_marker(text)
     end
 end
 
--- Gradient header helper: color > transparent with small text padding
-local function draw_gradient_header(text, width, help_text)
+-- ---------------------------------------------------------------------------
+-- Theme
+-- One palette for the whole window: deep navy glass, cool blue chrome, an
+-- accent colour per section (Weeklies / Timers / Settings) and the orange
+-- resize grip kept from the old look so people still find it.
+--
+-- Lives on `ui` rather than in its own local on purpose: render_ui sits at
+-- the 60-upvalue limit (see ASHU above), so nothing new may be captured.
+-- Every ImGui constant is looked up by NAME and skipped if this Ashita build
+-- lacks it, and the push counters on `ui` are advanced one push at a time so
+-- the d3d_present unwinder always knows exactly how much to pop.
+-- ---------------------------------------------------------------------------
+ui.theme = {
+    accents = {
+        weeklies = { 0.36, 0.66, 1.00 },   -- sky blue
+        timers   = { 1.00, 0.62, 0.30 },   -- ember orange
+        settings = { 0.72, 0.55, 1.00 },   -- soft violet
+        gold     = { 1.00, 0.84, 0.36 },   -- reset-soon warning
+        text_dim = { 0.60, 0.65, 0.75 },
+    },
+    colors = {
+        { 'ImGuiCol_WindowBg',            { 0.055, 0.065, 0.100, 0.94 } },
+        { 'ImGuiCol_ChildBg',             { 0.000, 0.000, 0.000, 0.00 } },
+        { 'ImGuiCol_PopupBg',             { 0.075, 0.085, 0.130, 0.97 } },
+        { 'ImGuiCol_Border',              { 0.36,  0.48,  0.72,  0.40 } },
+        { 'ImGuiCol_BorderShadow',        { 0.00,  0.00,  0.00,  0.00 } },
+        { 'ImGuiCol_TitleBg',             { 0.080, 0.095, 0.150, 1.00 } },
+        { 'ImGuiCol_TitleBgActive',       { 0.115, 0.145, 0.230, 1.00 } },
+        { 'ImGuiCol_TitleBgCollapsed',    { 0.080, 0.095, 0.150, 0.80 } },
+        { 'ImGuiCol_Text',                { 0.92,  0.94,  0.97,  1.00 } },
+        { 'ImGuiCol_TextDisabled',        { 0.52,  0.57,  0.68,  1.00 } },
+        { 'ImGuiCol_FrameBg',             { 0.125, 0.150, 0.225, 0.92 } },
+        { 'ImGuiCol_FrameBgHovered',      { 0.180, 0.225, 0.340, 1.00 } },
+        { 'ImGuiCol_FrameBgActive',       { 0.225, 0.290, 0.440, 1.00 } },
+        { 'ImGuiCol_Button',              { 0.200, 0.300, 0.500, 0.90 } },
+        { 'ImGuiCol_ButtonHovered',       { 0.300, 0.460, 0.740, 1.00 } },
+        { 'ImGuiCol_ButtonActive',        { 0.380, 0.580, 0.900, 1.00 } },
+        { 'ImGuiCol_CheckMark',           { 0.45,  0.82,  1.00,  1.00 } },
+        { 'ImGuiCol_Header',              { 0.240, 0.380, 0.620, 0.80 } },
+        { 'ImGuiCol_HeaderHovered',       { 0.300, 0.460, 0.740, 0.90 } },
+        { 'ImGuiCol_HeaderActive',        { 0.380, 0.580, 0.900, 1.00 } },
+        { 'ImGuiCol_Tab',                 { 0.110, 0.135, 0.205, 1.00 } },
+        { 'ImGuiCol_TabHovered',          { 0.300, 0.460, 0.740, 1.00 } },
+        { 'ImGuiCol_TabActive',           { 0.220, 0.350, 0.600, 1.00 } },
+        { 'ImGuiCol_TabUnfocused',        { 0.090, 0.110, 0.170, 1.00 } },
+        { 'ImGuiCol_TabUnfocusedActive',  { 0.170, 0.260, 0.440, 1.00 } },
+        { 'ImGuiCol_Separator',           { 0.36,  0.48,  0.72,  0.35 } },
+        { 'ImGuiCol_ScrollbarBg',         { 0.055, 0.065, 0.100, 0.60 } },
+        { 'ImGuiCol_ScrollbarGrab',       { 0.240, 0.320, 0.480, 0.80 } },
+        { 'ImGuiCol_ScrollbarGrabHovered',{ 0.300, 0.460, 0.740, 1.00 } },
+        { 'ImGuiCol_ScrollbarGrabActive', { 0.380, 0.580, 0.900, 1.00 } },
+        { 'ImGuiCol_SliderGrab',          { 0.36,  0.66,  1.00,  1.00 } },
+        { 'ImGuiCol_SliderGrabActive',    { 0.55,  0.80,  1.00,  1.00 } },
+        { 'ImGuiCol_ResizeGrip',          { 0.90,  0.45,  0.20,  0.80 } },
+        { 'ImGuiCol_ResizeGripHovered',   { 1.00,  0.60,  0.30,  1.00 } },
+        { 'ImGuiCol_ResizeGripActive',    { 1.00,  0.72,  0.40,  1.00 } },
+    },
+    vars = {
+        { 'ImGuiStyleVar_WindowRounding',    8.0 },
+        { 'ImGuiStyleVar_WindowBorderSize',  1.0 },
+        { 'ImGuiStyleVar_FrameBorderSize',   0.0 },
+        { 'ImGuiStyleVar_FrameRounding',     4.0 },
+        { 'ImGuiStyleVar_PopupRounding',     6.0 },
+        { 'ImGuiStyleVar_GrabRounding',      4.0 },
+        { 'ImGuiStyleVar_ScrollbarRounding', 6.0 },
+        { 'ImGuiStyleVar_ScrollbarSize',    10.0 },
+        { 'ImGuiStyleVar_TabRounding',       5.0 },
+        { 'ImGuiStyleVar_WindowPadding',    { 10.0, 8.0 } },
+        { 'ImGuiStyleVar_FramePadding',     {  6.0, 3.0 } },
+        { 'ImGuiStyleVar_ItemSpacing',      {  8.0, 5.0 } },
+    },
+    -- Set to false the first time a decorative drawlist call throws, after
+    -- which the headers fall back to the plain gradient. Some Ashita builds
+    -- bind fewer ImDrawList overloads than others.
+    fancy_drawlist = true,
+};
+
+-- Push the whole palette. Counters advance per push so a throw halfway
+-- through still leaves ui.style_colors / ui.style_vars truthful.
+function ui.theme.push()
+    for _, c in ipairs(ui.theme.colors) do
+        local id = _G[c[1]];
+        if id ~= nil then
+            imgui.PushStyleColor(id, c[2]);
+            ui.style_colors = ui.style_colors + 1;
+        end
+    end
+    for _, v in ipairs(ui.theme.vars) do
+        local id = _G[v[1]];
+        if id ~= nil then
+            imgui.PushStyleVar(id, v[2]);
+            ui.style_vars = ui.style_vars + 1;
+        end
+    end
+end
+
+function ui.theme.pop()
+    if ui.style_vars > 0 then imgui.PopStyleVar(ui.style_vars); end
+    if ui.style_colors > 0 then imgui.PopStyleColor(ui.style_colors); end
+    ui.style_colors = 0; ui.style_vars = 0;
+end
+
+function ui.theme.rgba(c, a)
+    return { c[1], c[2], c[3], a == nil and 1.0 or a };
+end
+
+-- Thin progress bar showing how far into the weekly cycle we are: fills left
+-- to right and warms from the section accent to gold in the last day, so
+-- "reset is close" is visible without reading the number.
+function ui.theme.draw_week_bar(reset_seconds, width)
+    local week = 7 * 24 * 3600;
+    local frac = 1.0 - (reset_seconds / week);
+    if frac < 0 then frac = 0; elseif frac > 1 then frac = 1; end
+    local actualWidth = type(width) == 'table' and width[1] or width;
+    local x, y = imgui.GetCursorScreenPos();
+    local h = 4;
+    local drawlist = imgui.GetWindowDrawList();
+    local acc = ui.theme.accents.weeklies;
+    local hot = ui.theme.accents.gold;
+    local ok = pcall(function()
+        drawlist:AddRectFilled({ x, y }, { x + actualWidth, y + h },
+            imgui.GetColorU32({ 1.0, 1.0, 1.0, 0.07 }));
+        if frac > 0 then
+            drawlist:AddRectFilledMultiColor(
+                { x, y }, { x + actualWidth * frac, y + h },
+                imgui.GetColorU32(ui.theme.rgba(acc, 0.9)), imgui.GetColorU32(ui.theme.rgba(hot, 0.9)),
+                imgui.GetColorU32(ui.theme.rgba(hot, 0.9)), imgui.GetColorU32(ui.theme.rgba(acc, 0.9)));
+        end
+    end);
+    if not ok then ui.theme.fancy_drawlist = false; end
+    imgui.SetCursorScreenPos({ x, y + h + 6 });
+end
+
+-- Section header: accent bar on the left, a soft accent-to-transparent
+-- gradient behind the title and a hairline underneath. `accent_key` picks
+-- the colour from ui.theme.accents (defaults to the Weeklies blue).
+-- `right_text` is drawn dim and right-aligned inside the band (e.g. "3/7 done").
+local function draw_gradient_header(text, width, help_text, accent_key, right_text)
     local drawlist = imgui.GetWindowDrawList();
     local x, y = imgui.GetCursorScreenPos();
     local lineH = imgui.GetTextLineHeightWithSpacing();
 
     -- Extract width if it's a table from GetContentRegionAvail()
     local actualWidth = type(width) == 'table' and width[1] or width;
+    local accent = ui.theme.accents[accent_key or 'weeklies'] or ui.theme.accents.weeklies;
+    local h = lineH + 4;
 
-    local fadeFraction = 0.75;
-    local gradWidth = actualWidth * fadeFraction;
-
-    local colLeft = {0.4, 0.7, 0.9, 1.0};  -- Light blue color (RGBA)
-    local colLeftU32 = imgui.GetColorU32(colLeft);
-    local colRight = {colLeft[1], colLeft[2], colLeft[3], 0.0};  -- Transparent
-    local colRightU32 = imgui.GetColorU32(colRight);
-
+    local bandL = imgui.GetColorU32(ui.theme.rgba(accent, 0.38));
+    local bandR = imgui.GetColorU32(ui.theme.rgba(accent, 0.0));
     drawlist:AddRectFilledMultiColor(
-        {x, y},
-        {x + gradWidth, y + lineH},
-        colLeftU32,
-        colRightU32,
-        colRightU32,
-        colLeftU32
-    );
+        { x, y }, { x + actualWidth * 0.85, y + h },
+        bandL, bandR, bandR, bandL);
 
-    local padX = 4;
+    if ui.theme.fancy_drawlist then
+        local ok = pcall(function()
+            -- Solid accent bar on the left edge.
+            drawlist:AddRectFilled({ x, y }, { x + 3, y + h }, imgui.GetColorU32(ui.theme.rgba(accent, 1.0)));
+            -- Hairline under the whole band.
+            drawlist:AddLine({ x, y + h }, { x + actualWidth, y + h }, imgui.GetColorU32(ui.theme.rgba(accent, 0.45)), 1.0);
+        end);
+        if not ok then ui.theme.fancy_drawlist = false; end
+    end
+
+    local padX = 9;
     local padY = 2;
-    imgui.SetCursorScreenPos({x + padX, y + padY});
-    imgui.Text(text);
+    imgui.SetCursorScreenPos({ x + padX, y + padY });
+    imgui.TextColored({ 1.0, 1.0, 1.0, 1.0 }, text);
 
     -- Add help marker on same line if provided (only if it's a string)
     if help_text and type(help_text) == 'string' then
         help_marker(help_text);
     end
 
-    local _, newY = imgui.GetCursorScreenPos();
-    imgui.SetCursorScreenPos({x, newY});
+    if right_text ~= nil and right_text ~= '' then
+        local tw = ui.theme.text_w(right_text);
+        imgui.SetCursorScreenPos({ x + actualWidth - tw - 6, y + padY });
+        imgui.TextColored(ui.theme.rgba(ui.theme.accents.text_dim, 1.0), right_text);
+    end
+
+    imgui.SetCursorScreenPos({ x, y + h + 3 });
     imgui.Spacing();
 end
 
 -- The tree connector in front of sub-rows (Carrying Tag, Cards): marks them
 -- as belonging to the row above. If this renders as a broken box on some
 -- client font, change it to '\\-' here and nowhere else.
-local SUB_MARK = '\226\148\148\226\148\128';   -- corner + horizontal run, ends at the bracket
 
 -- Fixed-bracket icons: '[' and ']' land on the same pixel columns in every
 -- row and the symbol is centered between them, so alignment never depends on
@@ -3571,7 +3723,26 @@ local function run_measurements()
     imgui.SetCursorPosY(sy);
 end
 
-local function draw_icon_box(sym, color)
+-- ---------------------------------------------------------------------------
+-- Status glyphs
+-- The icon column used to be text: "[o]", "[x]", "[KI]", "2/3". Those are now
+-- drawn with the ImDrawList so they read as real symbols:
+--   o   -> filled dot with a soft glow       (ready / go here)
+--   x   -> ring with a check mark            (done this week)
+--   ' ' -> empty ring                        (still to do)
+--   ?   -> ring with a ? inside              (unknown)
+--   KI  -> solid rounded badge reading KI    (key item in the bag)
+--   1..9-> ring with the digit inside        (Ashu Talif stage)
+--   n/m -> m little dots, n of them lit      (Assault tag stock)
+-- Every glyph occupies exactly the footprint the old "[KI]" text box had
+-- (icon_cell_w), so the column maths in the two tabs is untouched. If this
+-- Ashita build cannot draw circles the old text boxes come back unchanged.
+-- ---------------------------------------------------------------------------
+function ui.theme.cell_w()
+    return icon_text_w('[') * 2 + icon_text_w('KI') + 4;
+end
+
+function ui.theme.icon_box_text(sym, color)
     local icon_box_inner = icon_text_w('KI') + 4;
     local x0 = imgui.GetCursorPosX();
     imgui.TextColored(color, '[');
@@ -3585,22 +3756,521 @@ local function draw_icon_box(sym, color)
     imgui.TextColored(color, ']');
 end
 
--- Route any row icon: bracketed strings become fixed boxes ('[ x ]' -> box
--- with centered x). Counts and other bare strings are centered under the same
--- footprint, so 2/3 sits under the box symbols instead of hugging the left.
-local function draw_row_icon(icon, color)
-    local inner = tostring(icon):match('^%[(.-)%]$');
-    if inner ~= nil then
-        draw_icon_box((inner:gsub('%s+', '')), color);
-        return;
-    end
-    local icon_box_inner = icon_text_w('KI') + 4;
-    local total = icon_text_w('[') * 2 + icon_box_inner;
+function ui.theme.centered_text(icon, color)
+    local total = ui.theme.cell_w();
     local x0 = imgui.GetCursorPosX();
     local w = icon_text_w(icon);
     if w < total then imgui.SetCursorPosX(x0 + (total - w) / 2); end
     imgui.TextColored(color, icon);
 end
+
+-- One-time capability probe: draws three invisible primitives. Cached.
+function ui.theme.glyphs_ok(drawlist)
+    if ui.theme.glyph_ok == nil then
+        local x, y = imgui.GetCursorScreenPos();
+        ui.theme.glyph_ok = pcall(function()
+            drawlist:AddCircleFilled({ x, y }, 0.5, 0, 8);
+            drawlist:AddCircle({ x, y }, 0.5, 0, 8, 1.0);
+            drawlist:AddLine({ x, y }, { x, y }, 0, 1.0);
+        end);
+    end
+    return ui.theme.glyph_ok;
+end
+
+local function draw_icon_box(sym, color)
+    local drawlist = imgui.GetWindowDrawList();
+    if not ui.theme.glyphs_ok(drawlist) then ui.theme.icon_box_text(sym, color); return; end
+    sym = sym or '';
+    local cw = ui.theme.cell_w();
+    local lh = imgui.GetTextLineHeight();
+    local x, y = imgui.GetCursorScreenPos();
+    local cx, cy = x + cw / 2, y + lh / 2;
+    local r = lh * 0.30;
+    local col   = imgui.GetColorU32(color);
+    local faint = imgui.GetColorU32({ color[1], color[2], color[3], 0.20 });
+    local thick = math.max(1.5, lh * 0.10);
+
+    if sym == 'o' then
+        drawlist:AddCircleFilled({ cx, cy }, r + 3.0, faint, 24);
+        drawlist:AddCircleFilled({ cx, cy }, r, col, 24);
+    elseif sym == 'x' then
+        drawlist:AddCircleFilled({ cx, cy }, r + 1.5, faint, 24);
+        drawlist:AddCircle({ cx, cy }, r + 1.5, col, 24, thick);
+        drawlist:AddLine({ cx - r * 0.55, cy + r * 0.02 }, { cx - r * 0.12, cy + r * 0.48 }, col, thick);
+        drawlist:AddLine({ cx - r * 0.12, cy + r * 0.48 }, { cx + r * 0.62, cy - r * 0.45 }, col, thick);
+    elseif sym == '' then
+        drawlist:AddCircle({ cx, cy }, r, col, 24, thick);
+    elseif sym == 'KI' then
+        local tw = icon_text_w('KI');
+        local bw = math.min(cw, tw + 8);
+        ui.theme.rect(drawlist, { cx - bw / 2, y }, { cx + bw / 2, y + lh }, col, 4.0);
+        imgui.SetCursorScreenPos({ cx - tw / 2, y });
+        imgui.TextColored({ 0.04, 0.06, 0.10, 1.0 }, 'KI');
+        imgui.SameLine(0, 0);
+    else
+        -- '?' or a stage digit: ring with the text inside. Sized off the
+        -- line height so a digit never pokes out of it.
+        local rr = lh * 0.47;
+        drawlist:AddCircleFilled({ cx, cy }, rr, faint, 24);
+        drawlist:AddCircle({ cx, cy }, rr, col, 24, thick);
+        local tw = icon_text_w(sym);
+        imgui.SetCursorScreenPos({ cx - tw / 2, y });
+        imgui.TextColored(color, sym);
+        imgui.SameLine(0, 0);
+    end
+    imgui.SetCursorScreenPos({ x, y });
+    imgui.Dummy({ cw, lh });
+end
+
+-- n/m as a row of dots. Falls back to text when there are too many to fit.
+function ui.theme.dot_meter(n, m, color, unknown)
+    local drawlist = imgui.GetWindowDrawList();
+    if m < 1 or m > 5 or not ui.theme.glyphs_ok(drawlist) then
+        ui.theme.centered_text((unknown and '?' or tostring(n)) .. '/' .. m, color);
+        return;
+    end
+    local cw = ui.theme.cell_w();
+    local lh = imgui.GetTextLineHeight();
+    local x, y = imgui.GetCursorScreenPos();
+    -- Bigger than the chip dots: the icon cell has the room. Start at a fifth
+    -- of the line height and only shrink if that many dots would not fit.
+    local gap = 4;
+    local r = lh * 0.21;
+    if m * (r * 2 + gap) - gap > cw then
+        r = math.max(2.0, ((cw + gap) / m - gap) / 2);
+    end
+    local step = r * 2 + gap;
+    local sx = x + (cw - (m * step - gap)) / 2 + r;
+    local cy = y + lh / 2;
+    local col = imgui.GetColorU32(color);
+    local dim = imgui.GetColorU32({ 0.50, 0.56, 0.68, 0.55 });
+    for i = 1, m do
+        local cx = sx + (i - 1) * step;
+        if not unknown and i <= n then
+            drawlist:AddCircleFilled({ cx, cy }, r, col, 16);
+        else
+            drawlist:AddCircle({ cx, cy }, r, unknown and col or dim, 16, math.max(1.2, r * 0.3));
+        end
+    end
+    imgui.Dummy({ cw, lh });
+end
+
+-- Route any row icon. Bracketed strings become glyphs ('[ x ]' -> check);
+-- counts become dot meters; anything else is centred text in the same cell.
+local function draw_row_icon(icon, color)
+    icon = tostring(icon);
+    local inner = icon:match('^%[(.-)%]$');
+    if inner ~= nil then
+        draw_icon_box((inner:gsub('%s+', '')), color);
+        return;
+    end
+    local n, m = icon:match('^(%d+)/(%d+)$');
+    if n ~= nil then ui.theme.dot_meter(tonumber(n), tonumber(m), color, false); return; end
+    m = icon:match('^%?/(%d+)$');
+    if m ~= nil then ui.theme.dot_meter(0, tonumber(m), color, true); return; end
+    ui.theme.centered_text(icon, color);
+end
+
+-- ---------------------------------------------------------------------------
+-- Theme helpers that need the text measurer above.
+-- ---------------------------------------------------------------------------
+function ui.theme.text_w(s) return icon_text_w(s); end
+
+-- Rounded rectangle, probing once whether this build's AddRectFilled accepts
+-- a rounding argument. After the probe the answer is cached and no pcall runs.
+function ui.theme.rect(drawlist, p1, p2, col, rounding)
+    if ui.theme.rounded_ok == nil then
+        ui.theme.rounded_ok = pcall(function() drawlist:AddRectFilled(p1, p2, col, rounding); end);
+        if ui.theme.rounded_ok then return; end
+    end
+    if ui.theme.rounded_ok then
+        drawlist:AddRectFilled(p1, p2, col, rounding);
+    else
+        drawlist:AddRectFilled(p1, p2, col);
+    end
+end
+
+-- Status pill: a tinted rounded chip behind the text, replacing the old
+-- "(text)" parentheses. Optional `sub` is a second, dimmer chip right after
+-- it - used for the account figure on Dynamis and Limbus.
+function ui.theme.pill(text, color, sub, sub_color)
+    if text == nil or text == '' then return; end
+    local drawlist = imgui.GetWindowDrawList();
+    local x, y = imgui.GetCursorScreenPos();
+    local h = imgui.GetTextLineHeight();
+    local padX = 5;
+    local w = ui.theme.text_w(text);
+    ui.theme.rect(drawlist, { x, y - 1 }, { x + w + padX * 2, y + h + 1 },
+        imgui.GetColorU32({ color[1], color[2], color[3], 0.16 }), 4.0);
+    imgui.SetCursorScreenPos({ x + padX, y });
+    imgui.TextColored(color, text);
+    local right = x + w + padX * 2;
+    if sub ~= nil and sub ~= '' then
+        sub_color = sub_color or ui.theme.accents.text_dim;
+        local sx = x + w + padX * 2 + 4;
+        local sw = ui.theme.text_w(sub);
+        ui.theme.rect(drawlist, { sx, y - 1 }, { sx + sw + padX * 2, y + h + 1 },
+            imgui.GetColorU32({ 1.0, 1.0, 1.0, 0.06 }), 4.0);
+        imgui.SameLine();
+        imgui.SetCursorScreenPos({ sx + padX, y });
+        imgui.TextColored({ sub_color[1], sub_color[2], sub_color[3], 1.0 }, sub);
+        right = sx + sw + padX * 2;
+    end
+    -- Close with an invisible item that ends at the pill's right edge, so
+    -- whatever follows on the line (another pill, the (?) marker) is placed
+    -- after the padding rather than on top of it.
+    imgui.SameLine(0, 0);
+    imgui.SetCursorScreenPos({ right, y });
+    imgui.Dummy({ 1, h });
+end
+
+-- Counter chip: dim label + coloured "n/max" in one rounded pill, e.g.
+-- [char 2/2] [acct 3/4]. Chain them with imgui.SameLine() between calls.
+-- Dot-meter geometry for the chips: radius and centre-to-centre step.
+function ui.theme.dot_geom(h)
+    local r = math.max(3.0, h * 0.20);
+    return r, r * 2 + 4;
+end
+
+-- Width a count_pill will take, including the trailing gap. Used by the
+-- rows to decide whether two chips plus the (?) marker fit on the line;
+-- if not they fall back to numbers, which are narrower.
+function ui.theme.count_pill_w(label, value, max, dots)
+    local h = imgui.GetTextLineHeight();
+    local gap = ui.theme.text_w(' ');
+    local w = ui.theme.text_w(label) + gap + 4 * 2 + 4;
+    if dots and max ~= nil and max >= 1 and max <= 5 then
+        local _, step = ui.theme.dot_geom(h);
+        w = w + max * step - 4;
+    else
+        w = w + ui.theme.text_w(value);
+    end
+    return w;
+end
+
+-- Chip reading "You  o o" / "Account  o o o o": `max` dots, `left` of them
+-- lit. `unknown` draws them all hollow in the given colour. `dots == false`
+-- (row out of room, or this build cannot draw circles) shows `value` as
+-- text instead - one or the other, never both.
+function ui.theme.count_pill(label, value, color, left, max, unknown, dots)
+    local drawlist = imgui.GetWindowDrawList();
+    local x, y = imgui.GetCursorScreenPos();
+    local h = imgui.GetTextLineHeight();
+    local padX = 4;
+    local gap = ui.theme.text_w(' ');
+    local lw = ui.theme.text_w(label);
+    local r, step = ui.theme.dot_geom(h);
+    local use_dots = dots ~= false and max ~= nil and max >= 1 and max <= 5 and ui.theme.glyphs_ok(drawlist);
+    local body_w = use_dots and (max * step - 4) or ui.theme.text_w(value);
+    local w = lw + gap + body_w + padX * 2;
+    ui.theme.rect(drawlist, { x, y - 1 }, { x + w, y + h + 1 },
+        imgui.GetColorU32({ color[1], color[2], color[3], 0.14 }), 4.0);
+    imgui.SetCursorScreenPos({ x + padX, y });
+    imgui.TextColored(ui.theme.rgba(ui.theme.accents.text_dim, 1.0), label);
+    if use_dots then
+        local col = imgui.GetColorU32(color);
+        local dim = imgui.GetColorU32({ 0.50, 0.56, 0.68, 0.55 });
+        local sx = x + padX + lw + gap + r;
+        local cy = y + h / 2;
+        for i = 1, max do
+            local cx = sx + (i - 1) * step;
+            if not unknown and i <= (left or 0) then
+                drawlist:AddCircleFilled({ cx, cy }, r, col, 20);
+            else
+                drawlist:AddCircle({ cx, cy }, r, unknown and col or dim, 20, math.max(1.2, r * 0.3));
+            end
+        end
+    else
+        imgui.SameLine(0, 0);
+        imgui.SetCursorScreenPos({ x + padX + lw + gap, y });
+        imgui.TextColored(color, value);
+    end
+    -- Close the pill with a real (invisible) item so ImGui's own layout
+    -- knows how wide it is; the next SameLine(0, 0) or help marker lands
+    -- just past the chip instead of on top of it.
+    imgui.SameLine(0, 0);
+    imgui.SetCursorScreenPos({ x + w, y });
+    imgui.Dummy({ 4, h });
+end
+
+-- True if `need` pixels of chips plus the trailing (?) marker fit between
+-- the cursor and the right edge of the content area.
+function ui.theme.chips_fit(need)
+    local avail = imgui.GetContentRegionAvail();
+    local room = type(avail) == 'table' and avail[1] or avail;
+    local help_w = ui.theme.text_w('(?)') + ui.theme.text_w(' ') + 2;
+    return need + help_w <= room;
+end
+
+-- EcoWarrior nation chips. `locked` is the list of nation keys already
+-- done this cycle, `current` the one in progress (or nil). Full names when
+-- they fit, initials otherwise. `done` is accepted for compatibility but
+-- no longer changes the look: open nations stay lit so the row always shows
+-- whose turn is next.
+ui.theme.nations = {
+    { key = 'sandoria', name = "San d'Oria", initial = 'S', color = { 1.00, 0.50, 0.50, 1.0 } },
+    { key = 'bastok',   name = 'Bastok',     initial = 'B', color = { 0.50, 0.72, 1.00, 1.0 } },
+    { key = 'windurst', name = 'Windurst',   initial = 'W', color = { 0.55, 1.00, 0.55, 1.0 } },
+};
+-- Nation flag textures, loaded once from <addon>/images/<key>.png and
+-- <key>_grey.png through Direct3D. Anything missing (files, the d3d8 module,
+-- an old binding) leaves ui.theme.tex empty and the chips are used instead.
+ui.theme.tex = nil;
+function ui.theme.load_textures()
+    if ui.theme.tex ~= nil then return; end
+    ui.theme.tex = {};
+    local ok = pcall(function()
+        local ffi = require('ffi');
+        local d3d = require('d3d8');
+        local C = ffi.C;
+        local dev = d3d.get_device();
+        local base = addon.path;
+        if base:sub(-1) ~= '\\' and base:sub(-1) ~= '/' then base = base .. '\\'; end
+        base = base .. 'images\\';
+        for _, n in ipairs(ui.theme.nations) do
+            local pair = {};
+            for _, variant in ipairs({ 'color', 'grey' }) do
+                local file = base .. n.key .. (variant == 'grey' and '_grey' or '') .. '.png';
+                if ashita.fs.exists(file) then
+                    local ptr = ffi.new('IDirect3DTexture8*[1]');
+                    if C.D3DXCreateTextureFromFileA(dev, file, ptr) == C.S_OK then
+                        local tex = d3d.gc_safe_release(ffi.cast('IDirect3DTexture8*', ptr[0]));
+                        pair[variant] = { obj = tex, id = tonumber(ffi.cast('uint32_t', tex)) };
+                    end
+                end
+            end
+            if pair.color ~= nil then ui.theme.tex[n.key] = pair; end
+        end
+    end);
+    if not ok then ui.theme.tex = {}; end
+end
+
+-- One flag, `size` px square, at the cursor. Falls back to a text chip if
+-- the texture (or imgui.Image itself) is unavailable.
+function ui.theme.flag(n, state, size, use_full)
+    local t = ui.theme.tex and ui.theme.tex[n.key] or nil;
+    local dim  = { 0.42, 0.47, 0.58, 1.0 };
+    local gold = ui.theme.rgba(ui.theme.accents.gold, 1.0);
+    if t == nil or ui.theme.image_ok == false then
+        local col = n.color;
+        if state == 'current' then col = gold;
+        elseif state == 'locked' then col = dim;
+        elseif state == 'muted' then col = ui.theme.rgba(n.color, 0.5); end
+        ui.theme.pill(use_full and n.name or n.initial, col);
+        return;
+    end
+    local x, y = imgui.GetCursorScreenPos();
+    local h = imgui.GetTextLineHeight();
+    -- Centre the square on the text line.
+    local top = y + (h - size) / 2;
+    imgui.SetCursorScreenPos({ x, top });
+    local id, tint;
+    if state == 'locked' and t.grey ~= nil then
+        id = t.grey.id; tint = { 1.0, 1.0, 1.0, 0.85 };
+    elseif state == 'locked' then
+        id = t.color.id; tint = { 0.45, 0.45, 0.45, 0.6 };
+    elseif state == 'muted' then
+        id = t.color.id; tint = { 1.0, 1.0, 1.0, 0.45 };
+    else
+        id = t.color.id; tint = { 1.0, 1.0, 1.0, 1.0 };
+    end
+    local ok = pcall(imgui.Image, id, { size, size }, { 0, 0 }, { 1, 1 }, tint, { 0, 0, 0, 0 });
+    if not ok then
+        ui.theme.image_ok = false;
+        imgui.SetCursorScreenPos({ x, y });
+        ui.theme.pill(use_full and n.name or n.initial, n.color);
+        return;
+    end
+    -- Thin frame around every flag: green when the nation is open, gold for
+    -- the one in progress, grey when locked or when the weekly is done.
+    local frame;
+    if state == 'current' then frame = gold;
+    elseif state == 'open' then frame = { 0.0, 1.0, 0.0, 0.9 };
+    else frame = { 0.45, 0.50, 0.60, 0.7 }; end
+    local drawlist = imgui.GetWindowDrawList();
+    pcall(function()
+        drawlist:AddRect({ x - 1.5, top - 1.5 }, { x + size + 1.5, top + size + 1.5 },
+            imgui.GetColorU32(frame), 5.0, 0, 1.5);
+    end);
+    if imgui.IsItemHovered() then
+        imgui.BeginTooltip();
+        local what = (state == 'current') and 'in progress'
+                  or (state == 'locked') and 'done this cycle'
+                  or 'open';
+        imgui.Text(n.name .. ' - ' .. what);
+        imgui.EndTooltip();
+    end
+    -- Put the cursor back on the text baseline for whatever follows.
+    imgui.SameLine(0, 0);
+    imgui.SetCursorScreenPos({ x + size, y });
+    imgui.Dummy({ 1, h });
+end
+
+function ui.theme.nation_chips(locked, current, done)
+    ui.theme.load_textures();
+    local full_w = 0;
+    for _, n in ipairs(ui.theme.nations) do full_w = full_w + ui.theme.text_w(n.name) + 14; end
+    local use_full = ui.theme.chips_fit(full_w);
+    -- Same height as a status pill (text line + 2px each side) so the flags
+    -- neither touch the rows above and below nor look shorter than the chips.
+    local size = math.floor(imgui.GetTextLineHeight() + 2);
+    for i, n in ipairs(ui.theme.nations) do
+        local is_locked = false;
+        for _, l in ipairs(locked or {}) do if l == n.key then is_locked = true; break; end end
+        -- Open nations stay lit even when the weekly is done: the check on
+        -- the left already says "done", the flags say whose turn is next.
+        local state = 'open';
+        if n.key == current then state = 'current';
+        elseif is_locked then state = 'locked'; end
+        if i > 1 then imgui.SameLine(0, 6); end
+        ui.theme.flag(n, state, size, use_full);
+    end
+end
+
+-- Traffic-light colour for a remaining count.
+function ui.theme.count_color(left, max, known)
+    if not known then return { 1.0, 1.0, 0.0, 1.0 }; end
+    if left <= 0 then return { 1.0, 0.3, 0.3, 1.0 }; end
+    if left < max then return { 1.0, 0.84, 0.36, 1.0 }; end
+    return { 0.0, 1.0, 0.0, 1.0 };
+end
+
+-- Soft card behind a block of widgets. begin_panel() records where it starts
+-- and insets the cursor; end_panel() draws the card under whatever was laid
+-- out in between (the draw order is fixed by deferring the fill, see below).
+-- Returns { x, w } in window coordinates for right-aligning inside the card.
+function ui.theme.begin_panel()
+    local sx, sy = imgui.GetCursorScreenPos();
+    local avail = imgui.GetContentRegionAvail();
+    local w = type(avail) == 'table' and avail[1] or avail;
+    local pad = 8;
+    -- The card's fill must be painted before its contents. Its height is not
+    -- known yet, so paint the bottom edge from last frame's measurement:
+    -- one frame late on first open, exact from then on.
+    local h = ui.theme.panel_h or (imgui.GetTextLineHeight() * 2 + 26);
+    local drawlist = imgui.GetWindowDrawList();
+    ui.theme.rect(drawlist, { sx, sy }, { sx + w, sy + h },
+        imgui.GetColorU32({ 1.0, 1.0, 1.0, 0.045 }), 6.0);
+    ui.theme.rect(drawlist, { sx, sy }, { sx + 3, sy + h },
+        imgui.GetColorU32(ui.theme.rgba(ui.theme.accents.weeklies, 0.85)), 2.0);
+    imgui.SetCursorScreenPos({ sx + pad + 4, sy + pad - 2 });
+    return { sx = sx, sy = sy, x = imgui.GetCursorPosX(), w = w - pad * 2 - 4, pad = pad };
+end
+function ui.theme.end_panel(p)
+    local _, y = imgui.GetCursorScreenPos();
+    ui.theme.panel_h = (y - p.sy) + p.pad - 4;
+    imgui.SetCursorScreenPos({ p.sx, p.sy + ui.theme.panel_h + 8 });
+end
+
+-- Ready/done tallies shown at the right of the section headers.
+ui.theme.tally = {};
+function ui.theme.tally_reset(key, word)
+    local t = ui.theme.tally[key];
+    if t == nil then t = { n = 0, total = 0, shown = '' }; ui.theme.tally[key] = t; end
+    if t.total > 0 then
+        t.shown = string.format('%d / %d %s', t.n, t.total, word);
+    else
+        t.shown = '';
+    end
+    t.last_total = t.total;
+    t.n = 0; t.total = 0;
+end
+-- True if the section had at least one row last frame. A section whose
+-- rows are all unticked in Settings hides its header instead of showing an
+-- empty bar. (Unknown on the very first frame: assume it has rows.)
+function ui.theme.tally_any(key)
+    local t = ui.theme.tally[key];
+    return t == nil or t.last_total == nil or t.last_total > 0;
+end
+function ui.theme.tally_add(key, flag)
+    local t = ui.theme.tally[key];
+    if t == nil then t = { n = 0, total = 0, shown = '' }; ui.theme.tally[key] = t; end
+    t.total = t.total + 1;
+    if flag then t.n = t.n + 1; end
+end
+function ui.theme.tally_text(key)
+    local t = ui.theme.tally[key];
+    return t and t.shown or '';
+end
+
+-- Zebra striping. Call before drawing a row: main rows alternate a faint
+-- band, sub-rows (Cards, Carrying Tag) inherit the band of the row above so
+-- they read as part of it. reset() goes at the top of each section.
+ui.theme.row_n = 0;
+ui.theme.row_bottom = nil;
+-- Row groups (a main row plus its sub-rows) as rectangles, so hovering any
+-- line of a group lights the whole group. A group's full height is only
+-- known after its last sub-row is drawn, so the hover test uses the
+-- rectangles recorded last frame - swapped in frame_begin(), one frame of
+-- lag, invisible at game framerates.
+ui.theme.groups_prev = {};
+ui.theme.groups_cur = {};
+ui.theme.grp_i = 0;
+function ui.theme.frame_begin()
+    ui.theme.groups_prev = ui.theme.groups_cur;
+    ui.theme.groups_cur = {};
+    ui.theme.grp_i = 0;
+end
+function ui.theme.rows_reset(accent_key)
+    ui.theme.row_n = 0; ui.theme.row_bottom = nil;
+    ui.theme.row_accent = ui.theme.accents[accent_key or 'weeklies'] or ui.theme.accents.weeklies;
+end
+function ui.theme.begin_row(is_sub)
+    if not is_sub then ui.theme.row_n = ui.theme.row_n + 1; end
+    local x, y = imgui.GetCursorScreenPos();
+    local h = imgui.GetTextLineHeight();
+    local top = y - 1;
+    -- A sub-row starts its band where the parent's ended, so the two lines
+    -- read as one block with no seam - whatever ItemSpacing happens to be.
+    if is_sub and ui.theme.row_bottom ~= nil and ui.theme.row_bottom < top then
+        top = ui.theme.row_bottom;
+    end
+    ui.theme.row_top = top;
+    ui.theme.row_bottom = y + h + 1;
+    local drawlist = imgui.GetWindowDrawList();
+    local avail = imgui.GetContentRegionAvail();
+    local w = type(avail) == 'table' and avail[1] or avail;
+
+    -- Record this frame's group rectangle.
+    local grp;
+    if is_sub and ui.theme.groups_cur[ui.theme.grp_i] ~= nil then
+        grp = ui.theme.groups_cur[ui.theme.grp_i];
+        grp.bottom = y + h + 1;
+    else
+        ui.theme.grp_i = ui.theme.grp_i + 1;
+        grp = { top = top, bottom = y + h + 1, x1 = x - 4, x2 = x + w };
+        ui.theme.groups_cur[ui.theme.grp_i] = grp;
+    end
+
+    -- Hover glow over the whole group (probed once; not every build binds
+    -- IsMouseHoveringRect). Falls back to this row's own rectangle on the
+    -- very first frame, before any group has been measured.
+    local hovered = false;
+    if ui.theme.hover_ok ~= false and imgui.IsMouseHoveringRect ~= nil then
+        local test = ui.theme.groups_prev[ui.theme.grp_i] or grp;
+        local ok, res = pcall(imgui.IsMouseHoveringRect, { test.x1, test.top }, { test.x2, test.bottom }, false);
+        if ok then hovered = res == true; else ui.theme.hover_ok = false; end
+    end
+    if hovered then
+        ui.theme.rect(drawlist, { x - 4, top }, { x + w, y + h + 1 },
+            imgui.GetColorU32(ui.theme.rgba(ui.theme.accents.weeklies, 0.14)), 3.0);
+    elseif ui.theme.row_n % 2 == 1 then
+        ui.theme.rect(drawlist, { x - 4, top }, { x + w, y + h + 1 },
+            imgui.GetColorU32({ 1.0, 1.0, 1.0, 0.035 }), 3.0);
+    end
+    -- Multi-line rows get a slim accent bar down their left edge spanning
+    -- every line, so the extra line reads as part of the row above it. The
+    -- span comes from last frame's group rectangle (drawn on the main row).
+    if not is_sub then
+        local prev = ui.theme.groups_prev[ui.theme.grp_i];
+        if prev ~= nil and (prev.bottom - prev.top) > (h + 6) then
+            local acc = ui.theme.row_accent or ui.theme.accents.weeklies;
+            ui.theme.rect(drawlist, { x - 4, top }, { x - 1, top + (prev.bottom - prev.top) },
+                imgui.GetColorU32(ui.theme.rgba(acc, 0.85)), 2.0);
+        end
+    end
+end
+
 
 local function render_ui()
     if not ui.is_open[1] then return; end
@@ -3622,39 +4292,32 @@ local function render_ui()
     
     local current_time = os.time();
     
-    -- Window styling - minimal
-    imgui.SetNextWindowSize({ 340, 400 }, ImGuiCond_FirstUseEver);
-    ui.style_colors = 5; ui.style_vars = 2;
-    imgui.PushStyleColor(ImGuiCol_WindowBg, { 0.0, 0.0, 0.0, 0.85 });
-    imgui.PushStyleColor(ImGuiCol_TitleBg, { 0.0, 0.0, 0.0, 0.9 });
-    imgui.PushStyleColor(ImGuiCol_TitleBgActive, { 0.0, 0.0, 0.0, 0.9 });
-    imgui.PushStyleColor(ImGuiCol_FrameBg, { 0.1, 0.1, 0.1, 0.9 });
-    imgui.PushStyleColor(ImGuiCol_Border, { 0.0, 0.0, 0.0, 0.0 });
-    imgui.PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
-    imgui.PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
+    -- Window styling: the whole palette goes on before Begin and comes off
+    -- after End, so both the window chrome and every widget inside see it.
+    -- ui.theme.push() keeps ui.style_colors / ui.style_vars current so the
+    -- d3d_present unwinder can pop exactly what was pushed if this throws.
+    -- Everything inside is laid out in em units, so the window has to grow
+    -- with the font or the right-hand chips just fall off the edge. The
+    -- baseline (500x470) is tuned for the default 1.2 scale. On a scale
+    -- change the size is re-applied once (ImGuiCond_Always); otherwise only
+    -- the very first open is sized here and manual resizes are respected.
+    local scale_w = 500 * (ui.font_scale / 1.2);
+    local scale_h = 470 * (ui.font_scale / 1.2);
+    if ui.resize_to_scale then
+        imgui.SetNextWindowSize({ scale_w, scale_h }, ImGuiCond_Always or 1);
+        ui.resize_to_scale = false;
+    else
+        imgui.SetNextWindowSize({ scale_w, scale_h }, ImGuiCond_FirstUseEver);
+    end
+    ui.style_colors = 0; ui.style_vars = 0;
+    ui.theme.push();
     
     ui.began = true;
     if ui.window_flags == nil then
         ui.window_flags = ImGuiWindowFlags_NoCollapse or 0;
     end
-    -- The resize grip (bottom-right triangle) is near-invisible on the dark
-    -- theme; tint it the header orange so new users can find it. Guarded, in
-    -- case this Ashita build lacks the style constants.
-    local grip_pushed = 0;
-    if imgui.PushStyleColor ~= nil and ImGuiCol_ResizeGrip ~= nil then
-        imgui.PushStyleColor(ImGuiCol_ResizeGrip,        { 0.90, 0.45, 0.20, 0.80 });
-        imgui.PushStyleColor(ImGuiCol_ResizeGripHovered, { 1.00, 0.60, 0.30, 1.00 });
-        imgui.PushStyleColor(ImGuiCol_ResizeGripActive,  { 1.00, 0.72, 0.40, 1.00 });
-        grip_pushed = 3;
-    end
     if imgui.Begin('Homework v' .. addon.version, ui.is_open, ui.window_flags) then
         run_measurements();
-        -- Only WindowBg/TitleBg/TitleBgActive are consumed by Begin itself, so
-        -- FrameBg and Border must stay pushed to reach the combos and checkboxes
-        -- inside. Popping all five here made two of them no-ops.
-        imgui.PopStyleColor(3);
-        imgui.PopStyleVar(2);
-        ui.style_colors = 2; ui.style_vars = 0;
         
         -- Apply font scale (compatible with both old and new Ashita)
         local _useNewFont = (imgui.SetWindowFontScale == nil);
@@ -3667,6 +4330,8 @@ local function render_ui()
             imgui.SetWindowFontScale(ui.font_scale);
         end
 
+        ui.theme.frame_begin();
+
         -- Tab bar
         if imgui.BeginTabBar('##homework_tabs', ImGuiTabBarFlags_None) then
             -- Tasks tab
@@ -3678,22 +4343,44 @@ local function render_ui()
                 ui.char_list_combo = table.concat(ui.char_list, '\0') .. '\0';
             end
             local char_names = ui.char_list_combo;
-            imgui.SetNextItemWidth(100 * ui.font_scale);
+
+            -- Header panel: a soft card holding the character picker, the
+            -- reset countdown (right-aligned) and the week progress bar.
+            local next_reset = calculate_next_reset(current_time);
+            local reset_seconds = next_reset - current_time;
+            local panel = ui.theme.begin_panel();
+
+            imgui.SetNextItemWidth(126 * ui.font_scale);
             if imgui.Combo('##char_select', ui.selected_char, char_names) then
                 char_name = ui.char_list[ui.selected_char[1] + 1];
                 ui.selected_name = char_name;
                 char_data = tracker.settings.characters[char_name];
             end
 
-            local next_reset = calculate_next_reset(current_time);
-            local reset_seconds = next_reset - current_time;
+            -- Countdown on the right: gold inside the last day, blue otherwise.
+            local rc = (reset_seconds < 24 * 3600) and ui.theme.accents.gold or ui.theme.accents.weeklies;
+            local reset_txt = format_time_short(reset_seconds);
+            local lbl = 'Reset in ';
+            local rw = ui.theme.text_w(lbl) + ui.theme.text_w(reset_txt);
             imgui.SameLine();
-            imgui.Text('Reset: ' .. format_time_short(reset_seconds));
+            imgui.SetCursorPosX(panel.x + panel.w - rw);
+            imgui.TextColored(ui.theme.rgba(ui.theme.accents.text_dim, 1.0), lbl);
+            imgui.SameLine(0, 0);
+            imgui.TextColored({ rc[1], rc[2], rc[3], 1.0 }, reset_txt);
+            if imgui.IsItemHovered() then
+                imgui.BeginTooltip();
+                imgui.Text('Weekly reset: ' .. os.date('%a %d %b, %H:%M', next_reset));
+                imgui.EndTooltip();
+            end
 
             imgui.Spacing();
+            ui.theme.draw_week_bar(reset_seconds, panel.w);
+            ui.theme.end_panel(panel);
 
-        -- Weeklies header
-        draw_gradient_header('Weeklies', imgui.GetContentRegionAvail(), '[o] ready / go here    [x] done this week\n[ ] still to do        [?] unknown - /hw scan\nCounts are remaining/max. Status shows a place or what to do next.');
+        -- Weeklies header (hidden when every weekly is unticked in Settings)
+        if ui.theme.tally_any('weeklies') then
+        draw_gradient_header('Weeklies', imgui.GetContentRegionAvail(), 'Filled dot   = ready / go here\nCheck mark   = done this week\nEmpty ring   = still to do\nRing with ?  = unknown - /hw scan\nKI badge     = key item in your bag, fight open\nDots on a chip = uses left. You = this character, Account = everyone on it.', 'weeklies');
+        end
 
         -- Column positions scaled with font
         -- Columns derive from the font's own measurements, so every
@@ -3712,7 +4399,12 @@ local function render_ui()
         -- Get tracking settings for current character
         local tracking = get_char_tracking(char_name);
 
+        ui.theme.rows_reset('weeklies');
+
         -- Dynamis entry counter (displayed above EcoWarrior)
+        -- Icon = what THIS character can still take (n/2). The pill on the
+        -- right = what is left on the whole account (n/3) and what that means
+        -- for this character right now.
         local dyn_store, dyn_shared = get_dynamis_store(char_name);
         if dyn_store and tracking.tasks[DYNAMIS_ROW_LABEL] ~= false then
             local entries, dyn_char_left, dyn_acct_left = dynamis_effective_remaining(char_name);
@@ -3720,49 +4412,65 @@ local function render_ui()
             -- Counts render as n/max WITHOUT brackets. Bracketed digits were
             -- indistinguishable from the [o] used for a ready task in the game's
             -- font, so square brackets now always mean status and a bare
-            -- fraction always means a count. The cap comes along for free.
-            -- Always the character's own cap. `entries` is the LOWER of the
-            -- character and account figures, so pairing it with the account cap
-            -- read as "1/3" for someone who can only ever do 2. The account
-            -- total is already shown in the column beside this.
+            -- fraction always means a count.
+            -- The bracket on the left is pure status ([o] can enter, [x] out,
+            -- [?] unknown); the numbers live in the two chips on the right so
+            -- "this character" and "the account" are never confused.
             local dyn_max = CHARACTER_ENTRY_LIMIT;
+            if entries > dyn_max then dyn_max = entries; end
             local dyn_known = (dyn_store.known ~= false);
             local dyn_icon, dyn_color;
             if not dyn_known then
                 dyn_icon = '[?]'; dyn_color = { 1.0, 1.0, 0.0, 1.0 };
+            elseif entries <= 0 then
+                dyn_icon = '[x]'; dyn_color = { 0.55, 0.55, 0.55, 1.0 };
             else
-                dyn_icon = string.format('%d/%d', entries, dyn_max);
-                if entries == 0 then
-                    dyn_color = { 1.0, 0.3, 0.3, 1.0 };  -- Red
-                elseif entries == 1 then
-                    dyn_color = { 1.0, 1.0, 0.0, 1.0 };  -- Yellow
-                else
-                    dyn_color = { 0.0, 1.0, 0.0, 1.0 };  -- Green
-                end
+                dyn_icon = '[o]'; dyn_color = { 0.0, 1.0, 0.0, 1.0 };
             end
+            ui.theme.begin_row(false);
             draw_row_icon(dyn_icon, dyn_color);
             imgui.SameLine();
             imgui.SetCursorPosX(col_task);
-            imgui.Text('Dynamis');
-            -- Always print the number when grouped. Hiding it whenever the
-            -- personal and account figures happened to match meant it appeared
-            -- on one character and vanished on another for no visible reason,
-            -- which reads as the addon failing to track the account.
-            local dyn_note = '';
+            if dyn_icon == '[x]' then
+                imgui.TextColored(ui.theme.rgba(ui.theme.accents.text_dim, 1.0), 'Dynamis');
+            else
+                imgui.Text('Dynamis');
+            end
+
+            imgui.SameLine();
+            imgui.SetCursorPosX(col_location);
+            local d_char_left = dyn_shared and (dyn_char_left or entries) or entries;
+            local d_you_v = dyn_known and string.format('%d/%d', d_char_left, dyn_max) or ('?/' .. dyn_max);
+            local d_acc_v = dyn_known and string.format('%d/%d', dyn_acct_left or 0, ACCOUNT_ENTRY_LIMIT) or ('?/' .. ACCOUNT_ENTRY_LIMIT);
+            local d_dots = ui.theme.chips_fit(
+                ui.theme.count_pill_w('You', d_you_v, dyn_max, true)
+              + ((dyn_shared and dyn_acct_left ~= nil) and ui.theme.count_pill_w('Account', d_acc_v, ACCOUNT_ENTRY_LIMIT, true) or 0));
+            ui.theme.count_pill('You', d_you_v,
+                ui.theme.count_color(d_char_left, dyn_max, dyn_known),
+                d_char_left, dyn_max, not dyn_known, d_dots);
+            if dyn_shared and dyn_acct_left ~= nil then
+                imgui.SameLine(0, 0);
+                ui.theme.count_pill('Account', d_acc_v,
+                    ui.theme.count_color(dyn_acct_left, ACCOUNT_ENTRY_LIMIT, dyn_known),
+                    dyn_acct_left, ACCOUNT_ENTRY_LIMIT, not dyn_known, d_dots);
+            end
+
+            local d_help = string.format(
+                'Weekly Dynamis entries on Horizon:\n'
+             .. '  %d per character, %d per account.\n\n', CHARACTER_ENTRY_LIMIT, ACCOUNT_ENTRY_LIMIT)
+             .. 'You = entries THIS character can still take.\n'
+             .. 'Account = entries left for everyone on the account.\n'
+             .. 'Each entry spends one from both.';
+            if dyn_shared and dyn_known and dyn_acct_left ~= nil then
+                d_help = d_help .. string.format('\n\nThis character: %d left     Account: %d left',
+                    dyn_char_left or entries, dyn_acct_left);
+            end
             if not dyn_known then
-                dyn_note = '(unknown until reset)';
-            elseif dyn_shared and dyn_acct_left ~= nil then
-                dyn_note = string.format('(account: %d/%d)', dyn_acct_left, ACCOUNT_ENTRY_LIMIT);
+                d_help = d_help .. '\n\n[?] = installed mid-week, so what was already used\n'
+                               .. 'is unknown. Fix it in Settings or wait for the reset.';
             end
-            -- SameLine only when something actually follows. Calling it and then
-            -- printing nothing left the cursor parked mid-row, so the NEXT row
-            -- drew on top of this one - which is why an ungrouped character (no
-            -- account text) saw Dynamis and Limbus overlapping.
-            if dyn_note ~= '' then
-                imgui.SameLine();
-                imgui.SetCursorPosX(col_location);
-                imgui.TextColored({ 0.6, 0.8, 1.0, 1.0 }, dyn_note);
-            end
+            help_marker(d_help);
+            ui.theme.tally_add('weeklies', dyn_known and entries <= 0);
         end
 
         -- Limbus lost its 71h Cosmo-Cleanse cooldown, so it is a weekly now
@@ -3770,131 +4478,135 @@ local function render_ui()
         if tracking.tasks[LIMBUS_ROW_LABEL] ~= false then
             local has_cosmo = ki_held(char_name, LIMBUS_KI_ID);
             local eff, char_left, acct_left, known = limbus_state(char_name);
-            local l_icon, l_color, l_where, l_where_color;
+            local l_icon, l_color;
 
             local l_max = LIMBUS_CHARACTER_LIMIT;
-            if eff == nil then
-                l_icon = '[?]'; l_color = { 1.0, 1.0, 0.0, 1.0 };
-            elseif not known then
-                -- Counting, but the addon never saw the start of this week.
-                l_icon = string.format('?/%d', l_max); l_color = { 1.0, 1.0, 0.0, 1.0 };
-            elseif eff <= 0 then
-                l_icon = string.format('%d/%d', eff, l_max); l_color = { 1.0, 0.3, 0.3, 1.0 };
-            else
-                l_icon = string.format('%d/%d', eff, l_max); l_color = { 0.0, 1.0, 0.0, 1.0 };
-            end
-
-            -- Holding a cleanse means the next step is the zone, not the NPC.
-            -- Zone name abbreviated so the account figure below still fits the
-            -- column at the default window width.
-            local l_dest;
+            -- Same status language as Dynamis: dot = a run is available (either
+            -- still to buy, or a cleanse already in the bag), check = out for
+            -- the week, ? = unknown. What you hold is shown on the Entry
+            -- sub-row underneath.
             if has_cosmo then
-                l_dest = 'Apollyon/Tem';
-                l_where_color = { 0.0, 1.0, 0.0, 1.0 };
-            elseif eff ~= nil and known and eff <= 0 then
-                l_dest = LIMBUS_NPC;
-                l_where_color = { 1.0, 0.3, 0.3, 1.0 };
+                l_icon = '[o]'; l_color = { 0.0, 1.0, 0.0, 1.0 };
+            elseif eff == nil or not known then
+                l_icon = '[?]'; l_color = { 1.0, 1.0, 0.0, 1.0 };
+            elseif eff <= 0 then
+                l_icon = '[x]'; l_color = { 0.55, 0.55, 0.55, 1.0 };
             else
-                l_dest = LIMBUS_NPC;
-                l_where_color = (eff ~= nil and known)
-                    and { 0.0, 1.0, 0.0, 1.0 } or { 1.0, 1.0, 0.0, 1.0 };
+                l_icon = '[o]'; l_color = { 0.0, 1.0, 0.0, 1.0 };
             end
-            -- The account total lived only in the hover tooltip, so there was no
-            -- way to see the 4-per-account cap at a glance the way Dynamis shows
-            -- its 3. When the week is still unknown the account figure is just as
-            -- untrustworthy as the personal one, so it shows ? too.
             local l_shared = select(5, limbus_state(char_name));
-            if l_shared and acct_left ~= nil then
-                l_where = string.format('(%s - %s/%d)', l_dest,
-                    known and tostring(acct_left) or '?', LIMBUS_ACCOUNT_LIMIT);
-            else
-                l_where = '(' .. l_dest .. ')';
-            end
 
+            ui.theme.begin_row(false);
             draw_row_icon(l_icon, l_color);
             imgui.SameLine();
             imgui.SetCursorPosX(col_task);
-            imgui.Text(LIMBUS_ROW_LABEL);
+            if l_icon == '[x]' then
+                imgui.TextColored(ui.theme.rgba(ui.theme.accents.text_dim, 1.0), LIMBUS_ROW_LABEL);
+            else
+                imgui.Text(LIMBUS_ROW_LABEL);
+            end
             imgui.SameLine();
             imgui.SetCursorPosX(col_location);
-            imgui.TextColored(l_where_color, l_where);
+            local l_char = char_left or 0;
+            local l_known = (eff ~= nil and known);
+            local l_you_v = l_known and string.format('%d/%d', l_char, l_max) or ('?/' .. l_max);
+            local l_acc_v = known and string.format('%d/%d', acct_left or 0, LIMBUS_ACCOUNT_LIMIT) or ('?/' .. LIMBUS_ACCOUNT_LIMIT);
+            local l_dots = ui.theme.chips_fit(
+                ui.theme.count_pill_w('You', l_you_v, l_max, true)
+              + ((l_shared and acct_left ~= nil) and ui.theme.count_pill_w('Account', l_acc_v, LIMBUS_ACCOUNT_LIMIT, true) or 0));
+            ui.theme.count_pill('You', l_you_v,
+                ui.theme.count_color(l_char, l_max, l_known),
+                l_char, l_max, not l_known, l_dots);
+            if l_shared and acct_left ~= nil then
+                imgui.SameLine(0, 0);
+                ui.theme.count_pill('Account', l_acc_v,
+                    ui.theme.count_color(acct_left, LIMBUS_ACCOUNT_LIMIT, known),
+                    acct_left, LIMBUS_ACCOUNT_LIMIT, not known, l_dots);
+            end
 
-            local l_help;
-            if eff == nil then
-                l_help = 'No data for this character yet.';
-            else
-                l_help = string.format('%d run%s left for this character (max %d)',
-                    char_left, char_left == 1 and '' or 's', LIMBUS_CHARACTER_LIMIT);
+            local l_help = string.format(
+                'Weekly Limbus runs on Horizon:\n'
+             .. '  %d per character, %d per account.\n\n', LIMBUS_CHARACTER_LIMIT, LIMBUS_ACCOUNT_LIMIT)
+             .. 'You = runs THIS character can still take.\n'
+             .. 'Account = runs left for everyone on the account.\n'
+             .. 'Each Cosmo-Cleanse spends one from both, so two characters\n'
+             .. 'at 2/2 still only get ' .. LIMBUS_ACCOUNT_LIMIT .. ' between them.\n\n'
+             .. 'The Entry row below shows what you are holding: the\n'
+             .. 'Cosmo-Cleanse plus one card gets you in.';
+            if eff ~= nil then
+                l_help = l_help .. string.format('\n\nThis character: %d left', char_left);
                 if acct_left ~= nil then
-                    l_help = l_help .. string.format('\n%d left on the account (max %d)',
-                        acct_left, LIMBUS_ACCOUNT_LIMIT);
+                    l_help = l_help .. string.format('     Account: %d left', acct_left);
                 end
-                if not known then
-                    l_help = l_help .. '\n\n[?] = the addon was installed mid-week and cannot know'
-                          .. '\nwhat you already took. Correct it in Settings, or it will'
-                          .. '\nsort itself out at the next weekly reset.';
-                end
-                l_help = l_help .. (has_cosmo
-                    and '\n\nYou hold a Cosmo-Cleanse - head to Apollyon or Temenos.'
-                    or  ('\n\nTake a Cosmo-Cleanse from ' .. LIMBUS_NPC .. ' in Lower Jeuno.'));
-                l_help = l_help .. '\nA cleanse kept across the reset does not cost a run.';
+            end
+            l_help = l_help .. (has_cosmo
+                and '\n\nYou hold a Cosmo-Cleanse: enter Apollyon or Temenos.'
+                or  ('\n\nNext step: take a Cosmo-Cleanse from ' .. LIMBUS_NPC .. ' in Lower Jeuno.'));
+            l_help = l_help .. '\nA cleanse kept across the reset does not cost a run.';
+            if eff ~= nil and not known then
+                l_help = l_help .. '\n\n[?] = installed mid-week, so what was already used\n'
+                               .. 'is unknown. Fix it in Settings or wait for the reset.';
             end
             help_marker(l_help);
+            ui.theme.tally_add('weeklies', eff ~= nil and known and eff <= 0 and not has_cosmo);
 
-            local card_indent = 20 * ui.font_scale;
-            local card_col_name = col_task + card_indent;
-            local held_short, held_full, missing = {}, {}, {};
+            -- Entry sub-row: everything the zone asks for at the door. The
+            -- Cosmo-Cleanse plus one of three cards, and which card decides
+            -- where you can go. Each is a chip - lit when held, dim when not.
+            local held_n = 0;
+            local held_full, need_full = {}, {};
             for _, card in ipairs(LIMBUS_CARDS) do
                 if ki_held(char_name, card.ki_id) then
-                    -- 'White Card' -> 'White', so all three still fit the column
-                    table.insert(held_short, (card.name:gsub(' Card$', '')));
+                    held_n = held_n + 1;
                     table.insert(held_full, card.name .. ' - ' .. card.location);
                 else
-                    table.insert(missing, card.name);
-                end
-            end
-
-            -- Column system, same as the mains (see the assault sub-row).
-            local card_icon_x = card_indent + icon_text_w(SUB_MARK) + em;
-            imgui.SetCursorPosX(card_icon_x - icon_text_w(SUB_MARK));
-            imgui.TextColored({ 0.55, 0.55, 0.55, 1.0 }, SUB_MARK);
-            imgui.SameLine();
-            imgui.SetCursorPosX(card_icon_x);
-            if #held_short > 0 then
-                draw_icon_box('KI', { 0.0, 1.0, 0.0, 1.0 });
-            else
-                draw_icon_box('', { 0.55, 0.55, 0.55, 1.0 });
-            end
-            imgui.SameLine();
-            local card_text_x = card_icon_x + box_total + em;
-            imgui.SetCursorPosX(card_text_x);
-            local card_count = string.format('Cards %d/%d', #held_short, #LIMBUS_CARDS);
-            imgui.TextColored({ 1.0, 1.0, 1.0, 1.0 }, card_count);
-            if #held_short > 0 then
-                -- The held-card names sit one letter after the measured count,
-                -- never at a fixed column: the sub-row's indent had pushed the
-                -- count past that column and the names printed on top of it.
-                imgui.SameLine(0, 0);
-                imgui.SetCursorPosX(card_text_x + icon_text_w(card_count) + em);
-                imgui.TextColored({ 0.0, 1.0, 0.0, 1.0 }, table.concat(held_short, ', '));
-            end
-
-            -- Held cards with where they came from, then the ones still to find
-            -- with where to look. Listing a missing card twice, once by name and
-            -- again with its location, just made the tooltip longer.
-            local need_full = {};
-            for _, card in ipairs(LIMBUS_CARDS) do
-                if not ki_held(char_name, card.ki_id) then
                     table.insert(need_full, card.name .. ' - ' .. card.location);
                 end
             end
-            local card_help = '';
+
+            -- Second line of the Limbus row: what you are holding, as chips
+            -- in the status column directly under You/Account. No label, no
+            -- connector - the shared band and the accent bar on the left
+            -- (drawn by begin_row for multi-line rows) tie it to Limbus.
+            -- Drops to single letters if the full names would not fit.
+            ui.theme.begin_row(true);
+            imgui.SetCursorPosX(col_location);
+            local card_cols = {
+                { 0.92, 0.92, 0.97, 1.0 },   -- White
+                { 0.72, 0.62, 1.00, 1.0 },   -- Black (violet so it reads on navy)
+                { 1.00, 0.45, 0.45, 1.0 },   -- Red
+            };
+            local dim_col = { 0.42, 0.47, 0.58, 1.0 };
+            local cleanse_col = { 0.0, 1.0, 0.0, 1.0 };
+            local full_w = ui.theme.text_w('Cleanse') + 14;
+            for _, card in ipairs(LIMBUS_CARDS) do
+                full_w = full_w + ui.theme.text_w((card.name:gsub(' Card$', ''))) + 14;
+            end
+            local use_full = ui.theme.chips_fit(full_w);
+            ui.theme.pill(use_full and 'Cleanse' or 'KI', has_cosmo and cleanse_col or dim_col);
+            for ci, card in ipairs(LIMBUS_CARDS) do
+                local short = (card.name:gsub(' Card$', ''));
+                local label = use_full and short or short:sub(1, 1);
+                local held = ki_held(char_name, card.ki_id);
+                imgui.SameLine(0, 4);
+                ui.theme.pill(label, held and card_cols[ci] or dim_col);
+            end
+
+            local card_help = 'To enter Limbus you need the Cosmo-Cleanse (from\n'
+                           .. LIMBUS_NPC .. ', Lower Jeuno) AND one card. The card picks the area:\n'
+                           .. '  White = Temenos\n'
+                           .. '  Black = Apollyon Central / NE / SE / CS\n'
+                           .. '  Red   = Apollyon NW / SW';
             if #held_full > 0 then
-                card_help = 'Holding:\n  ' .. table.concat(held_full, '\n  ');
+                card_help = card_help .. '\n\nHolding:\n  ' .. table.concat(held_full, '\n  ');
             end
             if #need_full > 0 then
-                if card_help ~= '' then card_help = card_help .. '\n\n'; end
-                card_help = card_help .. 'Still needed:\n  ' .. table.concat(need_full, '\n  ');
+                card_help = card_help .. '\n\nStill needed:\n  ' .. table.concat(need_full, '\n  ');
+            end
+            if has_cosmo and held_n == 0 then
+                card_help = card_help .. '\n\nYou have the cleanse but no card - get one first.';
+            elseif (not has_cosmo) and held_n > 0 then
+                card_help = card_help .. '\n\nCard in hand - a Cosmo-Cleanse from ' .. LIMBUS_NPC .. ' is all that is left.';
             end
             help_marker(card_help);
         end
@@ -3926,18 +4638,24 @@ local function render_ui()
                 else
                     help_text = "Use /hw scan or talk to Despachiaire.\n/hw knife to toggle.";
                 end
+                ui.theme.begin_row(false);
                 imgui.BeginGroup();
                 draw_row_icon(icon, color);
                 imgui.SameLine();
                 imgui.SetCursorPosX(col_task);
-                imgui.Text("X'sKnife");
+                if step == 'done' then
+                    imgui.TextColored(ui.theme.rgba(ui.theme.accents.text_dim, 1.0), "X'sKnife");
+                else
+                    imgui.Text("X'sKnife");
+                end
                 if location ~= '' then
                     imgui.SameLine();
                     imgui.SetCursorPosX(col_location);
-                    imgui.TextColored({ 0.0, 1.0, 0.0, 1.0 }, '(' .. location .. ')');
+                    ui.theme.pill(location, { 0.0, 1.0, 0.0, 1.0 });
                 end
                 imgui.EndGroup();
                 if help_text then help_marker(help_text); end
+                ui.theme.tally_add('weeklies', step == 'done');
             end
         end
 
@@ -3949,20 +4667,34 @@ local function render_ui()
             local aa_color = (aa_key == 'green') and { 0.0, 1.0, 0.0, 1.0 }
                           or (aa_key == 'grey') and { 0.55, 0.55, 0.55, 1.0 }
                           or { 1.0, 1.0, 0.0, 1.0 };
+            ui.theme.begin_row(false);
             imgui.BeginGroup();
             draw_row_icon(aa_icon, aa_color);
             imgui.SameLine();
             imgui.SetCursorPosX(col_task);
-            imgui.Text('Ashu Talif');
-            imgui.SameLine();
-            imgui.SetCursorPosX(col_location);
-            imgui.TextColored({ 0.0, 1.0, 0.0, 1.0 }, '(' .. aa_status .. ')');
+            if aa_key == 'grey' then
+                imgui.TextColored(ui.theme.rgba(ui.theme.accents.text_dim, 1.0), 'Ashu Talif');
+            else
+                imgui.Text('Ashu Talif');
+            end
+            -- A finished row shows nothing on the right, like every other
+            -- [x] task. "failed - wait for reset" is still worth a grey pill.
+            if aa_status ~= 'done!' then
+                imgui.SameLine();
+                imgui.SetCursorPosX(col_location);
+                ui.theme.pill(aa_status, (aa_key == 'grey') and { 0.55, 0.55, 0.55, 1.0 } or { 0.0, 1.0, 0.0, 1.0 });
+            end
             imgui.EndGroup();
-            help_marker('Three weekly fights from Halshaob in Nashmau, in order:\n'
-                .. 'Scouting (3 bronze) > Painter (1 silver) > Captain (1 mythril).\n'
-                .. 'Win to unlock the next. Losing or crashing burns the chain\n'
-                .. 'until the weekly reset. A stage paid before the reset is not\n'
-                .. 'lost - it can be fought after.\n\n'
+            ui.theme.tally_add('weeklies', aa_key == 'grey');
+            help_marker('Three weekly fights from Halshaob in Nashmau, in order.\n'
+                .. 'The number in the ring is the fight you are on:\n'
+                .. '  1. Scouting Mission        - 3 bronze\n'
+                .. '  2. Royal Painter Escort    - 1 silver\n'
+                .. '  3. Targeting the Captain   - 1 mythril\n'
+                .. 'Pay Halshaob, board the ship, win to unlock the next.\n'
+                .. 'Losing or crashing burns the chain until the weekly\n'
+                .. 'reset. A fight paid before the reset is not lost - it\n'
+                .. 'can still be fought after.\n\n'
                 .. 'Fresh install shows [?] until the addon sees a real event:\n'
                 .. 'paying Halshaob syncs it instantly, and after one weekly\n'
                 .. 'reset it is always known.');
@@ -3979,6 +4711,7 @@ local function render_ui()
             if normalized == 'xsknife' then goto continue_task; end
             local icon, color, location = '[?]', { 1.0, 1.0, 0.0, 1.0 }, '';
             local help_text = nil;  -- Help marker text for this specific task
+            local eco_chips = nil;  -- EcoWarrior only: { locked = {...}, current = nation }
 
             if false then -- (X'sKnife moved to its own block under Limbus)
             elseif normalized == 'highwind' then
@@ -4033,6 +4766,13 @@ local function render_ui()
                 local step = eco_data.step or 'unknown';
                 local knows = eco_data.knows_status;
                 local available_text = eco_available_text(eco_data.locked_nations);
+                -- The three nations render as chips in the status column: lit
+                -- when that nation can still be taken this cycle, dim once it
+                -- is locked, gold for the one you are on. Any place-to-go text
+                -- goes on a second line under them.
+                if step ~= 'unknown' then
+                    eco_chips = { locked = eco_data.locked_nations or {}, current = eco_data.current_nation };
+                end
 
                 if step == 'done' then
                     icon = '[x]'; color = { 0.55, 0.55, 0.55, 1.0 };
@@ -4081,30 +4821,54 @@ local function render_ui()
             end
             
             -- Render with column alignment (grouped for hover detection)
+            ui.theme.begin_row(false);
             imgui.BeginGroup();
             draw_row_icon(icon, color);
             imgui.SameLine();
             imgui.SetCursorPosX(col_task);
-            imgui.Text(task);
-            if location ~= '' then
+            if icon == '[x]' then
+                imgui.TextColored(ui.theme.rgba(ui.theme.accents.text_dim, 1.0), task);
+            else
+                imgui.Text(task);
+            end
+            if eco_chips ~= nil then
                 imgui.SameLine();
                 imgui.SetCursorPosX(col_location);
-                imgui.TextColored({ 0.0, 1.0, 0.0, 1.0 }, '(' .. location .. ')');
+                ui.theme.nation_chips(eco_chips.locked, eco_chips.current, icon == '[x]');
+                imgui.EndGroup();
+                if help_text then help_marker(help_text); end
+                -- Where to go, when a run is in progress, as a second line.
+                if location ~= '' and eco_chips.current ~= nil then
+                    ui.theme.begin_row(true);
+                    imgui.SetCursorPosX(col_location);
+                    ui.theme.pill(location, { 0.0, 1.0, 0.0, 1.0 });
+                end
+            else
+                if location ~= '' then
+                    imgui.SameLine();
+                    imgui.SetCursorPosX(col_location);
+                    ui.theme.pill(location, (icon == '[x]') and { 0.55, 0.55, 0.55, 1.0 } or { 0.0, 1.0, 0.0, 1.0 });
+                end
+                imgui.EndGroup();
+                -- Add help marker if this task has help text
+                if help_text then
+                    help_marker(help_text);
+                end
             end
-            imgui.EndGroup();
-            
-            -- Add help marker if this task has help text
-            if help_text then
-                help_marker(help_text);
-            end
+            ui.theme.tally_add('weeklies', icon == '[x]');
 
             ::continue_task::
         end
 
+        ui.theme.tally_reset('weeklies', 'done');
         imgui.Spacing();
 
-        -- Timers header
-        draw_gradient_header('Timers', imgui.GetContentRegionAvail(), '[KI] in your bag - fight open    [    ] ready, KI not taken\n[ x ] on cooldown    [ ? ] unknown - /hw scan\nCounts are remaining/max. Status shows a time or what to do next.');
+        -- Timers header (hidden when every timer is unticked in Settings)
+        ui.theme.rows_reset('weeklies');
+        ui.theme.tally_reset('timers', 'ready');
+        if ui.theme.tally_any('timers') then
+        draw_gradient_header('Timers', imgui.GetContentRegionAvail(), 'KI badge     = key item in your bag, fight open\nEmpty ring   = ready, key item not taken yet\nCheck mark   = on cooldown\nRing with ?  = unknown - /hw scan\nDots = tags in stock. Status shows a time or what to do next.', 'weeklies');
+        end
 
         -- Timer column positions scaled with font
         local em = icon_text_w('M');
@@ -4168,6 +4932,7 @@ local function render_ui()
                 if #plist > 0 then a_help = a_help .. '\nPoints: ' .. table.concat(plist, ', '); end
             end
 
+            ui.theme.begin_row(false);
             draw_row_icon(a_icon, a_color);
             imgui.SameLine();
             imgui.SetCursorPosX(timer_col_name);
@@ -4175,44 +4940,29 @@ local function render_ui()
             if a_status ~= nil then
                 imgui.SameLine();
                 imgui.SetCursorPosX(timer_col_status);
-                imgui.TextColored({ 0.4, 0.7, 0.9, 1.0 }, '(' .. a_status .. ')');
+                ui.theme.pill(a_status, { 0.4, 0.7, 0.9, 1.0 });
             end
             if a_help then help_marker(a_help); end
+            ui.theme.tally_add('timers', carried or (stored ~= nil and stored > 0));
 
             -- One sub-row, not two. A tag becomes orders the moment you pick a
             -- mission, so you can never hold both - two lines meant one was
             -- always empty.
             local area = assault_active_area(char_name);
-            local sub_indent = 20 * ui.font_scale;
-            local sub_col_name = timer_col_name + sub_indent;
             local rank_name = ad_r.rank and MERCENARY_RANKS[ad_r.rank] or nil;
 
-            -- Sub-rows flow inline: plain [KI] and one normal space, no fixed
-            -- columns - they are annotations, not table rows.
-            -- Column system, same as the mains: the icon sits at a fixed
-            -- position, the name sits at a fixed position one letter-width
-            -- after the icon box. Scales with the font like everything else.
-            -- The corner glyph hugs the bracket: drawn so its right edge
-            -- lands exactly where the '[' begins. The bracket itself stays put.
-            local sub_icon_x = sub_indent + icon_text_w(SUB_MARK) + em;
-            imgui.SetCursorPosX(sub_icon_x - icon_text_w(SUB_MARK));
-            imgui.TextColored({ 0.55, 0.55, 0.55, 1.0 }, SUB_MARK);
-            imgui.SameLine();
-            imgui.SetCursorPosX(sub_icon_x);
-            if area ~= nil or carried then
-                draw_icon_box('KI', { 0.0, 1.0, 0.0, 1.0 });
+            -- Second line of the Assault row, in the status column under the
+            -- countdown: the tag / current orders as a chip, plus the rank.
+            ui.theme.begin_row(true);
+            imgui.SetCursorPosX(timer_col_status);
+            if area ~= nil then
+                ui.theme.pill(area, { 0.0, 1.0, 0.0, 1.0 },
+                    rank_name and (MERCENARY_RANKS_SHORT[ad_r.rank] or '?') or nil,
+                    { 0.4, 0.7, 0.9 });
+            elseif carried then
+                ui.theme.pill('Carrying a tag', { 0.0, 1.0, 0.0, 1.0 });
             else
-                draw_icon_box('', { 0.55, 0.55, 0.55, 1.0 });
-            end
-            imgui.SameLine();
-            imgui.SetCursorPosX(sub_icon_x + box_total + em);
-            imgui.TextColored({ 1.0, 1.0, 1.0, 1.0 },
-                area or (carried and 'Carrying Tag' or 'No Tag'));
-            if area ~= nil and rank_name ~= nil then
-                imgui.SameLine();
-                imgui.SetCursorPosX(timer_col_status);
-                imgui.TextColored({ 0.4, 0.7, 0.9, 1.0 },
-                    '(' .. (MERCENARY_RANKS_SHORT[ad_r.rank] or '?') .. ')');
+                ui.theme.pill('Not carrying a tag', { 0.55, 0.55, 0.55, 1.0 });
             end
             local pts = (area and type(ad_r.points) == 'table') and ad_r.points[area] or nil;
             help_marker((area
@@ -4256,13 +5006,15 @@ local function render_ui()
                     icon, icolor = '[x]', { 0.55, 0.55, 0.55, 1.0 };
                 end
             end
+            ui.theme.begin_row(false);
             draw_row_icon(icon, icolor);
             imgui.SameLine();
             imgui.SetCursorPosX(timer_col_name);
             imgui.Text(name);
             imgui.SameLine();
             imgui.SetCursorPosX(timer_col_status);
-            imgui.TextColored({ 0.4, 0.7, 0.9, 1.0 }, '(' .. status .. ')');
+            ui.theme.pill(status, (status == 'Ready') and { 0.0, 1.0, 0.0, 1.0 } or { 0.4, 0.7, 0.9, 1.0 });
+            ui.theme.tally_add('timers', status == 'Ready' or icon == '[KI]');
             help_marker('Imperial Standing NM. Buy an order from Shajaf in Whitegate:'
                 .. '\nConfidential (2000) for the level 60 fights, Secret (3000)'
                 .. '\nfor the uncapped ones. One purchase per day, resetting at'
@@ -4337,13 +5089,15 @@ local function render_ui()
             end
             
             -- Render with column alignment
+            ui.theme.begin_row(false);
             draw_row_icon(icon, icon_color);
             imgui.SameLine();
             imgui.SetCursorPosX(timer_col_name);
             imgui.Text(enm.name);
             imgui.SameLine();
             imgui.SetCursorPosX(timer_col_status);
-            imgui.TextColored({ 0.4, 0.7, 0.9, 1.0 }, '(' .. status_text .. ')');
+            ui.theme.pill(status_text, (status_text == 'Ready') and { 0.0, 1.0, 0.0, 1.0 } or { 0.4, 0.7, 0.9, 1.0 });
+            ui.theme.tally_add('timers', timer_data.has_ki or status_text == 'Ready');
             -- Add help marker if this timer has help text
             if timer_help_text then
                 help_marker(timer_help_text);
@@ -4357,19 +5111,22 @@ local function render_ui()
 
             -- Settings tab
             if imgui.BeginTabItem('Settings') then
-                draw_gradient_header('Display Settings', imgui.GetContentRegionAvail());
+                draw_gradient_header('Display Settings', imgui.GetContentRegionAvail(), nil, 'settings');
 
                 imgui.Text('Font Scale:');
                 imgui.SameLine();
                 if imgui.SmallButton('-##font') and ui.font_scale > 0.8 then
                     ui.font_scale = math.floor((ui.font_scale - 0.1) * 10 + 0.5) / 10;
+                    ui.resize_to_scale = true;
                     save_display_settings();
                 end
                 imgui.SameLine();
-                imgui.Text(string.format('%.1f', ui.font_scale));
+                imgui.TextColored({ ui.theme.accents.weeklies[1], ui.theme.accents.weeklies[2], ui.theme.accents.weeklies[3], 1.0 },
+                    string.format('%.1f', ui.font_scale));
                 imgui.SameLine();
                 if imgui.SmallButton('+##font') and ui.font_scale < 2.0 then
                     ui.font_scale = math.floor((ui.font_scale + 0.1) * 10 + 0.5) / 10;
+                    ui.resize_to_scale = true;
                     save_display_settings();
                 end
 
@@ -4377,10 +5134,10 @@ local function render_ui()
                 imgui.Spacing();
 
                 draw_gradient_header('Account Sharing', imgui.GetContentRegionAvail(),
-                    'Horizon counts some things per account, not per character:\nDynamis entries, Limbus runs, and Rytaal\'s assault tag stock.\nGroup the characters that share one account. Characters left\nout of every account just keep their own private counts.');
+                    'Horizon counts some things per account, not per character:\nDynamis entries, Limbus runs, and Rytaal\'s assault tag stock.\nGroup the characters that share one account. Characters left\nout of every account just keep their own private counts.', 'settings');
 
                 local aw = { tracker.settings.dynamis_account_wide == true };
-                if imgui.Checkbox('Horizon: account-wide counters (Dynamis / Limbus / Assault)', aw) then
+                if imgui.Checkbox('Horizon: account-wide counters', aw) then
                     tracker.settings.dynamis_account_wide = aw[1];
                     ui.pending_account_add = nil;
                     -- Turning sharing off is an exit path too.
@@ -4400,6 +5157,9 @@ local function render_ui()
                     end
                     save_settings();
                 end
+                help_marker('Dynamis, Limbus and Assault share their weekly counts\n'
+                         .. 'across every character on the same account. Tick the\n'
+                         .. 'characters that live together below.');
 
                 if tracker.settings.dynamis_account_wide then
                     local accts = dynamis_accounts();
@@ -4478,7 +5238,7 @@ local function render_ui()
                 imgui.Spacing();
                 imgui.Spacing();
 
-                draw_gradient_header('Display Task', imgui.GetContentRegionAvail(), 'Check to affect which tasks are displayed. All are actively tracked.');
+                draw_gradient_header('Display Task', imgui.GetContentRegionAvail(), 'Check to affect which tasks are displayed. All are actively tracked.', 'settings');
 
                 -- Character selector for tracking settings (synchronized with Tasks tab)
                 if ui.char_list_combo == nil then
@@ -4660,17 +5420,12 @@ local function render_ui()
             imgui.PopFont();
             ui.fonts_pushed = 0;
         end
-        imgui.PopStyleColor(2);   -- FrameBg, Border - held through the widgets
-        ui.style_colors = 0;
-
-    else
-        imgui.PopStyleColor(5);
-        imgui.PopStyleVar(2);
-        ui.style_colors = 0; ui.style_vars = 0;
     end
     imgui.End();
-    if grip_pushed > 0 then imgui.PopStyleColor(grip_pushed); end
     ui.began = false;
+    -- The palette outlives End so the title bar, border and resize grip are
+    -- all drawn with it; pop everything only now.
+    ui.theme.pop();
 end
 
 local function show_all_chars()
