@@ -5,7 +5,7 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-addon.version   = '3.10';
+addon.version   = '3.10.1';
 addon.desc      = 'Weekly homework tracker for FFXI';
 addon.link      = '';
 
@@ -5733,7 +5733,7 @@ local function render_ui()
             imgui.SameLine();
             imgui.SetCursorPosX(timer_col_status);
             ui.theme.pill(status_text, (status_text == 'Ready') and { 0.0, 1.0, 0.0, 1.0 } or { 0.4, 0.7, 0.9, 1.0 });
-            ui.theme.tally_add('timers', timer_data.has_ki or status_text == 'Ready');
+            ui.theme.tally_add('timers', (timer_data ~= nil and timer_data.has_ki) or status_text == 'Ready');
             -- Add help marker if this timer has help text
             if timer_help_text then
                 help_marker(timer_help_text);
