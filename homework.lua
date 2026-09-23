@@ -5,7 +5,7 @@
 
 addon.author   = 'Riquelme';
 addon.name     = 'Homework';
-addon.version   = '3.9';
+addon.version   = '3.10';
 addon.desc      = 'Weekly homework tracker for FFXI';
 addon.link      = '';
 
@@ -814,6 +814,257 @@ local MISSION_GIVER_MENUS = {
 local MENU_PARAM_RANK   = 0x08;   -- u32, 1..11
 local MENU_PARAM_POINTS = 0x10;   -- u32, assault points for that area
 
+-- ---------------------------------------------------------------------------
+-- Assault points
+-- One table (main chunk is near the 200-local limit): the five point shops
+-- and everything that keeps the per-character totals current.
+--
+-- Shops verified against LandSandBoat scripts/globals/assault/data.lua and
+-- the five mission-giver scripts in scripts/zones/Aht_Urhgan_Whitegate/npcs.
+-- Trust ciphers are left out (not on a 75-era server). Item ids are the
+-- game's, so the item card can read the real stats out of the DATs.
+--
+-- Where the totals come from, all passive (nothing is ever sent):
+--   * mission giver menu (0x034, event 273-277) - that area's points, exact
+--   * Currencies menu (0x113)                   - all five, exact
+--   * assault win message (0x02A)               - reward added on top of the
+--     last exact value; flagged as estimated until the next exact read
+-- ---------------------------------------------------------------------------
+local ASSAULT_PTS = {
+    MAX_PRICE = 20000,
+    shops = {
+        { area = 'Leujaoam Sanctum', npc = 'Yahsra', zone = 69, items = {
+            { id = 15970, price =  3000 }, { id = 15775, price =  5000 }, { id = 15521, price =  8000 },
+            { id = 15884, price = 10000 }, { id = 15490, price = 10000 }, { id = 18408, price = 10000 },
+            { id = 18485, price = 15000 }, { id = 18365, price = 15000 }, { id = 14933, price = 15000 },
+            { id = 16069, price = 20000 }, { id = 15606, price = 20000 } } },
+        { area = 'Mamool Ja T.G.', npc = 'Isdebaaq', zone = 66, items = {
+            { id = 15971, price =  3000 }, { id = 15776, price =  5000 }, { id = 15522, price =  8000 },
+            { id = 15885, price = 10000 }, { id = 15491, price = 10000 }, { id = 17715, price = 15000 },
+            { id = 18113, price = 15000 }, { id = 17951, price = 15000 }, { id = 14935, price = 20000 },
+            { id = 15688, price = 20000 }, { id = 15609, price = 20000 } } },
+        { area = 'Lebros Cavern', npc = 'Famad', zone = 63, items = {
+            { id = 15972, price =  3000 }, { id = 15777, price =  5000 }, { id = 15523, price =  8000 },
+            { id = 15886, price = 10000 }, { id = 15492, price = 10000 }, { id = 18583, price = 15000 },
+            { id = 18388, price = 15000 }, { id = 18417, price = 15000 }, { id = 14940, price = 20000 },
+            { id = 15690, price = 20000 }, { id = 14525, price = 20000 } } },
+        { area = 'Periqia', npc = 'Lageegee', zone = 56, items = {
+            { id = 15973, price =  3000 }, { id = 15778, price =  5000 }, { id = 15524, price =  8000 },
+            { id = 15887, price = 10000 }, { id = 15493, price = 10000 }, { id = 18025, price = 15000 },
+            { id = 18435, price = 15000 }, { id = 18686, price = 15000 }, { id = 16062, price = 20000 },
+            { id = 15695, price = 20000 }, { id = 14527, price = 20000 } } },
+        { area = 'Ilrusi Atoll', npc = 'Bhoy Yhupplo', zone = 55, items = {
+            { id = 15974, price =  3000 }, { id = 15779, price =  5000 }, { id = 15525, price =  8000 },
+            { id = 15888, price = 10000 }, { id = 15494, price = 10000 }, { id = 18685, price = 15000 },
+            { id = 18065, price = 15000 }, { id = 17851, price = 15000 }, { id = 16064, price = 20000 },
+            { id = 15604, price = 20000 }, { id = 14530, price = 20000 } } },
+    },
+    -- Fallback names for when the resource manager is unavailable.
+    names = {
+        [15970]='Stoic Earring',[15775]='Unfettered Ring',[15521]='Tempered Chain',[15884]='Potent Belt',
+        [15490]='Miraculous Cape',[18408]='Yigit Bulawa',[18485]='Imperial Bhuj',[18365]='Pahluwan Patas',
+        [14933]='Amir Kolluks',[16069]='Pahluwan Qalansuwa',[15606]='Yigit Seraweels',
+        [15971]='Antivenom Earring',[15776]='Ebullient Ring',[15522]='Enlightened Chain',[15885]='Spectral Belt',
+        [15491]='Bullseye Cape',[17715]='Storm Tulwar',[18113]='Imperial Neza',[17951]='Storm Tabar',
+        [14935]='Yigit Gages',[15688]='Amir Boots',[15609]='Pahluwan Seraweels',
+        [15972]='Insomnia Earring',[15777]='Hale Ring',[15523]='Chivalrous Chain',[15886]='Precise Belt',
+        [15492]='Intensifying Cape',[18583]='Imperial Pole',[18388]='Doombringer',[18417]='Sayosamonji',
+        [14940]='Pahluwan Dastanas',[15690]='Yigit Crackows',[14525]='Amir Korazin',
+        [15973]='Vision Earring',[15778]='Unyielding Ring',[15524]='Fortified Chain',[15887]='Resolute Belt',
+        [15493]='Bushido Cape',[18025]='Khanjar',[18435]='Hotarumaru',[18686]='Imperial Gun',
+        [16062]='Amir Puggaree',[15695]='Pahluwan Crackows',[14527]='Yigit Gomlek',
+        [15974]='Velocity Earring',[15779]='Garrulous Ring',[15525]='Grandiose Chain',[15888]='Hurling Belt',
+        [15494]='Invigorating Cape',[18685]='Imperial Kaman',[18065]='Storm Zaghnal',[17851]='Storm Fife',
+        [16064]='Yigit Turban',[15604]='Amir Dirs',[14530]='Pahluwan Khazagand',
+    },
+    -- "You gain <n> Assault points!" zone text ids (LSB IDs.lua): 7532 in
+    -- four of the five instances, 7431 in Lebros Cavern.
+    WIN_MSG = { [7532] = true, [7431] = true },
+    JOBS = { 'WAR','MNK','WHM','BLM','RDM','THF','PLD','DRK','BST','BRD','RNG','SAM','NIN','DRG','SMN','BLU','COR','PUP','DNC','SCH' },
+    -- Equipment slot bits (bit 0 = Main) and weapon skill ids, as the client
+    -- uses them to build the "[Neck] All Races" / "(Sword) All Races" line.
+    SLOTS = { [0]='Main','Sub','Range','Ammo','Head','Body','Hands','Legs','Feet','Neck','Waist','Ear','Ear','Ring','Ring','Back' },
+    SKILLS = { [1]='Hand-to-Hand',[2]='Dagger',[3]='Sword',[4]='Great Sword',[5]='Axe',[6]='Great Axe',[7]='Scythe',
+               [8]='Polearm',[9]='Katana',[10]='Great Katana',[11]='Club',[12]='Staff',
+               [25]='Archery',[26]='Marksmanship',[27]='Throwing',[41]='Wind Instrument',[42]='String Instrument' },
+    item_cache = {},
+    icon_cache = {},   -- id -> texture object (kept alive) or false when unavailable
+    -- Wildcat Badge key items, rank 1..11 (LSB xi.besieged.badges). The rank
+    -- is the highest one held, and reward n of every shop needs rank n.
+    BADGES = { 780, 783, 784, 794, 795, 825, 826, 827, 894, 900, 909 },
+};
+ASSAULT_PTS.by_zone = {};
+
+-- Item icon straight out of the game's item resource: Ashita exposes the
+-- DAT's icon bytes as item.Bitmap / item.ImageSize, and D3DX can build a
+-- texture from that memory directly (black is the DAT's transparent key).
+-- Same route luashitaview uses. Returns the ImGui texture id, or nil.
+function ASSAULT_PTS.icon(id)
+    local c = ASSAULT_PTS.icon_cache[id];
+    if c == false then return nil; end
+    if c ~= nil then return c.id; end
+    local ok, tex = pcall(function()
+        local it = AshitaCore:GetResourceManager():GetItemById(id);
+        if it == nil or it.Bitmap == nil or it.ImageSize == nil or it.ImageSize == 0 then return nil; end
+        local ffi = require('ffi');
+        local d3d = require('d3d8');
+        local C = ffi.C;
+        local dev = d3d.get_device();
+        if dev == nil then return nil; end
+        local ptr = ffi.new('IDirect3DTexture8*[1]');
+        local res = C.D3DXCreateTextureFromFileInMemoryEx(
+            dev, it.Bitmap, it.ImageSize,
+            0xFFFFFFFF, 0xFFFFFFFF, 1, 0,
+            C.D3DFMT_A8R8G8B8, C.D3DPOOL_MANAGED,
+            C.D3DX_DEFAULT, C.D3DX_DEFAULT,
+            0xFF000000, nil, nil, ptr);
+        if res ~= C.S_OK then return nil; end
+        local obj = d3d.gc_safe_release(ffi.cast('IDirect3DTexture8*', ptr[0]));
+        return { obj = obj, id = tonumber(ffi.cast('uint32_t', obj)) };
+    end);
+    if ok and tex ~= nil then
+        ASSAULT_PTS.icon_cache[id] = tex;
+        return tex.id;
+    end
+    ASSAULT_PTS.icon_cache[id] = false;
+    return nil;
+end
+
+-- Draws the icon at the cursor if there is one, and leaves the cursor on
+-- the same line just past it. Returns true when an icon was drawn.
+function ASSAULT_PTS.draw_icon(id, size)
+    local tid = ASSAULT_PTS.icon(id);
+    if tid == nil then return false; end
+    local x, y = imgui.GetCursorScreenPos();
+    local h = imgui.GetTextLineHeight();
+    imgui.SetCursorScreenPos({ x, y + (h - size) / 2 });
+    local ok = pcall(imgui.Image, tid, { size, size });
+    if not ok then ASSAULT_PTS.icon_cache[id] = false; imgui.SetCursorScreenPos({ x, y }); return false; end
+    imgui.SameLine(0, 0);
+    imgui.SetCursorScreenPos({ x + size + 6, y });
+    return true;
+end
+for _, sh in ipairs(ASSAULT_PTS.shops) do ASSAULT_PTS.by_zone[sh.zone] = sh; end
+
+-- Make sure the bookkeeping tables exist on a character's assault_data.
+function ASSAULT_PTS.ensure(a)
+    if type(a.points) ~= 'table' then a.points = {}; end
+    if type(a.points_seen) ~= 'table' then a.points_seen = {}; end
+    if type(a.points_est) ~= 'table' then a.points_est = {}; end
+end
+
+-- Exact value for one area (mission giver or Currencies menu).
+function ASSAULT_PTS.set(a, area, value)
+    if value == nil or value < 0 or value >= 1000000 then return false; end
+    ASSAULT_PTS.ensure(a);
+    local changed = (a.points[area] ~= value) or a.points_est[area] ~= nil;
+    a.points[area] = value;
+    a.points_seen[area] = os.time();
+    a.points_est[area] = nil;
+    return changed;
+end
+
+-- A win: the message shows the full reward, and the server ends up with
+-- exactly that much more than before the assault (100 of it was credited
+-- silently on entry). Add it to the last exact value and flag the area.
+function ASSAULT_PTS.add(a, area, reward)
+    if reward == nil or reward <= 0 or reward > 10000 then return false; end
+    ASSAULT_PTS.ensure(a);
+    if a.points[area] == nil then return false; end   -- nothing to add to yet
+    a.points[area] = a.points[area] + reward;
+    a.points_est[area] = true;
+    return true;
+end
+
+-- value (or nil), estimated flag, seconds since the last exact read (or nil)
+function ASSAULT_PTS.get(a, area)
+    if a == nil or type(a.points) ~= 'table' then return nil, false, nil; end
+    local v = a.points[area];
+    if v == nil then return nil, false, nil; end
+    local est = type(a.points_est) == 'table' and a.points_est[area] == true;
+    local seen = type(a.points_seen) == 'table' and a.points_seen[area] or nil;
+    return v, est, (seen and (os.time() - seen) or nil);
+end
+
+function ASSAULT_PTS.fmt(n)
+    local str = tostring(math.floor(n));
+    local out = str:reverse():gsub('(%d%d%d)', '%1,'):reverse();
+    return (out:gsub('^,', ''));
+end
+
+-- Item card data straight from the game's DATs, cached per id. Anything the
+-- resource manager cannot provide falls back to the name table above.
+function ASSAULT_PTS.item(id)
+    local c = ASSAULT_PTS.item_cache[id];
+    if c ~= nil then return c; end
+    c = { name = ASSAULT_PTS.names[id] or ('Item #' .. id), desc = nil, level = nil, jobs = nil };
+    -- Ashita returns Name / Description as a language-indexed object, not a
+    -- Lua table, so index it directly: [1] is English, [0] Japanese.
+    local function lang(field)
+        if type(field) == 'string' then return (#field > 0) and field or nil; end
+        for _, idx in ipairs({ 1, 0, 2 }) do
+            local ok, v = pcall(function() return field[idx]; end);
+            if ok and type(v) == 'string' and #v > 0 then return v; end
+        end
+        return nil;
+    end
+    pcall(function()
+        local it = AshitaCore:GetResourceManager():GetItemById(id);
+        if it == nil then return; end
+        local nm = lang(it.Name);
+        if nm ~= nil then c.name = nm; end
+        local ds = lang(it.Description);
+        if ds ~= nil then
+            -- The DAT text carries inline icon bytes (0xEF pairs for element
+            -- icons, auto-translate marks) that ImGui reads as broken UTF-8
+            -- and swallows the character after them. Swap the element ones
+            -- for words and drop the rest, as luashitaview does.
+            local words = { ['\239\31'] = 'Fire', ['\239\32'] = 'Ice', ['\239\33'] = 'Wind', ['\239\34'] = 'Earth',
+                            ['\239\35'] = 'Lightning', ['\239\36'] = 'Water', ['\239\37'] = 'Light', ['\239\38'] = 'Darkness' };
+            ds = ds:gsub('\239[\31-\40]', function(pair) return words[pair] or ''; end);
+            ds = ds:gsub('[\128-\255]', ''):gsub('%z', '');
+            c.desc = ds;
+        end
+        if type(it.Level) == 'number' and it.Level > 0 then c.level = it.Level; end
+        -- "[Neck]" or "(Sword)" - the client shows the weapon type for weapons.
+        if type(it.Slots) == 'number' and it.Slots > 0 then
+            local names, seen = {}, {};
+            for b = 0, 15 do
+                if bit.band(it.Slots, bit.lshift(1, b)) ~= 0 then
+                    local n = ASSAULT_PTS.SLOTS[b];
+                    if n and not seen[n] then seen[n] = true; table.insert(names, n); end
+                end
+            end
+            local weapon = bit.band(it.Slots, 0x000F) ~= 0 and type(it.Skill) == 'number' and ASSAULT_PTS.SKILLS[it.Skill];
+            if weapon then c.slot = '(' .. weapon .. ')';
+            elseif #names > 0 then c.slot = '[' .. table.concat(names, '/') .. ']'; end
+        end
+        -- Races: bits 1-8 = Hume M/F, Elvaan M/F, Tarutaru M/F, Mithra, Galka.
+        if type(it.Races) == 'number' then
+            if bit.band(it.Races, 0x1FE) == 0x1FE then c.races = 'All Races';
+            else
+                local r = {};
+                if bit.band(it.Races, 0x006) ~= 0 then table.insert(r, 'Hume'); end
+                if bit.band(it.Races, 0x018) ~= 0 then table.insert(r, 'Elvaan'); end
+                if bit.band(it.Races, 0x060) ~= 0 then table.insert(r, 'Tarutaru'); end
+                if bit.band(it.Races, 0x080) ~= 0 then table.insert(r, 'Mithra'); end
+                if bit.band(it.Races, 0x100) ~= 0 then table.insert(r, 'Galka'); end
+                if #r > 0 then c.races = table.concat(r, '/'); end
+            end
+        end
+        if type(it.Jobs) == 'number' and it.Jobs > 0 then
+            local list, all = {}, true;
+            for j = 1, #ASSAULT_PTS.JOBS do
+                if bit.band(it.Jobs, bit.lshift(1, j)) ~= 0 then table.insert(list, ASSAULT_PTS.JOBS[j]);
+                elseif j <= 18 then all = false; end
+            end
+            c.jobs = all and 'All Jobs' or table.concat(list, '/');
+        end
+    end);
+    ASSAULT_PTS.item_cache[id] = c;
+    return c;
+end
+
 -- Mercenary ranks, from LandSandBoat's xi.assault.mercenaryRank.
 local MERCENARY_RANKS = {
     [1]  = 'Private Second Class',
@@ -1317,6 +1568,20 @@ function sanitize_loaded_settings(st)
                 if type(k) ~= 'string' then cd.assault_data.points[k] = nil;
                 else cd.assault_data.points[k] = num(v, 0, 0); end
             end
+            cd.assault_data.points_seen = tbl(cd.assault_data.points_seen);
+            for k, v in pairs(cd.assault_data.points_seen) do
+                if type(k) ~= 'string' then cd.assault_data.points_seen[k] = nil;
+                else cd.assault_data.points_seen[k] = num(v, 0, 0); end
+            end
+            cd.assault_data.points_est = tbl(cd.assault_data.points_est);
+            for k, v in pairs(cd.assault_data.points_est) do
+                if type(k) ~= 'string' or v ~= true then cd.assault_data.points_est[k] = nil; end
+            end
+            -- A total without a read timestamp predates the zone check above
+            -- and cannot be trusted: forget it and show ? until a real read.
+            for k in pairs(cd.assault_data.points) do
+                if cd.assault_data.points_seen[k] == nil then cd.assault_data.points[k] = nil; end
+            end
 
             -- enm_timers entries must be tables with sane fields
             for tname, td in pairs(cd.enm_timers) do
@@ -1740,6 +2005,17 @@ local function ki_held(char_name, ki_id)
     end
     return false;
 end
+
+-- Mercenary rank: highest Wildcat Badge in the key item list (instant, no
+-- NPC visit), else the value the mission-giver menu last reported, else 0.
+function ASSAULT_PTS.rank(char_name, a)
+    for r = #ASSAULT_PTS.BADGES, 1, -1 do
+        if ki_held(char_name, ASSAULT_PTS.BADGES[r]) then return r, 'badge'; end
+    end
+    if a ~= nil and type(a.rank) == 'number' and a.rank > 0 then return a.rank, 'menu'; end
+    return 0, nil;
+end
+
 
 local function assault_holding_tag(char_name)
     return ki_held(char_name, IMPERIAL_ARMY_ID_TAG);
@@ -3486,11 +3762,12 @@ local function help_marker(text)
     imgui.SameLine();
     imgui.TextDisabled('(?)');
     if imgui.IsItemHovered() then
-        imgui.BeginTooltip();
+        ui.theme.help_hovered = true;   -- so row tooltips do not stack on this one
+        ui.theme.tip_begin();
         imgui.PushTextWrapPos(imgui.GetFontSize() * 35.0);
         imgui.TextUnformatted(text);
         imgui.PopTextWrapPos();
-        imgui.EndTooltip();
+        ui.theme.tip_end();
     end
 end
 
@@ -4093,12 +4370,12 @@ function ui.theme.flag(n, state, size, use_full)
             imgui.GetColorU32(frame), 5.0, 0, 1.5);
     end);
     if imgui.IsItemHovered() then
-        imgui.BeginTooltip();
+        ui.theme.tip_begin();
         local what = (state == 'current') and 'in progress'
                   or (state == 'locked') and 'done this cycle'
                   or 'open';
         imgui.Text(n.name .. ' - ' .. what);
-        imgui.EndTooltip();
+        ui.theme.tip_end();
     end
     -- Put the cursor back on the text baseline for whatever follows.
     imgui.SameLine(0, 0);
@@ -4125,6 +4402,25 @@ function ui.theme.nation_chips(locked, current, done)
         if i > 1 then imgui.SameLine(0, 6); end
         ui.theme.flag(n, state, size, use_full);
     end
+end
+
+-- Framed tooltip: a clear accent border and a solid background so a popup
+-- never blends into the rows underneath it. Use in place of BeginTooltip /
+-- EndTooltip. Constants missing from an older binding are skipped.
+function ui.theme.tip_begin()
+    local nc, nv = 0, 0;
+    if ImGuiCol_Border ~= nil then imgui.PushStyleColor(ImGuiCol_Border, ui.theme.rgba(ui.theme.accents.weeklies, 0.9)); nc = nc + 1; end
+    if ImGuiCol_PopupBg ~= nil then imgui.PushStyleColor(ImGuiCol_PopupBg, { 0.055, 0.065, 0.105, 0.985 }); nc = nc + 1; end
+    if ImGuiStyleVar_PopupBorderSize ~= nil then imgui.PushStyleVar(ImGuiStyleVar_PopupBorderSize, 1.5); nv = nv + 1; end
+    if ImGuiStyleVar_WindowPadding ~= nil then imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, { 10.0, 8.0 }); nv = nv + 1; end
+    ui.theme.tip_nc, ui.theme.tip_nv = nc, nv;
+    imgui.BeginTooltip();
+end
+function ui.theme.tip_end()
+    imgui.EndTooltip();
+    if (ui.theme.tip_nv or 0) > 0 then imgui.PopStyleVar(ui.theme.tip_nv); end
+    if (ui.theme.tip_nc or 0) > 0 then imgui.PopStyleColor(ui.theme.tip_nc); end
+    ui.theme.tip_nc, ui.theme.tip_nv = 0, 0;
 end
 
 -- Traffic-light colour for a remaining count.
@@ -4210,6 +4506,7 @@ function ui.theme.frame_begin()
     ui.theme.groups_prev = ui.theme.groups_cur;
     ui.theme.groups_cur = {};
     ui.theme.grp_i = 0;
+    ui.theme.help_hovered = false;
 end
 function ui.theme.rows_reset(accent_key)
     ui.theme.row_n = 0; ui.theme.row_bottom = nil;
@@ -4251,6 +4548,7 @@ function ui.theme.begin_row(is_sub)
         local ok, res = pcall(imgui.IsMouseHoveringRect, { test.x1, test.top }, { test.x2, test.bottom }, false);
         if ok then hovered = res == true; else ui.theme.hover_ok = false; end
     end
+    ui.theme.row_hovered = hovered;
     if hovered then
         ui.theme.rect(drawlist, { x - 4, top }, { x + w, y + h + 1 },
             imgui.GetColorU32(ui.theme.rgba(ui.theme.accents.weeklies, 0.14)), 3.0);
@@ -4271,6 +4569,314 @@ function ui.theme.begin_row(is_sub)
     end
 end
 
+
+-- ---------------------------------------------------------------------------
+-- Assault tab: the five point totals with a bar each, and the point shop of
+-- the selected area with an item card on hover. Defined here, after the
+-- drawing helpers it uses.
+-- ---------------------------------------------------------------------------
+-- Laid out like the game's own item window:
+--   Tempered chain
+--   [Neck] All Races
+--   DEF:8 HP+20
+--   Lv.60 All Jobs
+function ASSAULT_PTS.item_card(id)
+    local it = ASSAULT_PTS.item(id);
+    ui.theme.tip_begin();
+    -- Bigger icon on the card, top-aligned so it never pokes above the
+    -- tooltip; the name sits centred beside it.
+    local lh = imgui.GetTextLineHeight();
+    local isz = math.floor(lh * 1.7);
+    local tid = ASSAULT_PTS.icon(id);
+    local x, y = imgui.GetCursorScreenPos();
+    if tid ~= nil and pcall(imgui.Image, tid, { isz, isz }) then
+        imgui.SameLine(0, 0);
+        imgui.SetCursorScreenPos({ x + isz + 8, y + (isz - lh) / 2 });
+        imgui.TextColored({ 1.0, 0.92, 0.6, 1.0 }, it.name);
+        imgui.SetCursorScreenPos({ x, y + isz + 4 });
+    else
+        imgui.TextColored({ 1.0, 0.92, 0.6, 1.0 }, it.name);
+    end
+    local line2 = {};
+    if it.slot then table.insert(line2, it.slot); end
+    if it.races then table.insert(line2, it.races); end
+    if #line2 > 0 then
+        imgui.TextColored({ 0.55, 0.80, 1.0, 1.0 }, line2[1]);
+        if line2[2] then imgui.SameLine(); imgui.Text(line2[2]); end
+    end
+    if it.desc then
+        imgui.PushTextWrapPos(imgui.GetFontSize() * 28.0);
+        imgui.TextUnformatted(it.desc);
+        imgui.PopTextWrapPos();
+    else
+        imgui.TextColored(ui.theme.rgba(ui.theme.accents.text_dim, 1.0), 'No description available.');
+    end
+    local line4 = {};
+    if it.level then table.insert(line4, 'Lv.' .. it.level); end
+    if it.jobs then table.insert(line4, it.jobs); end
+    if #line4 > 0 then imgui.Text(table.concat(line4, ' ')); end
+    ui.theme.tip_end();
+end
+
+function ASSAULT_PTS.draw_tab(char_name, char_data, current_time)
+    local em = icon_text_w('M');
+    local base = imgui.GetCursorPosX();
+    local a = char_data and char_data.assault_data or nil;
+
+    -- Header card: which character, and how fresh the numbers are.
+    local panel = ui.theme.begin_panel();
+    imgui.TextColored({ 1.0, 1.0, 1.0, 1.0 }, char_name or '?');
+
+    -- Rank, right-aligned: name plus an 11-step ladder. Blue steps are
+    -- earned, the gold one is the current rank, dim ones are still ahead.
+    local rank = ASSAULT_PTS.rank(char_name, a);
+    local rank_txt = (rank > 0) and (MERCENARY_RANKS[rank] or ('Rank ' .. rank)) or 'Rank unknown';
+    local lh0 = imgui.GetTextLineHeight();
+    local r0, step0 = math.max(2.5, lh0 * 0.16), 0;
+    step0 = r0 * 2 + 3;
+    local ladder_w = 11 * step0 - 3;
+    local rw = ui.theme.text_w(rank_txt) + em + ladder_w;
+    imgui.SameLine();
+    imgui.SetCursorPosX(panel.x + panel.w - rw);
+    imgui.TextColored((rank > 0) and ui.theme.rgba(ui.theme.accents.gold, 1.0) or { 1.0, 1.0, 0.0, 1.0 }, rank_txt);
+    imgui.SameLine(0, em);
+    do
+        local lx, ly = imgui.GetCursorScreenPos();
+        local dl = imgui.GetWindowDrawList();
+        local cy = ly + lh0 / 2;
+        pcall(function()
+            for i = 1, 11 do
+                local cx = lx + r0 + (i - 1) * step0;
+                if i < rank then
+                    dl:AddCircleFilled({ cx, cy }, r0, imgui.GetColorU32(ui.theme.rgba(ui.theme.accents.weeklies, 0.95)), 12);
+                elseif i == rank then
+                    dl:AddCircleFilled({ cx, cy }, r0 + 1.0, imgui.GetColorU32(ui.theme.rgba(ui.theme.accents.gold, 1.0)), 12);
+                else
+                    dl:AddCircle({ cx, cy }, r0, imgui.GetColorU32({ 0.50, 0.56, 0.68, 0.55 }), 12, 1.2);
+                end
+            end
+        end);
+        imgui.Dummy({ ladder_w, lh0 });
+        if imgui.IsItemHovered() then
+            ui.theme.tip_begin();
+            imgui.TextColored({ 1.0, 0.92, 0.6, 1.0 }, 'Mercenary rank');
+            for i = 1, 11 do
+                local c = (i <= rank) and { 1.0, 1.0, 1.0, 1.0 } or ui.theme.rgba(ui.theme.accents.text_dim, 1.0);
+                imgui.TextColored(c, string.format('%2d  %s', i, MERCENARY_RANKS[i]));
+            end
+            imgui.TextColored(ui.theme.rgba(ui.theme.accents.text_dim, 1.0), 'Reward n of every shop needs rank n.');
+            ui.theme.tip_end();
+        end
+    end
+    imgui.Spacing();
+    -- Wrapped to the card's width, so a narrow window folds it onto two
+    -- lines instead of clipping it. While any area is still unread the
+    -- prompt pulses slowly in gold; once everything is known it settles
+    -- into a quiet grey note.
+    local unknown = false;
+    for _, sh in ipairs(ASSAULT_PTS.shops) do
+        if ASSAULT_PTS.get(a, sh.area) == nil then unknown = true; break; end
+    end
+    -- Every new line inside the card must start at the card's inset, or
+    -- it lands on the accent bar at the left edge.
+    imgui.SetCursorPosX(panel.x);
+    imgui.PushTextWrapPos(panel.x + panel.w);
+    if unknown then
+        local pulse = 0.55 + 0.45 * math.sin(os.clock() * 2.0);
+        imgui.TextColored(ui.theme.rgba(ui.theme.accents.gold, pulse),
+            'Open Menu > Status > Currencies once to sync your assault points.');
+    else
+        imgui.TextColored(ui.theme.rgba(ui.theme.accents.text_dim, 1.0),
+            'Updates from Menu > Status > Currencies and the mission givers.');
+    end
+    imgui.PopTextWrapPos();
+    ui.theme.end_panel(panel);
+
+    -- Five areas
+    draw_gradient_header('Assault Points', imgui.GetContentRegionAvail(),
+        'One total per area, spent at that area\'s mission giver in Whitegate.\n'
+     .. 'The bar fills toward 20,000 - the price of the most expensive reward.\n'
+     .. '~ marks a total that had a win added to it since the last exact read.\n\n'
+     .. 'Click an area to browse its rewards below.', 'weeklies');
+    ui.theme.rows_reset('weeklies');
+    local avail = imgui.GetContentRegionAvail();
+    local width = type(avail) == 'table' and avail[1] or avail;
+    local col_pts = base + width - em * 8;      -- right-aligned number column (room for "~99,999")
+    -- The bar starts after the widest "area  npc" label, so it never runs
+    -- over a name at any font scale; if that leaves under 4em it is skipped.
+    local label_w = 0;
+    for _, sh in ipairs(ASSAULT_PTS.shops) do
+        local w = ui.theme.text_w(sh.area) + ui.theme.text_w('  ' .. sh.npc);
+        if w > label_w then label_w = w; end
+    end
+    local col_bar = base + label_w + em * 1.5;
+    local show_bar = (col_pts - em) - col_bar >= em * 4;
+    local lh = imgui.GetTextLineHeight();
+    ui.assault_sel = ui.assault_sel or 1;
+    for i, sh in ipairs(ASSAULT_PTS.shops) do
+        local v, est, _ = ASSAULT_PTS.get(a, sh.area);
+        ui.theme.begin_row(false);
+        local sx, sy = imgui.GetCursorScreenPos();
+        local wx = imgui.GetCursorPosX();
+        local drawlist = imgui.GetWindowDrawList();
+        if i == ui.assault_sel then
+            ui.theme.rect(drawlist, { sx - 4, sy - 1 }, { sx + width, sy + lh + 1 },
+                imgui.GetColorU32(ui.theme.rgba(ui.theme.accents.weeklies, 0.22)), 3.0);
+            ui.theme.rect(drawlist, { sx - 4, sy - 1 }, { sx - 1, sy + lh + 1 },
+                imgui.GetColorU32(ui.theme.rgba(ui.theme.accents.weeklies, 0.95)), 2.0);
+        end
+        imgui.TextColored({ 1.0, 1.0, 1.0, 1.0 }, sh.area);
+        imgui.SameLine(0, 0);
+        imgui.TextColored(ui.theme.rgba(ui.theme.accents.text_dim, 1.0), '  ' .. sh.npc);
+        -- Bar toward the top price, then the number.
+        if show_bar then
+            local bx1 = sx + (col_bar - wx);
+            local bx2 = sx + (col_pts - wx) - em;
+            local by = sy + lh / 2;
+            local bh = math.max(4, lh * 0.28);
+            ui.theme.rect(drawlist, { bx1, by - bh / 2 }, { bx2, by + bh / 2 },
+                imgui.GetColorU32({ 1.0, 1.0, 1.0, 0.07 }), 2.0);
+            if v ~= nil and v > 0 then
+                local frac = v / ASSAULT_PTS.MAX_PRICE;
+                if frac > 1 then frac = 1; end
+                local acc = (frac >= 1) and { 0.0, 1.0, 0.0 } or ui.theme.accents.weeklies;
+                ui.theme.rect(drawlist, { bx1, by - bh / 2 }, { bx1 + (bx2 - bx1) * frac, by + bh / 2 },
+                    imgui.GetColorU32(ui.theme.rgba(acc, 0.9)), 2.0);
+            end
+        end
+        imgui.SameLine();
+        local txt = v and ((est and '~' or '') .. ASSAULT_PTS.fmt(v)) or '?';
+        local tw = ui.theme.text_w(txt);
+        imgui.SetCursorPosX(base + width - tw - em * 0.5);
+        local tc = v and (est and ui.theme.rgba(ui.theme.accents.gold, 1.0) or { 1.0, 1.0, 1.0, 1.0 })
+                     or { 1.0, 1.0, 0.0, 1.0 };
+        imgui.TextColored(tc, txt);
+        if ui.theme.row_hovered and imgui.IsMouseClicked(0) then ui.assault_sel = i; end
+        if ui.theme.row_hovered and not ui.theme.help_hovered then
+            ui.theme.tip_begin();
+            imgui.TextColored({ 1.0, 0.92, 0.6, 1.0 }, ASSAULT_AREA_FULL[sh.area] or sh.area);
+            if v == nil then
+                imgui.Text('Not read yet - open Menu > Status > Currencies.');
+            else
+                imgui.Text(string.format('%s points%s', ASSAULT_PTS.fmt(v), est and ' (estimated)' or ''));
+            end
+            ui.theme.tip_end();
+        end
+    end
+
+    -- Shop of the selected area
+    local sel = ASSAULT_PTS.shops[ui.assault_sel] or ASSAULT_PTS.shops[1];
+    local have = ASSAULT_PTS.get(a, sel.area);
+    imgui.Spacing();
+    draw_gradient_header(sel.npc .. ' - ' .. (ASSAULT_AREA_FULL[sel.area] or sel.area) .. ' rewards',
+        imgui.GetContentRegionAvail(),
+        'The list is the promotion ladder: reward n needs rank n.\n'
+     .. 'Green stripe = buy it now. Blue fill = how close your points are.\n'
+     .. 'Greyed with a rank chip = not unlocked yet.\n'
+     .. 'Hover an item for its stats. Bought from ' .. sel.npc .. ' in Whitegate.', 'weeklies');
+    ui.theme.rows_reset('weeklies');
+    -- The list is the promotion ladder: reward n needs rank n. Each row is
+    -- one of three things, and the row itself shows which:
+    --   buy now    - green stripe on the left, full-colour icon, green price
+    --   saving up  - the row's background fills from the left as your points
+    --                approach the price; grey price says how far to go
+    --   locked     - greyed icon and name, a small rank chip, no fill
+    local lh = imgui.GetTextLineHeight();
+    local icon_size = math.floor(lh + 2);
+    local divider_drawn = false;
+    for idx, item in ipairs(sel.items) do
+        local it = ASSAULT_PTS.item(item.id);
+        local need_rank = idx;
+        local locked = (rank < need_rank);
+        local can = (not locked) and have ~= nil and have >= item.price;
+        -- One hairline between the last unlocked reward and the first
+        -- locked one, so the ladder's edge is visible at a glance.
+        if locked and not divider_drawn and idx > 1 then
+            divider_drawn = true;
+            local dx, dy = imgui.GetCursorScreenPos();
+            local dl = imgui.GetWindowDrawList();
+            pcall(function()
+                dl:AddLine({ dx - 4, dy + 1 }, { dx + width, dy + 1 },
+                    imgui.GetColorU32(ui.theme.rgba(ui.theme.accents.gold, 0.45)), 1.0);
+            end);
+            imgui.Dummy({ 1, 3 });
+        end
+        ui.theme.begin_row(false);
+        local rx, ry = imgui.GetCursorScreenPos();
+        local dl = imgui.GetWindowDrawList();
+        if can then
+            ui.theme.rect(dl, { rx - 4, ry - 1 }, { rx + width, ry + lh + 1 },
+                imgui.GetColorU32({ 0.0, 1.0, 0.0, 0.07 }), 3.0);
+            ui.theme.rect(dl, { rx - 4, ry - 1 }, { rx - 1, ry + lh + 1 },
+                imgui.GetColorU32({ 0.0, 1.0, 0.0, 0.9 }), 2.0);
+        elseif not locked and have ~= nil and have > 0 then
+            local frac = have / item.price;
+            if frac > 1 then frac = 1; end
+            ui.theme.rect(dl, { rx - 4, ry - 1 }, { rx - 4 + (width + 4) * frac, ry + lh + 1 },
+                imgui.GetColorU32(ui.theme.rgba(ui.theme.accents.weeklies, 0.10)), 3.0);
+        end
+
+        imgui.SetCursorPosX(base + em * 0.5);
+        if locked then
+            -- Greyed icon: draw it tinted rather than in full colour.
+            local tid = ASSAULT_PTS.icon(item.id);
+            if tid ~= nil then
+                local ix, iy = imgui.GetCursorScreenPos();
+                imgui.SetCursorScreenPos({ ix, iy + (lh - icon_size) / 2 });
+                if pcall(imgui.Image, tid, { icon_size, icon_size }, { 0, 0 }, { 1, 1 }, { 0.5, 0.5, 0.55, 0.45 }) then
+                    imgui.SameLine(0, 0);
+                    imgui.SetCursorScreenPos({ ix + icon_size + 6, iy });
+                else
+                    imgui.SetCursorScreenPos({ ix, iy });
+                end
+            end
+        else
+            ASSAULT_PTS.draw_icon(item.id, icon_size);
+        end
+
+        -- "[60] Tempered chain", the way luashitaview labels a piece.
+        local dimc = ui.theme.rgba(ui.theme.accents.text_dim, 1.0);
+        local name_col = locked and { 0.42, 0.47, 0.58, 1.0 } or (can and { 1.0, 1.0, 1.0, 1.0 } or dimc);
+        if it.level then
+            imgui.TextColored(locked and { 0.38, 0.42, 0.52, 1.0 } or dimc, '[' .. it.level .. ']');
+            if imgui.IsItemHovered() then ASSAULT_PTS.item_card(item.id); end
+            imgui.SameLine(0, ui.theme.text_w(' '));
+        end
+        imgui.TextColored(name_col, it.name);
+        if imgui.IsItemHovered() then ASSAULT_PTS.item_card(item.id); end
+        if locked then
+            imgui.SameLine(0, em * 0.6);
+            ui.theme.pill(MERCENARY_RANKS_SHORT[need_rank] or tostring(need_rank), ui.theme.rgba(ui.theme.accents.gold, 0.85));
+            if imgui.IsItemHovered() then
+                ui.theme.tip_begin();
+                imgui.Text('Needs rank ' .. need_rank .. ': ' .. (MERCENARY_RANKS[need_rank] or '?'));
+                ui.theme.tip_end();
+            end
+        end
+
+        imgui.SameLine();
+        local ptxt = ASSAULT_PTS.fmt(item.price);
+        imgui.SetCursorPosX(base + width - ui.theme.text_w(ptxt) - em * 0.5 - 10);
+        local pcol = can and { 0.0, 1.0, 0.0, 1.0 } or (locked and { 0.42, 0.47, 0.58, 1.0 } or { 0.55, 0.55, 0.55, 1.0 });
+        ui.theme.pill(ptxt, pcol);
+        if imgui.IsItemHovered() then
+            ui.theme.tip_begin();
+            if locked then
+                imgui.Text('Needs rank ' .. need_rank .. ': ' .. (MERCENARY_RANKS[need_rank] or '?'));
+                if have ~= nil and have < item.price then
+                    imgui.Text(string.format('and %s more points', ASSAULT_PTS.fmt(item.price - have)));
+                end
+            elseif can then
+                imgui.Text('You can buy this now.');
+            elseif have ~= nil then
+                imgui.Text(string.format('Need %s more points', ASSAULT_PTS.fmt(item.price - have)));
+            else
+                imgui.Text('Points not read yet.');
+            end
+            ui.theme.tip_end();
+        end
+    end
+end
 
 local function render_ui()
     if not ui.is_open[1] then return; end
@@ -4335,7 +4941,15 @@ local function render_ui()
         -- Tab bar
         if imgui.BeginTabBar('##homework_tabs', ImGuiTabBarFlags_None) then
             -- Tasks tab
-            if imgui.BeginTabItem('Tasks') then
+            local t_open;
+            if ui.goto_tab == 'Tasks' then
+                ui.goto_tab = nil;
+                local ok_sel, res_sel = pcall(imgui.BeginTabItem, 'Tasks', nil, ImGuiTabItemFlags_SetSelected or 2);
+                if ok_sel then t_open = res_sel; else t_open = imgui.BeginTabItem('Tasks'); end
+            else
+                t_open = imgui.BeginTabItem('Tasks');
+            end
+            if t_open then
             -- Character dropdown + Reset timer on same line
             -- Cached: this ran twice a frame, once per tab, allocating a new
             -- string each time for a list that changes only on character switch.
@@ -4368,12 +4982,13 @@ local function render_ui()
             imgui.SameLine(0, 0);
             imgui.TextColored({ rc[1], rc[2], rc[3], 1.0 }, reset_txt);
             if imgui.IsItemHovered() then
-                imgui.BeginTooltip();
+                ui.theme.tip_begin();
                 imgui.Text('Weekly reset: ' .. os.date('%a %d %b, %H:%M', next_reset));
-                imgui.EndTooltip();
+                ui.theme.tip_end();
             end
 
             imgui.Spacing();
+            imgui.SetCursorPosX(panel.x);
             ui.theme.draw_week_bar(reset_seconds, panel.w);
             ui.theme.end_panel(panel);
 
@@ -4944,6 +5559,27 @@ local function render_ui()
             end
             if a_help then help_marker(a_help); end
             ui.theme.tally_add('timers', carried or (stored ~= nil and stored > 0));
+            -- Hover the row: the five point totals. Click: open the Assault tab.
+            if ui.theme.row_hovered and not ui.theme.help_hovered then
+                local cd_pts = tracker.settings.characters[char_name];
+                local ap = cd_pts and cd_pts.assault_data or nil;
+                ui.theme.tip_begin();
+                imgui.TextColored({ 1.0, 0.92, 0.6, 1.0 }, 'Assault points');
+                local t_rank = ASSAULT_PTS.rank(char_name, ap);
+                imgui.TextColored(ui.theme.rgba(ui.theme.accents.text_dim, 1.0),
+                    'Rank: ' .. ((t_rank > 0) and MERCENARY_RANKS[t_rank] or 'unknown'));
+                local col2 = imgui.GetFontSize() * 15.0;
+                for _, sh in ipairs(ASSAULT_PTS.shops) do
+                    local v, est = ASSAULT_PTS.get(ap, sh.area);
+                    imgui.Text(ASSAULT_AREA_FULL[sh.area] or sh.area);
+                    imgui.SameLine(col2);
+                    imgui.TextColored(v and { 1.0, 1.0, 1.0, 1.0 } or { 1.0, 1.0, 0.0, 1.0 },
+                        v and ((est and '~' or '') .. ASSAULT_PTS.fmt(v)) or '?');
+                end
+                imgui.TextColored(ui.theme.rgba(ui.theme.accents.text_dim, 1.0), 'Click to open the Assault tab');
+                ui.theme.tip_end();
+                if imgui.IsMouseClicked(0) then ui.goto_tab = 'Assault'; end
+            end
 
             -- One sub-row, not two. A tag becomes orders the moment you pick a
             -- mission, so you can never hold both - two lines meant one was
@@ -5106,6 +5742,34 @@ local function render_ui()
             ::continue_timer::
         end
 
+                imgui.EndTabItem();
+            end
+
+            -- Assault tab. ui.goto_tab = 'Assault' (set by clicking the Assault
+            -- row on Tasks) selects it for one frame.
+            local a_flags = 0;
+            if ui.goto_tab == 'Assault' then
+                a_flags = ImGuiTabItemFlags_SetSelected or 2;
+                ui.goto_tab = nil;
+            end
+            local a_open;
+            if a_flags ~= 0 then
+                -- Not every binding accepts nil for p_open; fall back to a plain open.
+                local ok_sel, res_sel = pcall(imgui.BeginTabItem, 'Assault', nil, a_flags);
+                if ok_sel then a_open = res_sel; else a_open = imgui.BeginTabItem('Assault'); end
+            else
+                a_open = imgui.BeginTabItem('Assault');
+            end
+            if a_open then
+                if ui.char_list_combo == nil then
+                    ui.char_list_combo = table.concat(ui.char_list, '\0') .. '\0';
+                end
+                local a_name = ui.selected_name or tracker.current_char;
+                local a_data = tracker.settings.characters[a_name];
+                local ok_tab, err_tab = pcall(ASSAULT_PTS.draw_tab, a_name, a_data, current_time);
+                if not ok_tab then
+                    imgui.TextColored({ 1.0, 0.4, 0.4, 1.0 }, 'Assault tab error: ' .. tostring(err_tab));
+                end
                 imgui.EndTabItem();
             end
 
@@ -5875,6 +6539,41 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
     -- Justinius). Its fields sit right after the npc id: idx 0x08, zone 0x0A,
     -- menu 0x0C - verified against live captures. 0x034 (below) is the long
     -- form with 32 bytes of event params first.
+    -- Currencies menu: all five assault point totals, exact.
+    if id == 0x0113 then
+        if data == nil or #data < 0x094 then return; end
+        local cd = get_char_data();
+        if cd == nil then return; end
+        if cd.assault_data == nil then cd.assault_data = new_assault_data(); end
+        local changed = false;
+        local off = 0x080;
+        for _, sh in ipairs(ASSAULT_PTS.shops) do
+            local v = struct.unpack('i', data, off + 1);
+            if ASSAULT_PTS.set(cd.assault_data, sh.area, v) then changed = true; end
+            off = off + 4;
+        end
+        if changed then save_settings(); end
+        return;
+    end
+
+    -- "You gain <n> Assault points!" inside an assault: add the reward.
+    if id == 0x002A then
+        if data == nil or #data < 0x1C then return; end
+        local sh = ASSAULT_PTS.by_zone[get_zone_id()];
+        if sh == nil then return; end
+        local mes = struct.unpack('H', data, 0x1A + 1);
+        if not ASSAULT_PTS.WIN_MSG[mes] then return; end
+        local uid = struct.unpack('I', data, 0x04 + 1);
+        local ok, me = pcall(function() return AshitaCore:GetMemoryManager():GetParty():GetMemberServerId(0); end);
+        if ok and type(me) == 'number' and me ~= 0 and uid ~= me then return; end
+        local reward = struct.unpack('i', data, 0x08 + 1);
+        local cd = get_char_data();
+        if cd == nil then return; end
+        if cd.assault_data == nil then cd.assault_data = new_assault_data(); end
+        if ASSAULT_PTS.add(cd.assault_data, sh.area, reward) then save_settings(); end
+        return;
+    end
+
     if id == 0x0032 then
         if data == nil or #data < 0x0E then return; end
         if tracker.current_char == nil or tracker.current_char == 'Unknown' then return; end
@@ -5936,6 +6635,12 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
                 -- mercenary rank and that area's assault points.
                 local giver_area = MISSION_GIVER_MENUS[menu_id];
                 if giver_area ~= nil then
+                    -- Menu ids 273-277 are reused by other events elsewhere,
+                    -- and those wrote garbage into the point totals. The
+                    -- givers only exist in Whitegate (zone 50).
+                    if #data < MENU_OFFSET_ZONE + 2 then return; end
+                    local mzone = struct.unpack('H', data, MENU_OFFSET_ZONE + 1);
+                    if mzone ~= 50 then return; end
                     local rank   = struct.unpack('L', data, MENU_PARAM_RANK + 1);
                     local points = struct.unpack('L', data, MENU_PARAM_POINTS + 1);
                     local cd = get_char_data();
@@ -5948,13 +6653,7 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
                         a.rank = rank;
                         a.rank_seen_at = os.time();
                     end
-                    if points ~= nil and points < 1000000 then
-                        if type(a.points) ~= 'table' then a.points = {}; end
-                        if a.points[giver_area] ~= points then
-                            a.points[giver_area] = points;
-                            changed = true;
-                        end
-                    end
+                    if ASSAULT_PTS.set(a, giver_area, points) then changed = true; end
                     -- Opening a mission giver's menu usually changes nothing, and
                     -- a full serialise per menu open just feeds the save spam.
                     if changed then save_settings(); end
@@ -6331,6 +7030,7 @@ ashita.events.register('command', 'command_cb', function(e)
             update_char_list();
             ui.render_failed = false;   -- retry after a display error
             ui.is_open[1] = true;
+            ui.goto_tab = 'Tasks';      -- always come back on the Tasks tab
         end
         return;
     end
@@ -6343,6 +7043,7 @@ ashita.events.register('command', 'command_cb', function(e)
         help_line('/hw',              'Toggle tracking window');
         help_line('/hw weeklys',      'Weekly checklist in chat');
         help_line('/hw timers',       'ENM / Limbus timers in chat');
+        help_line('/hw assault',      'Assault points per area in chat');
         help_line('/hw chars',        'All characters and their progress');
         help_line('/hw chars <name>', 'Week & timers for one character');
         print('');
@@ -6365,6 +7066,7 @@ ashita.events.register('command', 'command_cb', function(e)
         update_char_list();
         ui.render_failed = false;   -- give a failed render another go
         ui.is_open[1] = true;
+        ui.goto_tab = 'Tasks';
         return;
     end
     if (args[2] == 'hide') then
@@ -6373,6 +7075,29 @@ ashita.events.register('command', 'command_cb', function(e)
     end
     if (args[2] == 'weeklys' or args[2] == 'week' or args[2] == 'weekly' or args[2] == 'list') then show_list(); return; end
     if (args[2] == 'timers' or args[2] == 'timer') then show_timers(); return; end
+    if (args[2] == 'itemtest' and args[3] ~= nil) then
+        local id = tonumber(args[3]);
+        if id == nil then print_msg('Usage: /hw itemtest <item id>'); return; end
+        ASSAULT_PTS.item_cache[id] = nil;
+        local it = ASSAULT_PTS.item(id);
+        print_msg(string.format('Item %d: name=%s level=%s jobs=%s', id, tostring(it.name), tostring(it.level), tostring(it.jobs)));
+        print_msg('desc=' .. tostring(it.desc));
+        return;
+    end
+    if (args[2] == 'assault' or args[2] == 'points') then
+        local cd = get_char_data();
+        local a = cd and cd.assault_data or nil;
+        print_msg('Assault points for \30\110' .. tracker.current_char .. '\30\106:');
+        local c_rank = ASSAULT_PTS.rank(tracker.current_char, a);
+        print('  \30\110Rank\30\106 ' .. ((c_rank > 0) and ('\30\071' .. c_rank .. ' - ' .. MERCENARY_RANKS[c_rank] .. '\30\106') or '\30\104?\30\106'));
+        for _, sh in ipairs(ASSAULT_PTS.shops) do
+            local v, est = ASSAULT_PTS.get(a, sh.area);
+            print(string.format('  \30\110%-28s\30\106 %s', ASSAULT_AREA_FULL[sh.area] or sh.area,
+                v and ('\30\071' .. (est and '~' or '') .. ASSAULT_PTS.fmt(v) .. '\30\106') or '\30\104?\30\106'));
+        end
+        print('  \30\071? = not read yet. Open Menu > Status > Currencies once to sync.\30\106');
+        return;
+    end
     if (args[2] == 'chars' or args[2] == 'char') then
         if (#args >= 3) then show_char_details(args[3]); else show_all_chars(); end
         return;
